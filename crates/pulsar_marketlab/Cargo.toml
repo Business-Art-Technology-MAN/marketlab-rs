@@ -1,0 +1,22 @@
+[package]
+name = "pulsar_marketlab"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ndarray = { workspace = true }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+vector-ta = { workspace = true }
+thiserror = { workspace = true }
+csv = { workspace = true }
+unicode-segmentation = "1.12"
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+num-traits = "0.2"
+
+# Directly links to the underlying Pulsar UI framework crates 
+# without triggering a nested workspace collision:
+# pulsar-ui = { path = "../../external/Pulsar-Native/crates/pulsar-ui" }

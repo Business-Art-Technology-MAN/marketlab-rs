@@ -1,0 +1,18 @@
+market_lab_workspace/
+├── .cursor/
+│   └── rules/                  # Project-wide Cursor instruction profiles
+│       ├── agent_1_stage.md    
+│       ├── agent_2_engine.md   
+│       ├── agent_3_kernel.md   
+│       └── agent_4_ui.md       
+├── core/                       # Market Lab Rust Engines
+│   ├── Cargo.toml
+│   └── src/
+│       ├── trading_stage/      # Layer 1 Core (SRD 1)
+│       ├── execution_engine/   # Layer 2 Core (SRD 2)
+│       └── signal_kernel/      # Layer 3 Core (SRD 3)
+├── external/                   # Upstream Source Repositories
+│   ├── pulsar-native/          # Forked: Pulsar-Native (GPUI Host Shell)
+│   └── plugin-blueprints/      # Forked: Plugin_Blueprints (Visual Canvas Logic)
+├── setup_workspace.sh          # Orchestration Automation Script
+└── Cargo.toml                  # Cargo Workspace Configurator

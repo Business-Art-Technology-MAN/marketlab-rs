@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates\\pulsar_marketlab"
+]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ndarray = "0.15"
+nalgebra = "0.32"
+rayon = "1.8"
+vector-ta = "0.2.7"
+thiserror = "1.0"
+csv = "1.3"
