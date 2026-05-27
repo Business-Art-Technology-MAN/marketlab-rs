@@ -41,7 +41,6 @@ pub const SIM_DEPLOY_FRACTION: f64 = 0.95;
 pub const SIM_INITIAL_CASH: f64 = 10_000.0;
 pub const SHARPE_ANNUALIZATION: f64 = 252.0;
 const CSV_PLAYBACK_INTERVAL: Duration = Duration::from_millis(400);
-pub const CSV_EXECUTION_TIMELINE_CAP: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub enum PipelineSystemMessage {
