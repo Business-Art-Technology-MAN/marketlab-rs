@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pulsar_marketlab::execution_engine::ExecutionGraph;
+use pulsar_marketlab::signal_dsl::evaluate_formula;
 use pulsar_marketlab::technical_analysis::{
     clamp_ta_lookback, compute_ta_latest_with_params, MarketSeriesWindow,
 };
@@ -281,6 +282,8 @@ pub struct VisualNode {
     pub ta_indicator_id: Option<String>,
     /// Lookback period passed to VectorTA `period` param (sidebar slider).
     pub ta_lookback_period: u32,
+    /// OSL-inspired formula evaluated against the upstream market window when set.
+    pub dsl_formula: Option<String>,
     /// When set, a background CSV playback loop streams Yahoo Finance rows for this node.
     pub asset_source: Option<AssetSourceType>,
     pub x: f32,
@@ -378,8 +381,43 @@ pub(crate) fn ta_lookback_for_node(node: &VisualNode) -> usize {
 }
 
 pub fn ta_compute_for_node(node: &VisualNode, window: &MarketSeriesWindow) -> Option<f64> {
+    let lookback = ta_lookback_for_node(node);
+    if let Some(formula) = node.dsl_formula.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return evaluate_formula(formula, window, lookback)
+            .ok()
+            .map(f64::from);
+    }
     let indicator_id = node.ta_indicator_id.as_deref()?;
-    compute_ta_latest_with_params(indicator_id, window, ta_lookback_for_node(node))
+    compute_ta_latest_with_params(indicator_id, window, lookback)
+}
+
+#[cfg(test)]
+mod graph_compiler_dsl_tests {
+    use super::*;
+
+    #[test]
+    fn ta_compute_prefers_dsl_formula_over_indicator_id() {
+        let node = VisualNode {
+            id: 2,
+            name: "Custom".into(),
+            node_type: NodeType::TechnicalAnalysis,
+            grade: NodeGradeType::Scalar,
+            ta_indicator_id: Some("sma".into()),
+            ta_lookback_period: 14,
+            dsl_formula: Some("close - sma(3)".into()),
+            asset_source: None,
+            x: 0.0,
+            y: 0.0,
+            inputs: vec!["In".into()],
+            outputs: vec!["Out".into()],
+        };
+        let mut window = MarketSeriesWindow::default();
+        for close in [100.0, 102.0, 101.0, 105.0, 104.0] {
+            window.push_close_only(close);
+        }
+        let value = ta_compute_for_node(&node, &window).expect("dsl value");
+        assert!((value - 0.666_667).abs() < 0.01);
+    }
 }
 
 pub const NODE_SPAWN_STAGGER_X: f32 = 260.0;

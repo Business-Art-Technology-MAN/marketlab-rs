@@ -1283,6 +1283,7 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
+            dsl_formula: None,
             asset_source: Some(AssetSourceType::Csv {
                 path: DEFAULT_CSV_ASSET_PATH.to_string(),
             }),
@@ -1300,6 +1301,7 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
             grade: NodeGradeType::Scalar,
             ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
+            dsl_formula: None,
             asset_source: None,
             x: 320.0,
             y: 130.0,
@@ -1313,6 +1315,7 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
+            dsl_formula: None,
             asset_source: None,
             x: 600.0,
             y: 130.0,
