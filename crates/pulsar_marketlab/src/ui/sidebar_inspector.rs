@@ -5,7 +5,7 @@ use gpui::prelude::FluentBuilder;
 use gpui_component::scroll::ScrollableElement;
 
 use crate::asset_path_input::render_asset_path_input;
-use crate::graph_compiler::{NodeType, VisualNode, AssetSourceType};
+use crate::graph_compiler::{VisualNode, AssetSourceType};
 use pulsar_marketlab::technical_analysis::{
     category_display_label, ta_category_for_indicator, ta_indicator_catalog_hierarchy,
     ta_indicator_label, TA_SIDEBAR_ALGORITHMS, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK, clamp_ta_lookback,
@@ -23,14 +23,14 @@ impl TradingSystemWorkspace {
     pub(crate) fn selected_technical_analysis_node(&self) -> Option<&VisualNode> {
         let selected_id = self.selected_node_id?;
         self.nodes.iter().find(|node| {
-            node.id == selected_id && node.node_type == NodeType::TechnicalAnalysis
+            node.id == selected_id && node.node_type.is_otl_shader()
         })
     }
 
     pub(crate) fn selected_portfolio_node(&self) -> Option<&VisualNode> {
         let selected_id = self.selected_node_id?;
         self.nodes.iter().find(|node| {
-            node.id == selected_id && node.node_type == NodeType::Portfolio
+            node.id == selected_id && node.node_type.is_portfolio()
         })
     }
 
@@ -41,7 +41,7 @@ impl TradingSystemWorkspace {
         if let Some(node) = self
             .nodes
             .iter_mut()
-            .find(|node| node.id == node_id && node.node_type == NodeType::TechnicalAnalysis)
+            .find(|node| node.id == node_id && node.node_type.is_otl_shader())
         {
             node.ta_indicator_id = Some(indicator_id.clone());
             node.name = label;
@@ -63,7 +63,7 @@ impl TradingSystemWorkspace {
     pub(crate) fn set_ta_lookback_period(&mut self, node_id: usize, period: u32) {
         let period = clamp_ta_lookback(period as usize) as u32;
         if let Some(node) = self.nodes.iter_mut().find(|node| {
-            node.id == node_id && node.node_type == NodeType::TechnicalAnalysis
+            node.id == node_id && node.node_type.is_otl_shader()
         }) {
             node.ta_lookback_period = period;
         }
@@ -129,7 +129,7 @@ impl TradingSystemWorkspace {
     pub(crate) fn selected_asset_node(&self) -> Option<&VisualNode> {
         let selected_id = self.selected_node_id?;
         self.nodes.iter().find(|node| {
-            node.id == selected_id && node.node_type == NodeType::Asset
+            node.id == selected_id && node.node_type.is_asset_adaptor()
         })
     }
 
@@ -204,7 +204,7 @@ impl TradingSystemWorkspace {
         if let Some(node) = self
             .nodes
             .iter_mut()
-            .find(|node| node.id == node_id && node.node_type == NodeType::Asset)
+            .find(|node| node.id == node_id && node.node_type.is_asset_adaptor())
         {
             node.asset_source = Some(AssetSourceType::Csv {
                 path: path.clone(),

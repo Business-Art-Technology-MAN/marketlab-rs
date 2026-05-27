@@ -423,7 +423,7 @@ fn wired_ta_nodes_for_asset_port<'a>(
         let Some(ta_node) = graph.nodes.iter().find(|node| node.id == connection.to_node_id) else {
             continue;
         };
-        if ta_node.node_type != NodeType::TechnicalAnalysis {
+        if !ta_node.node_type.is_otl_shader() {
             continue;
         }
         if wired.iter().any(|existing: &&VisualNode| existing.id == ta_node.id) {
@@ -968,8 +968,8 @@ fn evaluate_portfolio_at_playhead(
             let Some(node) = nodes_by_id.get(&node_id) else {
                 continue;
             };
-            match node.node_type {
-                NodeType::Asset => {
+            match &node.node_type {
+                NodeType::AssetAdaptor { .. } => {
                     let Some(rows) = yahoo_by_asset.get(&node_id) else {
                         continue;
                     };
@@ -987,7 +987,7 @@ fn evaluate_portfolio_at_playhead(
                         last_close = row.close;
                     }
                 }
-                NodeType::TechnicalAnalysis => {
+                NodeType::OtlShader { .. } => {
                     if !portfolio_ta_filter.contains(&node_id) {
                         continue;
                     }
@@ -1031,7 +1031,7 @@ fn evaluate_portfolio_at_playhead(
                         &sink,
                     );
                 }
-                NodeType::Portfolio => {}
+                NodeType::TerminalIntegrator { .. } => {}
             }
         }
 
@@ -1114,7 +1114,7 @@ fn refresh_ta_samples_at_playhead(
 ) {
     let portfolio_ta = portfolio_wired_ta_node_ids(graph);
     for node in nodes {
-        if node.node_type != NodeType::TechnicalAnalysis || !portfolio_ta.contains(&node.id) {
+        if !node.node_type.is_otl_shader() || !portfolio_ta.contains(&node.id) {
             continue;
         }
         let Some(asset_id) = upstream_asset_for_ta_node(node.id, graph) else {
@@ -1169,7 +1169,7 @@ pub(crate) fn hydrate_market_stage_from_workspace(
 ) {
     stage.prims.clear();
     for node in nodes {
-        if !matches!(node.node_type, NodeType::Asset) {
+        if !node.node_type.is_asset_adaptor() {
             continue;
         }
         if !matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) {
@@ -1279,11 +1279,12 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
         VisualNode {
             id: 1,
             name: csv_node_label_from_path(DEFAULT_CSV_ASSET_PATH),
-            node_type: NodeType::Asset,
+            node_type: NodeType::asset_adaptor_from_csv_path(DEFAULT_CSV_ASSET_PATH),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: Some(AssetSourceType::Csv {
                 path: DEFAULT_CSV_ASSET_PATH.to_string(),
             }),
@@ -1297,11 +1298,12 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
             name: ta_indicator_label(DEFAULT_TA_INDICATOR_ID)
                 .unwrap_or("RSI")
                 .to_string(),
-            node_type: NodeType::TechnicalAnalysis,
+            node_type: NodeType::otl_shader(String::new()),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: None,
             x: 320.0,
             y: 130.0,
@@ -1311,11 +1313,12 @@ pub fn default_pipeline_nodes() -> Vec<VisualNode> {
         VisualNode {
             id: 4,
             name: "Sim Portfolio".to_string(),
-            node_type: NodeType::Portfolio,
+            node_type: NodeType::portfolio(),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: None,
             x: 600.0,
             y: 130.0,
@@ -1421,15 +1424,16 @@ impl TradingSystemWorkspace {
                 .unwrap_or_default();
         };
         if let Some(node) = self.nodes.iter().find(|node| node.id == node_id) {
-            match node.node_type {
-                NodeType::Asset if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) => {
+            match &node.node_type {
+                NodeType::AssetAdaptor { .. }
+                    if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) => {
                     return self
                         .asset_ohlc_history
                         .get(&node_id)
                         .cloned()
                         .unwrap_or_default();
                 }
-                NodeType::TechnicalAnalysis => {
+                NodeType::OtlShader { .. } => {
                     if let Some(asset_id) = upstream_price_source_node_id_parts(
                         node_id,
                         0,
@@ -1503,8 +1507,9 @@ impl TradingSystemWorkspace {
         let mut rows = Vec::new();
 
         for node in &self.nodes {
-            match node.node_type {
-                NodeType::Asset if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) => {
+            match &node.node_type {
+                NodeType::AssetAdaptor { .. }
+                    if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) => {
                     let Ok(prim) = asset_prim_path(&node.name) else {
                         continue;
                     };
@@ -1520,7 +1525,7 @@ impl TradingSystemWorkspace {
                         associated_node_id: Some(node.id),
                     });
                 }
-                NodeType::TechnicalAnalysis => {
+                NodeType::OtlShader { .. } => {
                     let indicator_id = analytics_indicator_id(node);
                     let Ok(prim) = analytics_prim_path(&indicator_id) else {
                         continue;
@@ -1647,7 +1652,7 @@ impl TradingSystemWorkspace {
                                             .nodes
                                             .iter()
                                             .find(|node| node.id == node_id)
-                                            .filter(|node| node.node_type == NodeType::TechnicalAnalysis)
+                                            .filter(|node| node.node_type.is_otl_shader())
                                             .cloned();
                                         if let Some(node) = ta_node {
                                             if let Some(value) =

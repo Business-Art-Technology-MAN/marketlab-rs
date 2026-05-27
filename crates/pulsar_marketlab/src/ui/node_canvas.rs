@@ -165,7 +165,7 @@ impl TradingSystemWorkspace {
         let ta_index = self
             .nodes
             .iter()
-            .filter(|node| node.node_type == NodeType::TechnicalAnalysis)
+            .filter(|node| node.node_type.is_otl_shader())
             .count();
 
         self.nodes.push(VisualNode {
@@ -173,11 +173,12 @@ impl TradingSystemWorkspace {
             name: ta_indicator_label(DEFAULT_TA_INDICATOR_ID)
                 .unwrap_or("RSI")
                 .to_string(),
-            node_type: NodeType::TechnicalAnalysis,
+            node_type: NodeType::otl_shader(String::new()),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: None,
             x: x + ta_index as f32 * NODE_SPAWN_STAGGER_X,
             y: y + ta_index as f32 * NODE_SPAWN_STAGGER_Y,
@@ -203,17 +204,18 @@ impl TradingSystemWorkspace {
         let asset_index = self
             .nodes
             .iter()
-            .filter(|node| node.node_type == NodeType::Asset)
+            .filter(|node| node.node_type.is_asset_adaptor())
             .count();
 
         self.nodes.push(VisualNode {
             id: node_id,
             name: "CSV Asset".to_string(),
-            node_type: NodeType::Asset,
+            node_type: NodeType::asset_adaptor_from_label("CSV Asset"),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: None,
             x: x + asset_index as f32 * NODE_SPAWN_STAGGER_X,
             y: y + asset_index as f32 * NODE_SPAWN_STAGGER_Y,
@@ -241,17 +243,18 @@ impl TradingSystemWorkspace {
         let portfolio_index = self
             .nodes
             .iter()
-            .filter(|node| node.node_type == NodeType::Portfolio)
+            .filter(|node| node.node_type.is_portfolio())
             .count();
 
         self.nodes.push(VisualNode {
             id: node_id,
             name: format!("Sim Portfolio {}", portfolio_index + 1),
-            node_type: NodeType::Portfolio,
+            node_type: NodeType::portfolio(),
             grade: NodeGradeType::Scalar,
             ta_indicator_id: None,
             ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             dsl_formula: None,
+            aov_outputs: Vec::new(),
             asset_source: None,
             x: x + portfolio_index as f32 * NODE_SPAWN_STAGGER_X,
             y: y + portfolio_index as f32 * NODE_SPAWN_STAGGER_Y,
@@ -313,7 +316,7 @@ impl TradingSystemWorkspace {
             .nodes
             .iter()
             .find(|node| node.id == from_node_id)
-            .is_some_and(|node| node.node_type == NodeType::TechnicalAnalysis);
+            .is_some_and(|node| node.node_type.is_otl_shader());
 
         self.connections.retain(|connection| {
             !(connection.to_node_id == to_node_id && connection.to_port_idx == to_port_idx)
@@ -361,7 +364,7 @@ impl TradingSystemWorkspace {
             return None;
         }
 
-        let effective_port = if to_node.node_type == NodeType::Portfolio {
+        let effective_port = if to_node.node_type.is_portfolio() {
             if self.connections.iter().any(|connection| {
                 connection.to_node_id == to_node_id && connection.from_node_id == from_node_id
             }) {
@@ -394,7 +397,7 @@ impl TradingSystemWorkspace {
             to_node_id,
             to_port_idx: effective_port,
         });
-        if to_node.node_type == NodeType::Portfolio {
+        if to_node.node_type.is_portfolio() {
             portfolio_ensure_spare_input_port(&mut self.nodes, &self.connections, to_node_id);
         }
         self.active_wire_source = None;
@@ -835,14 +838,10 @@ impl TradingSystemWorkspace {
             let Some(node) = self.nodes.iter().find(|node| node.id == node_id) else {
                 continue;
             };
-            let color = match node.node_type {
-                NodeType::TechnicalAnalysis => rgb(0xa855f7),
-                NodeType::Portfolio => rgb(0x14b8a6),
-                _ => match node.grade {
-                    NodeGradeType::Scalar => rgb(0xf59e0b),
-                    NodeGradeType::Vector => rgb(0x3b82f6),
-                    NodeGradeType::Trivector => rgb(0x8b5cf6),
-                },
+            let color = match &node.node_type {
+                NodeType::OtlShader { .. } => rgb(0xa855f7),
+                NodeType::TerminalIntegrator { .. } => rgb(0x14b8a6),
+                NodeType::AssetAdaptor { .. } => rgb(0xf59e0b),
             };
             let border_color = if self.selected_node_id == Some(node.id) {
                 rgb(0x3b82f6)
@@ -983,7 +982,7 @@ impl TradingSystemWorkspace {
                         .child(format!("Grade Space: {:?}", node.grade)),
                 );
 
-            if node.node_type == NodeType::TechnicalAnalysis {
+            if node.node_type.is_otl_shader() {
                 let indicator_label = node
                     .ta_indicator_id
                     .as_deref()
@@ -1001,7 +1000,7 @@ impl TradingSystemWorkspace {
                 );
             }
 
-            if node.node_type == NodeType::Portfolio {
+            if node.node_type.is_portfolio() {
                 let wired_count = portfolio_wired_source_count(&self.connections, node_id);
                 if let Some(metrics) = &self.portfolio_diagnostics {
                     let return_color = if metrics.total_return_pct >= 0.0 {

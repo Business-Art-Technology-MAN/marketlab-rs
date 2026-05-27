@@ -1,5 +1,14 @@
 //! Graph configuration, shared snapshots, and DAG compilation.
 
+mod registry;
+
+#[cfg(test)]
+mod tests;
+
+pub use registry::{
+    connection_is_valid, effective_otl_script, validate_graph_wiring, NodeType, WireValidationError,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +19,7 @@ use pulsar_marketlab::technical_analysis::{
 };
 
 pub(crate) fn is_price_source_node(node: &VisualNode) -> bool {
-    matches!(node.node_type, NodeType::Asset | NodeType::Portfolio)
+    node.node_type.is_asset_adaptor() || node.node_type.is_portfolio()
 }
 
 pub(crate) fn upstream_node_at_port(
@@ -41,7 +50,7 @@ pub fn csv_backed_asset_ids(graph: &PipelineGraphSnapshot) -> HashSet<usize> {
     graph
         .nodes
         .iter()
-        .filter(|node| node.node_type == NodeType::Asset)
+        .filter(|node| node.node_type.is_asset_adaptor())
         .filter(|node| matches!(node.asset_source, Some(AssetSourceType::Csv { .. })))
         .map(|node| node.id)
         .collect()
@@ -51,7 +60,7 @@ pub fn portfolio_signal_port_label(port_idx: usize) -> String {
     format!("Signal In {port_idx}")
 }
 
-/// TA node ids with an active wire into any Portfolio input socket.
+/// OTL shader node ids with an active wire into any portfolio integrator socket.
 pub fn portfolio_wired_ta_node_ids(graph: &PipelineGraphSnapshot) -> HashSet<usize> {
     graph
         .connections
@@ -61,14 +70,14 @@ pub fn portfolio_wired_ta_node_ids(graph: &PipelineGraphSnapshot) -> HashSet<usi
                 .nodes
                 .iter()
                 .find(|node| node.id == connection.to_node_id)?;
-            if to_node.node_type != NodeType::Portfolio {
+            if !to_node.node_type.is_portfolio() {
                 return None;
             }
             let from_node = graph
                 .nodes
                 .iter()
                 .find(|node| node.id == connection.from_node_id)?;
-            if from_node.node_type == NodeType::TechnicalAnalysis {
+            if from_node.node_type.is_otl_shader() {
                 Some(from_node.id)
             } else {
                 None
@@ -76,6 +85,7 @@ pub fn portfolio_wired_ta_node_ids(graph: &PipelineGraphSnapshot) -> HashSet<usi
         })
         .collect()
 }
+
 #[derive(Debug, Clone)]
 pub struct PipelineGraphSnapshot {
     pub nodes: Vec<VisualNode>,
@@ -84,6 +94,9 @@ pub struct PipelineGraphSnapshot {
     pub execution_order: Vec<usize>,
     /// False when the canvas contains a dependency cycle.
     pub dag_valid: bool,
+    /// False when any connection violates tier or port wire-kind rules.
+    pub wiring_valid: bool,
+    pub wiring_errors: Vec<WireValidationError>,
 }
 
 pub fn compile_graph_to_dag(snapshot: &PipelineGraphSnapshot) -> (Vec<usize>, bool) {
@@ -109,6 +122,16 @@ pub fn compile_graph_to_dag(snapshot: &PipelineGraphSnapshot) -> (Vec<usize>, bo
     }
 }
 
+fn finalize_snapshot(mut snapshot: PipelineGraphSnapshot) -> PipelineGraphSnapshot {
+    let wiring_errors = validate_graph_wiring(&snapshot);
+    snapshot.wiring_valid = wiring_errors.is_empty();
+    snapshot.wiring_errors = wiring_errors;
+    let (execution_order, dag_valid) = compile_graph_to_dag(&snapshot);
+    snapshot.execution_order = execution_order;
+    snapshot.dag_valid = dag_valid;
+    snapshot
+}
+
 pub fn upstream_asset_for_ta_node(ta_node_id: usize, graph: &PipelineGraphSnapshot) -> Option<usize> {
     graph.connections.iter().find_map(|connection| {
         if connection.to_node_id != ta_node_id {
@@ -118,7 +141,7 @@ pub fn upstream_asset_for_ta_node(ta_node_id: usize, graph: &PipelineGraphSnapsh
             .nodes
             .iter()
             .find(|node| node.id == connection.from_node_id)?;
-        if asset.node_type == NodeType::Asset {
+        if asset.node_type.is_asset_adaptor() {
             Some(asset.id)
         } else {
             None
@@ -137,19 +160,16 @@ pub struct SharedPipelineGraph(Arc<Mutex<PipelineGraphState>>);
 
 impl SharedPipelineGraph {
     pub fn new(nodes: Vec<VisualNode>, connections: Vec<NodeConnection>) -> Self {
-        let snapshot = PipelineGraphSnapshot {
+        let snapshot = finalize_snapshot(PipelineGraphSnapshot {
             nodes,
             connections,
             execution_order: Vec::new(),
             dag_valid: true,
-        };
-        let (execution_order, dag_valid) = compile_graph_to_dag(&snapshot);
+            wiring_valid: true,
+            wiring_errors: Vec::new(),
+        });
         Self(Arc::new(Mutex::new(PipelineGraphState {
-            snapshot: PipelineGraphSnapshot {
-                execution_order,
-                dag_valid,
-                ..snapshot
-            },
+            snapshot,
             revision: 0,
         })))
     }
@@ -157,18 +177,14 @@ impl SharedPipelineGraph {
     pub fn replace(&self, nodes: Vec<VisualNode>, connections: Vec<NodeConnection>) {
         if let Ok(mut guard) = self.0.lock() {
             guard.revision = guard.revision.saturating_add(1);
-            let base = PipelineGraphSnapshot {
+            guard.snapshot = finalize_snapshot(PipelineGraphSnapshot {
                 nodes,
                 connections,
                 execution_order: Vec::new(),
                 dag_valid: true,
-            };
-            let (execution_order, dag_valid) = compile_graph_to_dag(&base);
-            guard.snapshot = PipelineGraphSnapshot {
-                execution_order,
-                dag_valid,
-                ..base
-            };
+                wiring_valid: true,
+                wiring_errors: Vec::new(),
+            });
         }
     }
 
@@ -186,7 +202,6 @@ impl SharedPipelineGraph {
             .unwrap_or_else(|poisoned| poisoned.into_inner().snapshot.clone())
     }
 }
-
 
 /// Thread-safe CSV path registry shared between the UI workspace and the asset feeder.
 #[derive(Clone)]
@@ -230,6 +245,7 @@ impl SharedCsvAssetPaths {
             .unwrap_or_default()
     }
 }
+
 pub const NODE_CHART_HEIGHT: f32 = 52.0;
 
 pub(crate) const NODE_WIDTH: f32 = 220.0;
@@ -244,19 +260,6 @@ pub(crate) const CONNECTION_STROKE_WIDTH: f32 = 2.0;
 pub(crate) const MIN_ZOOM: f32 = 0.15;
 pub(crate) const MAX_ZOOM: f32 = 3.0;
 pub(crate) const ZOOM_WHEEL_SENSITIVITY: f32 = 0.002;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeType {
-    Asset,
-    Portfolio,
-    TechnicalAnalysis,
-}
-
-impl NodeType {
-    pub(crate) fn displays_price_chart(self) -> bool {
-        matches!(self, NodeType::Asset)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -284,6 +287,8 @@ pub struct VisualNode {
     pub ta_lookback_period: u32,
     /// OSL-inspired formula evaluated against the upstream market window when set.
     pub dsl_formula: Option<String>,
+    /// OTL arbitrary output variable names exposed as dedicated AOV output ports.
+    pub aov_outputs: Vec<String>,
     /// When set, a background CSV playback loop streams Yahoo Finance rows for this node.
     pub asset_source: Option<AssetSourceType>,
     pub x: f32,
@@ -291,6 +296,7 @@ pub struct VisualNode {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
 }
+
 #[derive(Debug, Clone)]
 pub struct NodeConnection {
     pub from_node_id: usize,
@@ -298,6 +304,7 @@ pub struct NodeConnection {
     pub to_node_id: usize,
     pub to_port_idx: usize,
 }
+
 pub(crate) fn portfolio_input_port_free(
     connections: &[NodeConnection],
     portfolio_id: usize,
@@ -338,7 +345,7 @@ pub(crate) fn portfolio_ensure_spare_input_port(
 ) {
     let Some(node) = nodes
         .iter()
-        .find(|node| node.id == portfolio_id && node.node_type == NodeType::Portfolio)
+        .find(|node| node.id == portfolio_id && node.node_type.is_portfolio())
     else {
         return;
     };
@@ -360,29 +367,13 @@ pub(crate) fn portfolio_wired_source_count(connections: &[NodeConnection], portf
         .count()
 }
 
-pub(crate) fn connection_is_valid(
-    from_node: &VisualNode,
-    from_port_idx: usize,
-    to_node: &VisualNode,
-    to_port_idx: usize,
-) -> bool {
-    if from_port_idx >= from_node.outputs.len() || to_port_idx >= to_node.inputs.len() {
-        return false;
-    }
-    matches!(
-        (from_node.node_type, to_node.node_type),
-        (NodeType::Asset, NodeType::TechnicalAnalysis)
-            | (NodeType::TechnicalAnalysis, NodeType::Portfolio)
-            | (NodeType::Asset, NodeType::Portfolio)
-    )
-}
 pub(crate) fn ta_lookback_for_node(node: &VisualNode) -> usize {
     clamp_ta_lookback(node.ta_lookback_period as usize)
 }
 
 pub fn ta_compute_for_node(node: &VisualNode, window: &MarketSeriesWindow) -> Option<f64> {
     let lookback = ta_lookback_for_node(node);
-    if let Some(formula) = node.dsl_formula.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(formula) = effective_otl_script(node) {
         return evaluate_formula(formula, window, lookback)
             .ok()
             .map(f64::from);
@@ -391,47 +382,19 @@ pub fn ta_compute_for_node(node: &VisualNode, window: &MarketSeriesWindow) -> Op
     compute_ta_latest_with_params(indicator_id, window, lookback)
 }
 
-#[cfg(test)]
-mod graph_compiler_dsl_tests {
-    use super::*;
-
-    #[test]
-    fn ta_compute_prefers_dsl_formula_over_indicator_id() {
-        let node = VisualNode {
-            id: 2,
-            name: "Custom".into(),
-            node_type: NodeType::TechnicalAnalysis,
-            grade: NodeGradeType::Scalar,
-            ta_indicator_id: Some("sma".into()),
-            ta_lookback_period: 14,
-            dsl_formula: Some("close - sma(3)".into()),
-            asset_source: None,
-            x: 0.0,
-            y: 0.0,
-            inputs: vec!["In".into()],
-            outputs: vec!["Out".into()],
-        };
-        let mut window = MarketSeriesWindow::default();
-        for close in [100.0, 102.0, 101.0, 105.0, 104.0] {
-            window.push_close_only(close);
-        }
-        let value = ta_compute_for_node(&node, &window).expect("dsl value");
-        assert!((value - 0.666_667).abs() < 0.01);
-    }
-}
-
 pub const NODE_SPAWN_STAGGER_X: f32 = 260.0;
 pub const NODE_SPAWN_STAGGER_Y: f32 = 48.0;
+
 pub(crate) fn node_shows_price_chart(node: &VisualNode) -> bool {
     node.node_type.displays_price_chart()
 }
 
 pub(crate) fn node_body_height_world(node: &VisualNode, include_chart: bool) -> f32 {
     let mut height = NODE_HEADER_HEIGHT + NODE_GRADE_HEIGHT;
-    if node.node_type == NodeType::TechnicalAnalysis {
+    if node.node_type.is_otl_shader() {
         height += NODE_TA_LABEL_HEIGHT;
     }
-    if node.node_type == NodeType::Portfolio {
+    if node.node_type.is_portfolio() {
         height += NODE_PORTFOLIO_METRICS_HEIGHT;
     }
     if include_chart && node_shows_price_chart(node) {

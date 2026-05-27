@@ -66,8 +66,8 @@ impl TradingSystemWorkspace {
 
         if let Some(node_id) = self.selected_node_id {
             if let Some(node) = self.nodes.iter().find(|node| node.id == node_id) {
-                match node.node_type {
-                    NodeType::Asset
+                match &node.node_type {
+                    NodeType::AssetAdaptor { .. }
                         if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) =>
                     {
                         config.asset_name = Some(node.name.clone());
@@ -77,7 +77,7 @@ impl TradingSystemWorkspace {
                             .cloned()
                             .unwrap_or_default();
                     }
-                    NodeType::TechnicalAnalysis => {
+                    NodeType::OtlShader { .. } => {
                         config.ta_indicator_id = node.ta_indicator_id.clone();
                         config.ta_lookback_period = Some(node.ta_lookback_period);
                         config.ta_indicator_label = node

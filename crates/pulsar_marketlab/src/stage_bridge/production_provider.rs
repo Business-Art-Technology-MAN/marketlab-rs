@@ -7,6 +7,7 @@ use openusd::sdf::schema::FieldKey;
 
 use crate::execution_engine::{EXECUTION_CASH_ATTR, EXECUTION_CASH_PATH};
 use crate::signal_dsl::{MarketProviderServices, OtlClosure, Vector};
+use crate::signal_dsl::financial::{execute_financial_integrator, execute_stdlib_integrator};
 use crate::technical_analysis::{compute_ta_latest_with_params, MarketSeriesWindow};
 use crate::trading_stage::MarketStage;
 
@@ -188,6 +189,18 @@ impl MarketProviderServices for ProductionStageProvider {
         inputs: &[OtlClosure],
         t: f64,
     ) -> Option<Vector> {
+        if let Some(value) = execute_stdlib_integrator(self, integrator_name, inputs, t) {
+            return Some(value);
+        }
+        if integrator_name.starts_with("financial::") {
+            return execute_financial_integrator(
+                self,
+                integrator_name,
+                &self.active_path,
+                inputs,
+                t,
+            );
+        }
         match integrator_name {
             "identity" => inputs.first().and_then(|closure| closure(self, t)),
             "sum" => {

@@ -58,7 +58,17 @@ impl MarketProviderServices for MockMarketProvider {
             return Some(value.clone());
         }
         match name {
-            "close" | "open" | "high" | "low" | "volume" => self.point_at_playhead(t),
+            "close" | "open" | "high" | "low" | "volume" => {
+                let close = self.point_at_playhead(t)?.as_scalar()?;
+                let value = match name {
+                    "close" | "open" => close,
+                    "high" => close * 1.01,
+                    "low" => close * 0.99,
+                    "volume" => 0.0,
+                    _ => return None,
+                };
+                Some(Vector::scalar(value))
+            }
             _ => None,
         }
     }
@@ -69,6 +79,20 @@ impl MarketProviderServices for MockMarketProvider {
         inputs: &[super::services::OtlClosure],
         t: f64,
     ) -> Option<Vector> {
+        if let Some(value) =
+            super::financial::execute_stdlib_integrator(self, integrator_name, inputs, t)
+        {
+            return Some(value);
+        }
+        if integrator_name.starts_with("financial::") {
+            return super::financial::execute_financial_integrator(
+                self,
+                integrator_name,
+                &self.active_close_path,
+                inputs,
+                t,
+            );
+        }
         match integrator_name {
             "identity" => inputs.first().and_then(|closure| closure(self, t)),
             "sum" => {

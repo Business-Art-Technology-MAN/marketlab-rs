@@ -64,6 +64,19 @@ fn otl_rsi_integrator_routes_through_production_provider() {
 }
 
 #[test]
+fn production_rtn_log_executes_via_stage_provider() {
+    let close_path = "/assets/SPY/close";
+    let provider = production_provider();
+    let ctx = CompileContext {
+        timeline_close_path: close_path.to_string(),
+    };
+    let closure = compile_formula("rtn::log(3)", &ctx).expect("compile rtn::log");
+    let value = invoke_closure(&closure, &provider, 4.0).expect("execute rtn::log");
+    let expected = (104.0_f64 / 102.0).ln() as f32;
+    assert!((value - expected).abs() < 0.001, "got {value}, expected {expected}");
+}
+
+#[test]
 fn compiled_closure_and_provider_are_send_sync() {
     let provider = production_provider();
     let closure = compile_formula("close", &CompileContext::default()).expect("compile");

@@ -1,6 +1,7 @@
 //! Phase C Pillar 1 — OSL-inspired signal expression frontend.
 
 mod ast;
+pub(crate) mod financial;
 mod interpreter;
 #[cfg(test)]
 mod mock_provider;

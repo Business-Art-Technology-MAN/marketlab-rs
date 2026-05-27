@@ -99,8 +99,40 @@ fn compile_function_call(
     match name {
         "sma" | "ta::sma" => compile_sma_intrinsic(args, ctx),
         "rsi" | "ta::rsi" => compile_integrator_call("vector_ta::rsi", args, ctx),
+        "rtn::log" => compile_financial_intrinsic("financial::rtn_log", args, ctx),
+        "vol::realized" => compile_financial_intrinsic("financial::vol_realized", args, ctx),
+        "vol::parkinson" => compile_financial_intrinsic("financial::vol_parkinson", args, ctx),
+        "clamp" => compile_integrator_call("stdlib::clamp", args, ctx),
+        "mix" => compile_integrator_call("stdlib::mix", args, ctx),
+        "step" => compile_integrator_call("stdlib::step", args, ctx),
         other => Err(DslError::UnknownFunction(other.to_string())),
     }
+}
+
+fn compile_financial_intrinsic(
+    integrator_name: &str,
+    args: &[DslExpression],
+    ctx: &CompileContext,
+) -> Result<OtlClosure, DslError> {
+    if args.len() != 1 {
+        return Err(DslError::InvalidArgumentCount {
+            name: integrator_name.to_string(),
+            expected: 1,
+            got: args.len(),
+        });
+    }
+    let period_closure = compile(&args[0], ctx)?;
+    let close_path = ctx.timeline_close_path.clone();
+    let integrator_name = integrator_name.to_string();
+    Ok(Arc::new(move |services, t| {
+        super::financial::execute_financial_integrator(
+            services,
+            &integrator_name,
+            &close_path,
+            std::slice::from_ref(&period_closure),
+            t,
+        )
+    }))
 }
 
 fn compile_integrator_call(
@@ -197,6 +229,20 @@ impl MarketProviderServices for WindowMarketProvider<'_> {
         inputs: &[OtlClosure],
         t: f64,
     ) -> Option<Vector> {
+        if let Some(value) =
+            super::financial::execute_stdlib_integrator(self, integrator_name, inputs, t)
+        {
+            return Some(value);
+        }
+        if integrator_name.starts_with("financial::") {
+            return super::financial::execute_financial_integrator(
+                self,
+                integrator_name,
+                DEFAULT_CLOSE_PATH,
+                inputs,
+                t,
+            );
+        }
         match integrator_name {
             "vector_ta::rsi" => {
                 let period = inputs
@@ -287,5 +333,52 @@ mod tests {
         }
         let value = evaluate_formula("close - sma(3)", &window, 14).unwrap();
         assert!((value - (104.0 - 103.333_333)).abs() < 0.01);
+    }
+
+    #[test]
+    fn rtn_log_returns_historical_log_differential() {
+        let closure = compile_formula("rtn::log(3)", &CompileContext::default()).unwrap();
+        let provider = sample_provider();
+        let value = invoke_closure(&closure, &provider, 4.0).unwrap();
+        let expected = (104.0_f64 / 102.0).ln() as f32;
+        assert!((value - expected).abs() < 0.001, "got {value}, expected {expected}");
+    }
+
+    #[test]
+    fn vol_realized_returns_sample_standard_deviation() {
+        let closure = compile_formula("vol::realized(3)", &CompileContext::default()).unwrap();
+        let provider = sample_provider();
+        let value = invoke_closure(&closure, &provider, 4.0).unwrap();
+        assert!(value.is_finite());
+        assert!(value > 0.0);
+    }
+
+    #[test]
+    fn clamp_limits_financial_intrinsic_output() {
+        let closure =
+            compile_formula("clamp(rtn::log(3), -0.05, 0.05)", &CompileContext::default()).unwrap();
+        let provider = sample_provider();
+        let value = invoke_closure(&closure, &provider, 4.0).unwrap();
+        assert!(value >= -0.05);
+        assert!(value <= 0.05);
+    }
+
+    #[test]
+    fn mix_blends_close_sma_and_realized_volatility() {
+        let closure = compile_formula(
+            "mix(close, sma(3), vol::realized(3))",
+            &CompileContext::default(),
+        )
+        .unwrap();
+        let provider = sample_provider();
+        let value = invoke_closure(&closure, &provider, 4.0).unwrap();
+        assert!(value.is_finite());
+    }
+
+    #[test]
+    fn financial_closures_are_send_and_sync() {
+        let closure = compile_formula("rtn::log(3)", &CompileContext::default()).unwrap();
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        assert_send_sync(&closure);
     }
 }
