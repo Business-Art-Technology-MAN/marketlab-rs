@@ -6,7 +6,8 @@ pub mod trading_stage;
 
 pub use execution_engine::{
     ExecutionEngine, ExecutionEngineError, ExecutionGraph, MixedFrequencyStrideGrid,
-    SeriesStrideSpec, SimulationTransaction, StageSimulationLedger, EXECUTION_CASH_PATH,
+    SeriesDurationSpec, SeriesStrideSpec, SimulationTransaction, StageSimulationLedger,
+    EXECUTION_CASH_PATH, SECONDS_PER_DAY,
 };
 pub use fix_engine::{
     spawn_mock_fix_bridge, FixPlayheadClock, FixStageWrite, FIX_LAST_PRICE_ATTR, FIX_LAST_QTY_ATTR,

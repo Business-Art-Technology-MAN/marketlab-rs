@@ -182,6 +182,49 @@ impl MarketStage {
         let (prim_path, attribute) = split_prim_and_attribute(full_path)?;
         self.resolve_attribute_at(prim_path, attribute, t)
     }
+
+    /// Causal samples with timestamps in `[start, end]` (inclusive).
+    pub fn samples_in_time_range(
+        &self,
+        prim_path: &str,
+        attribute: &str,
+        start: f64,
+        end: f64,
+    ) -> Vec<(f64, f32)> {
+        if !start.is_finite() || !end.is_finite() || start > end {
+            return Vec::new();
+        }
+        let Some(prim) = self.prims.get(prim_path) else {
+            return Vec::new();
+        };
+        let Some(series) = prim.attributes.get(attribute) else {
+            return Vec::new();
+        };
+        series
+            .samples
+            .range(OrderedFloat(start)..=OrderedFloat(end))
+            .map(|(time, value)| (time.into_inner(), *value))
+            .collect()
+    }
+
+    /// Collect attribute values in `(playhead_time - lookback_duration) ..= playhead_time`.
+    pub fn collect_values_in_window(
+        &self,
+        prim_path: &str,
+        attribute: &str,
+        playhead_time: f64,
+        lookback_duration_secs: f64,
+    ) -> Vec<f64> {
+        if !playhead_time.is_finite() || !lookback_duration_secs.is_finite() || lookback_duration_secs <= 0.0
+        {
+            return Vec::new();
+        }
+        let start = playhead_time - lookback_duration_secs;
+        self.samples_in_time_range(prim_path, attribute, start, playhead_time)
+            .into_iter()
+            .map(|(_, value)| f64::from(value))
+            .collect()
+    }
 }
 
 fn split_prim_and_attribute(full_path: &str) -> Option<(&str, &str)> {
@@ -261,6 +304,19 @@ mod tests {
         let expected = Utc.from_utc_datetime(&expected).timestamp() as f64;
         assert!((t - expected).abs() < f64::EPSILON);
         assert!(t > 1_700_000_000.0);
+    }
+
+    #[test]
+    fn samples_in_time_range_is_causal_and_inclusive() {
+        let mut stage = MarketStage::new();
+        let prim = asset_prim_path("SPY").unwrap();
+        stage.set_sample(&prim, "close", 100.0, 1.0).unwrap();
+        stage.set_sample(&prim, "close", 200.0, 2.0).unwrap();
+        stage.set_sample(&prim, "close", 300.0, 3.0).unwrap();
+        let samples = stage.samples_in_time_range(&prim, "close", 150.0, 250.0);
+        assert_eq!(samples, vec![(200.0, 2.0)]);
+        let window = stage.collect_values_in_window(&prim, "close", 250.0, 100.0);
+        assert_eq!(window, vec![2.0]);
     }
 
     #[test]

@@ -9,6 +9,9 @@ use vector_ta::indicators::registry::{
 };
 use vector_ta::utilities::enums::Kernel;
 
+use crate::execution_engine::SECONDS_PER_DAY;
+use crate::trading_stage::{asset_prim_path, MarketStage};
+
 pub const DEFAULT_TA_INDICATOR_ID: &str = "rsi";
 pub const DEFAULT_TA_LOOKBACK: usize = 14;
 pub const MIN_TA_LOOKBACK: usize = 2;
@@ -224,6 +227,61 @@ impl MarketSeriesWindow {
     pub fn push_close_only(&mut self, close: f64) {
         self.push_bar(close, close, close, close, 0.0);
     }
+}
+
+pub fn lookback_duration_for_bars(bar_count: usize) -> f64 {
+    bar_count as f64 * SECONDS_PER_DAY
+}
+
+/// Build a causal OHLC window from stage samples ending at `playhead_time`.
+pub fn market_window_from_stage(
+    stage: &MarketStage,
+    ticker: &str,
+    playhead_time: f64,
+    lookback_duration_secs: f64,
+) -> MarketSeriesWindow {
+    let Ok(prim) = asset_prim_path(ticker) else {
+        return MarketSeriesWindow::default();
+    };
+    if !playhead_time.is_finite() || lookback_duration_secs <= 0.0 {
+        return MarketSeriesWindow::default();
+    }
+    let start = playhead_time - lookback_duration_secs;
+    let close_samples = stage.samples_in_time_range(&prim, "close", start, playhead_time);
+    let mut window = MarketSeriesWindow::default();
+    for (time, close) in close_samples {
+        let close = f64::from(close);
+        let open = stage
+            .resolve_attribute_at(&prim, "open", time)
+            .map(f64::from)
+            .unwrap_or(close);
+        let high = stage
+            .resolve_attribute_at(&prim, "high", time)
+            .map(f64::from)
+            .unwrap_or(close);
+        let low = stage
+            .resolve_attribute_at(&prim, "low", time)
+            .map(f64::from)
+            .unwrap_or(close);
+        let volume = stage
+            .resolve_attribute_at(&prim, "volume", time)
+            .map(f64::from)
+            .unwrap_or(0.0);
+        window.push_bar(open, high, low, close, volume);
+    }
+    window
+}
+
+pub fn compute_ta_at_playhead_from_stage(
+    stage: &MarketStage,
+    ticker: &str,
+    indicator_id: &str,
+    playhead_time: f64,
+    lookback_bars: usize,
+) -> Option<f64> {
+    let duration = lookback_duration_for_bars(lookback_bars.saturating_add(5));
+    let window = market_window_from_stage(stage, ticker, playhead_time, duration);
+    compute_ta_latest_with_params(indicator_id, &window, lookback_bars)
 }
 
 pub fn compute_ta_latest(indicator_id: &str, window: &MarketSeriesWindow) -> Option<f64> {
@@ -571,6 +629,21 @@ mod tests {
         }
         let closure = build_ta_evaluation_closure("rsi".to_string(), window);
         assert!((closure.run)(29, 14).is_some());
+    }
+
+    #[test]
+    fn market_window_from_stage_collects_causal_bars() {
+        use crate::trading_stage::{asset_prim_path, stage_time_from_bar_date, MarketStage};
+
+        let mut stage = MarketStage::new();
+        let prim = asset_prim_path("SPY").unwrap();
+        let t0 = stage_time_from_bar_date("2024-01-02").unwrap();
+        let t1 = stage_time_from_bar_date("2024-01-03").unwrap();
+        stage.set_sample(&prim, "close", t0, 100.0).unwrap();
+        stage.set_sample(&prim, "close", t1, 110.0).unwrap();
+        let window = market_window_from_stage(&stage, "SPY", t1, SECONDS_PER_DAY * 2.0);
+        assert_eq!(window.len(), 2);
+        assert_eq!(window.close, vec![100.0, 110.0]);
     }
 
     #[test]

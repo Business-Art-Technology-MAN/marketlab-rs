@@ -23,7 +23,7 @@ pub use stage_ledger::{
 // Errors
 // -----------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionEngineError {
     EmptyMasterTimeline,
     EmptyMatrixDims,
@@ -32,6 +32,8 @@ pub enum ExecutionEngineError {
     MatrixConstructionFailed,
     InvalidStride { stride: usize },
     InvalidPhase { phase: usize, stride: usize },
+    InvalidDuration { duration: f64 },
+    InvalidPlayheadTime,
     SeriesLengthMismatch { series: String, expected: usize, got: usize },
     UnknownGraphNode(String),
     GraphCycleDetected,
@@ -64,6 +66,12 @@ impl fmt::Display for ExecutionEngineError {
                 f,
                 "phase {phase} must be strictly less than stride {stride}"
             ),
+            ExecutionEngineError::InvalidDuration { duration } => {
+                write!(f, "duration must be finite and positive, got {duration}")
+            }
+            ExecutionEngineError::InvalidPlayheadTime => {
+                write!(f, "playhead time must be finite")
+            }
             ExecutionEngineError::SeriesLengthMismatch {
                 series,
                 expected,
@@ -156,16 +164,81 @@ pub struct SimulationTransactionWire {
 }
 
 // -----------------------------------------------------------------------------
-// Mixed-frequency temporal stride arrays
+// Mixed-frequency temporal stride arrays (epoch duration windows)
 // -----------------------------------------------------------------------------
 
-/// One heterogeneous series aligned onto the master clock via `(stride, phase)`.
+pub const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// One heterogeneous series aligned via rolling epoch-duration windows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeriesDurationSpec {
+    pub series_id: String,
+    /// Rolling lookback width in seconds ending at the playhead.
+    pub lookback_duration_secs: f64,
+    /// Native cadence within the lookback window (e.g. 3600.0 for hourly).
+    pub native_interval_secs: f64,
+}
+
+impl SeriesDurationSpec {
+    pub fn validated(
+        lookback_duration_secs: f64,
+        native_interval_secs: f64,
+    ) -> Result<(), ExecutionEngineError> {
+        if !lookback_duration_secs.is_finite() || lookback_duration_secs <= 0.0 {
+            return Err(ExecutionEngineError::InvalidDuration {
+                duration: lookback_duration_secs,
+            });
+        }
+        if !native_interval_secs.is_finite() || native_interval_secs <= 0.0 {
+            return Err(ExecutionEngineError::InvalidDuration {
+                duration: native_interval_secs,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn new(
+        series_id: impl Into<String>,
+        lookback_duration_secs: f64,
+        native_interval_secs: f64,
+    ) -> Result<Self, ExecutionEngineError> {
+        Self::validated(lookback_duration_secs, native_interval_secs)?;
+        Ok(Self {
+            series_id: series_id.into(),
+            lookback_duration_secs,
+            native_interval_secs,
+        })
+    }
+
+    /// Causal window `[playhead_time - lookback, playhead_time]`.
+    pub fn window_bounds(&self, playhead_time: f64) -> Result<(f64, f64), ExecutionEngineError> {
+        if !playhead_time.is_finite() {
+            return Err(ExecutionEngineError::InvalidPlayheadTime);
+        }
+        Ok((playhead_time - self.lookback_duration_secs, playhead_time))
+    }
+
+    /// Deterministic resample timestamps inside the causal window.
+    pub fn observation_times(&self, playhead_time: f64) -> Result<Vec<f64>, ExecutionEngineError> {
+        let (start, end) = self.window_bounds(playhead_time)?;
+        let mut times = Vec::new();
+        let mut t = start;
+        while t <= end + f64::EPSILON {
+            times.push(t);
+            t += self.native_interval_secs;
+        }
+        if times.last().map(|last| (*last - end).abs() > f64::EPSILON).unwrap_or(true) {
+            times.push(end);
+        }
+        Ok(times)
+    }
+}
+
+/// Legacy index stride spec retained for wire payloads; converts to epoch durations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeriesStrideSpec {
     pub series_id: String,
-    /// Master ticks between native observations (must be >= 1).
     pub stride: usize,
-    /// First native emission lands at master index `phase` (must be < stride).
     pub phase: usize,
 }
 
@@ -193,7 +266,6 @@ impl SeriesStrideSpec {
         })
     }
 
-    /// Deterministic emission indices on the master timeline (inclusive start, exclusive end).
     pub fn emission_indices(&self, master_len: usize) -> Vec<usize> {
         let mut indices = Vec::new();
         let mut t = self.phase;
@@ -203,105 +275,105 @@ impl SeriesStrideSpec {
         }
         indices
     }
+
+    pub fn to_duration_spec(&self, bar_duration_secs: f64) -> Result<SeriesDurationSpec, ExecutionEngineError> {
+        SeriesDurationSpec::new(
+            self.series_id.clone(),
+            self.stride as f64 * bar_duration_secs,
+            self.stride as f64 * bar_duration_secs,
+        )
+    }
 }
 
-/// Dense per-series rows forward-filled onto the master clock.
-#[derive(Clone, Debug, PartialEq)]
+/// Mixed-frequency stage query engine keyed by epoch-duration specs.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MixedFrequencyStrideGrid {
-    master_len: usize,
-    /// Row-major: one row per registered series, `cols == master_len`.
-    aligned: Array2<f64>,
     series_index: BTreeMap<String, usize>,
-    specs: Vec<SeriesStrideSpec>,
+    specs: Vec<SeriesDurationSpec>,
 }
 
 impl MixedFrequencyStrideGrid {
-    pub fn new(master_len: usize) -> Result<Self, ExecutionEngineError> {
-        if master_len == 0 {
-            return Err(ExecutionEngineError::EmptyMasterTimeline);
-        }
-        Ok(Self {
-            master_len,
-            aligned: Array2::zeros((0, master_len)),
-            series_index: BTreeMap::new(),
-            specs: Vec::new(),
-        })
-    }
-
-    pub fn master_len(&self) -> usize {
-        self.master_len
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn series_count(&self) -> usize {
         self.specs.len()
     }
 
-    pub fn spec(&self, series_id: &str) -> Option<&SeriesStrideSpec> {
+    pub fn spec(&self, series_id: &str) -> Option<&SeriesDurationSpec> {
         self.series_index
             .get(series_id)
             .map(|&row| &self.specs[row])
     }
 
-    pub fn aligned_row(&self, series_id: &str) -> Option<ndarray::ArrayView1<'_, f64>> {
-        self.series_index
-            .get(series_id)
-            .map(|&row| self.aligned.row(row))
-    }
-
-    pub fn aligned(&self) -> &Array2<f64> {
-        &self.aligned
-    }
-
-    /// Register a native-frequency payload and materialize its causal forward-filled row.
-    pub fn ingest_native_series(
-        &mut self,
-        spec: SeriesStrideSpec,
-        native_values: &[f64],
-    ) -> Result<(), ExecutionEngineError> {
-        if self.series_index.contains_key(&spec.series_id) {
-            self.specs[self.series_index[&spec.series_id]] = spec.clone();
+    pub fn register_series(&mut self, spec: SeriesDurationSpec) -> Result<(), ExecutionEngineError> {
+        if let Some(&row) = self.series_index.get(&spec.series_id) {
+            self.specs[row] = spec;
         } else {
             let row = self.specs.len();
             self.series_index.insert(spec.series_id.clone(), row);
-            self.specs.push(spec.clone());
-            if self.aligned.nrows() == 0 {
-                self.aligned = Array2::zeros((1, self.master_len));
-            } else {
-                self.aligned
-                    .append(
-                        ndarray::Axis(0),
-                        Array2::zeros((1, self.master_len)).view(),
-                    )
-                    .expect("append single row");
-            }
-        }
-
-        let emissions = spec.emission_indices(self.master_len);
-        if native_values.len() != emissions.len() {
-            return Err(ExecutionEngineError::SeriesLengthMismatch {
-                series: spec.series_id.clone(),
-                expected: emissions.len(),
-                got: native_values.len(),
-            });
-        }
-
-        let row_idx = self.series_index[&spec.series_id];
-        let mut scratch = vec![f64::NAN; self.master_len];
-        forward_fill_causal(&mut scratch, &emissions, native_values);
-        for (t, value) in scratch.iter().enumerate() {
-            self.aligned[(row_idx, t)] = *value;
+            self.specs.push(spec);
         }
         Ok(())
     }
 
+    pub fn register_from_stride_spec(
+        &mut self,
+        spec: SeriesStrideSpec,
+        bar_duration_secs: f64,
+    ) -> Result<(), ExecutionEngineError> {
+        self.register_series(spec.to_duration_spec(bar_duration_secs)?)
+    }
+
+    /// Query `MarketStage` over `(playhead_time - lookback) ..= playhead_time`.
+    pub fn query_stage_window(
+        &self,
+        stage: &crate::trading_stage::MarketStage,
+        series_id: &str,
+        prim_path: &str,
+        attribute: &str,
+        playhead_time: f64,
+    ) -> Result<Vec<f64>, ExecutionEngineError> {
+        let spec = self
+            .spec(series_id)
+            .ok_or_else(|| ExecutionEngineError::UnknownGraphNode(series_id.to_string()))?;
+        let (start, end) = spec.window_bounds(playhead_time)?;
+        Ok(stage
+            .samples_in_time_range(prim_path, attribute, start, end)
+            .into_iter()
+            .map(|(_, value)| f64::from(value))
+            .collect())
+    }
+
+    /// Forward-fill stage values at the spec's observation timestamps.
+    pub fn aligned_observations_at_playhead(
+        &self,
+        stage: &crate::trading_stage::MarketStage,
+        series_id: &str,
+        prim_path: &str,
+        attribute: &str,
+        playhead_time: f64,
+    ) -> Result<Vec<f64>, ExecutionEngineError> {
+        let spec = self
+            .spec(series_id)
+            .ok_or_else(|| ExecutionEngineError::UnknownGraphNode(series_id.to_string()))?;
+        let times = spec.observation_times(playhead_time)?;
+        Ok(times
+            .into_iter()
+            .filter_map(|t| stage.resolve_attribute_at(prim_path, attribute, t))
+            .map(f64::from)
+            .collect())
+    }
+
     pub fn hydrate_from_wire(
-        master_len: usize,
         entries: &[SeriesStrideSpecWire],
+        bar_duration_secs: f64,
     ) -> Result<Self, ExecutionEngineError> {
-        let mut grid = Self::new(master_len)?;
+        let mut grid = Self::new();
         for entry in entries {
             let spec = SeriesStrideSpec::new(&entry.series_id, entry.stride, entry.phase)?;
-            grid.ingest_native_series(spec, &entry.native_values)?;
+            grid.register_from_stride_spec(spec, bar_duration_secs)?;
         }
         Ok(grid)
     }
@@ -462,9 +534,12 @@ pub struct ExecutionEngine {
 
 impl ExecutionEngine {
     pub fn bootstrap(master_len: usize) -> Result<Self, ExecutionEngineError> {
+        if master_len == 0 {
+            return Err(ExecutionEngineError::EmptyMasterTimeline);
+        }
         Ok(Self {
             master_len,
-            stride_grid: MixedFrequencyStrideGrid::new(master_len)?,
+            stride_grid: MixedFrequencyStrideGrid::new(),
             compiled_order: Vec::new(),
         })
     }
@@ -490,12 +565,40 @@ impl ExecutionEngine {
         Ok(())
     }
 
+    pub fn register_series_duration(
+        &mut self,
+        spec: SeriesDurationSpec,
+    ) -> Result<(), ExecutionEngineError> {
+        self.stride_grid.register_series(spec)
+    }
+
+    pub fn register_series_stride(
+        &mut self,
+        spec: SeriesStrideSpec,
+        bar_duration_secs: f64,
+    ) -> Result<(), ExecutionEngineError> {
+        self.stride_grid
+            .register_from_stride_spec(spec, bar_duration_secs)
+    }
+
+    pub fn query_series_window(
+        &self,
+        stage: &crate::trading_stage::MarketStage,
+        series_id: &str,
+        prim_path: &str,
+        attribute: &str,
+        playhead_time: f64,
+    ) -> Result<Vec<f64>, ExecutionEngineError> {
+        self.stride_grid
+            .query_stage_window(stage, series_id, prim_path, attribute, playhead_time)
+    }
+
     pub fn ingest_series(
         &mut self,
         spec: SeriesStrideSpec,
-        native_values: &[f64],
+        _native_values: &[f64],
     ) -> Result<(), ExecutionEngineError> {
-        self.stride_grid.ingest_native_series(spec, native_values)
+        self.register_series_stride(spec, SECONDS_PER_DAY)
     }
 
     pub fn apply_transaction(
@@ -531,15 +634,57 @@ mod tests {
     }
 
     #[test]
-    fn mixed_frequency_grid_aligns_rows() {
-        let mut grid = MixedFrequencyStrideGrid::new(8).unwrap();
-        let spec = SeriesStrideSpec::new("h1", 2, 0).unwrap();
-        grid.ingest_native_series(spec, &[10.0, 20.0, 30.0, 40.0])
+    fn duration_spec_window_bounds_are_causal() {
+        let spec = SeriesDurationSpec::new("daily", SECONDS_PER_DAY * 5.0, SECONDS_PER_DAY).unwrap();
+        let (start, end) = spec.window_bounds(1_000_000.0).unwrap();
+        assert_eq!(end - start, SECONDS_PER_DAY * 5.0);
+    }
+
+    #[test]
+    fn mixed_frequency_grid_queries_stage_window() {
+        let mut grid = MixedFrequencyStrideGrid::new();
+        grid.register_series(
+            SeriesDurationSpec::new(
+                "daily_close",
+                SECONDS_PER_DAY * 3.0,
+                SECONDS_PER_DAY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut stage = MarketStage::new();
+        let prim = crate::trading_stage::asset_prim_path("SPY").unwrap();
+        stage.set_sample(&prim, "close", 100.0, 10.0).unwrap();
+        stage.set_sample(&prim, "close", 100.0 + SECONDS_PER_DAY, 20.0).unwrap();
+        stage.set_sample(&prim, "close", 100.0 + SECONDS_PER_DAY * 2.0, 30.0).unwrap();
+        let playhead = 100.0 + SECONDS_PER_DAY * 2.0;
+        let window = grid
+            .query_stage_window(&stage, "daily_close", &prim, "close", playhead)
             .unwrap();
-        let row = grid.aligned_row("h1").unwrap();
-        assert_eq!(row[0], 10.0);
-        assert_eq!(row[1], 10.0);
-        assert_eq!(row[2], 20.0);
+        assert_eq!(window, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn aligned_observations_forward_fill_from_stage() {
+        let mut grid = MixedFrequencyStrideGrid::new();
+        grid.register_series(
+            SeriesDurationSpec::new(
+                "daily_close",
+                SECONDS_PER_DAY * 2.0,
+                SECONDS_PER_DAY,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut stage = MarketStage::new();
+        let prim = crate::trading_stage::asset_prim_path("SPY").unwrap();
+        stage.set_sample(&prim, "close", 100.0, 10.0).unwrap();
+        stage.set_sample(&prim, "close", 100.0 + SECONDS_PER_DAY, 20.0).unwrap();
+        let playhead = 100.0 + SECONDS_PER_DAY + SECONDS_PER_DAY / 2.0;
+        let values = grid
+            .aligned_observations_at_playhead(&stage, "daily_close", &prim, "close", playhead)
+            .unwrap();
+        assert_eq!(values, vec![10.0, 20.0]);
     }
 
     #[test]

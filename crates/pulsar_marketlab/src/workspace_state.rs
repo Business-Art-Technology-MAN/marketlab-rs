@@ -24,7 +24,8 @@ use pulsar_marketlab::trading_stage::{
     analytics_prim_path, asset_prim_path, stage_time_from_bar_date, MarketStage,
 };
 use pulsar_marketlab::technical_analysis::{
-    build_ta_evaluation_closure, ta_indicator_label, MarketSeriesWindow, DEFAULT_TA_INDICATOR_ID,
+    build_ta_evaluation_closure, compute_ta_at_playhead_from_stage, ta_indicator_label,
+    MarketSeriesWindow, DEFAULT_TA_INDICATOR_ID,
     DEFAULT_TA_LOOKBACK,
 };
 
@@ -1106,6 +1107,43 @@ fn analytics_indicator_id(node: &VisualNode) -> String {
         .unwrap_or_else(|| format!("ta_{}", node.id))
 }
 
+fn refresh_ta_samples_at_playhead(
+    market_stage: &mut MarketStage,
+    nodes: &[VisualNode],
+    graph: &PipelineGraphSnapshot,
+    playhead_time: f64,
+) {
+    let portfolio_ta = portfolio_wired_ta_node_ids(graph);
+    for node in nodes {
+        if node.node_type != NodeType::TechnicalAnalysis || !portfolio_ta.contains(&node.id) {
+            continue;
+        }
+        let Some(asset_id) = upstream_asset_for_ta_node(node.id, graph) else {
+            continue;
+        };
+        let Some(asset) = graph.nodes.iter().find(|entry| entry.id == asset_id) else {
+            continue;
+        };
+        let Some(indicator_id) = node.ta_indicator_id.as_deref() else {
+            continue;
+        };
+        let lookback = ta_lookback_for_node(node);
+        let Some(value) = compute_ta_at_playhead_from_stage(
+            market_stage,
+            &asset.name,
+            indicator_id,
+            playhead_time,
+            lookback,
+        ) else {
+            continue;
+        };
+        let indicator_key = analytics_indicator_id(node);
+        if let Ok(prim) = analytics_prim_path(&indicator_key) {
+            let _ = market_stage.set_sample(&prim, "value", playhead_time, value as f32);
+        }
+    }
+}
+
 pub(crate) fn hydrate_market_stage_from_ohlc(
     stage: &mut MarketStage,
     ticker: &str,
@@ -1457,6 +1495,8 @@ impl TradingSystemWorkspace {
             return;
         }
         let t = self.playhead_time;
+        let graph = self.pipeline_graph.snapshot();
+        refresh_ta_samples_at_playhead(&mut self.market_stage, &self.nodes, &graph, t);
         let tick = self.playhead_tick_label();
         let mut rows = Vec::new();
 
