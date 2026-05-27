@@ -16,6 +16,8 @@ unicode-segmentation = "1.12"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
 num-traits = "0.2"
+ordered-float = "4.2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Directly links to the underlying Pulsar UI framework crates 
 # without triggering a nested workspace collision:

@@ -2,11 +2,13 @@
 
 use std::path::Path as StdPath;
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::*;
 
 use gpui_component::Root;
+use pulsar_marketlab::fix_engine::{spawn_mock_fix_bridge, FixPlayheadClock};
 
 mod asset_path_input;
 mod graph_compiler;
@@ -16,7 +18,7 @@ mod workspace_state;
 
 use graph_compiler::{portfolio_wired_ta_node_ids, SharedCsvAssetPaths, SharedPipelineGraph};
 use workspace_state::{
-    bootstrap_csv_execution_engine, csv_playback_is_active, default_pipeline_connections, default_pipeline_nodes,
+    csv_playback_is_active, default_pipeline_connections, default_pipeline_nodes,
     finalize_csv_playback_at_eof, format_multivector_scalar, hot_swap_csv_playback, init_csv_playback_from_path,
     market_window_from_yahoo_rows, restart_csv_playback, send_chart_series_preload, send_playhead_set,
     ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge, TradingSystemWorkspace,
@@ -103,6 +105,7 @@ fn spawn_csv_asset_feeder(
     tx: Sender<PipelineSystemMessage>,
     path_registry: SharedCsvAssetPaths,
     pipeline_graph: SharedPipelineGraph,
+    fix_clock: Arc<FixPlayheadClock>,
 ) {
     std::thread::spawn(move || {
         let mut playbacks = match init_csv_asset_playbacks(&path_registry) {
@@ -114,13 +117,6 @@ fn spawn_csv_asset_feeder(
             }
         };
 
-        let mut csv_engine = match bootstrap_csv_execution_engine() {
-            Ok(engine) => engine,
-            Err(error) => {
-                let _ = tx.send(PipelineSystemMessage::StatusAlert { text: error });
-                return;
-            }
-        };
         let mut ta_execution = TaExecutionBridge::new();
 
         for playback in &playbacks {
@@ -153,7 +149,7 @@ fn spawn_csv_asset_feeder(
             if config_changed || registry_changed {
                 last_graph_revision = graph_revision;
                 last_paths_revision = paths_revision;
-                restart_csv_playback(&mut playbacks, &mut csv_engine, &mut ta_execution, &tx);
+                restart_csv_playback(&mut playbacks, &mut ta_execution, &tx);
             }
 
             if !csv_playback_is_active(&playbacks) {
@@ -162,7 +158,6 @@ fn spawn_csv_asset_feeder(
 
             let graph = pipeline_graph.snapshot();
             let portfolio_ta_filter = portfolio_wired_ta_node_ids(&graph);
-            let sim_tick = ta_execution.simulation_tick();
             let mut any_processed = false;
             let mut epoch_end = false;
             let mut last_close = 0.0;
@@ -179,8 +174,16 @@ fn spawn_csv_asset_feeder(
                 last_label = Some(row.date.clone());
                 let window =
                     market_window_from_yahoo_rows(&playback.rows, playback.cursor + 1);
-                TaExecutionBridge::record_market_price(&mut csv_engine, sim_tick, row.close);
-                let execution = (&mut csv_engine, &mut ta_execution, &tx);
+                let bar_time = pulsar_marketlab::stage_time_from_bar_date(&row.date)
+                    .unwrap_or(playback.cursor as f64);
+                fix_clock.set_bar_epoch(bar_time);
+                TaExecutionBridge::record_market_price(
+                    ta_execution.simulation_stage_mut(),
+                    &playback.ticker,
+                    bar_time,
+                    row.close,
+                );
+                let execution = (&mut ta_execution, &tx);
                 let mut messages = vec![PipelineSystemMessage::TickUpdate {
                     tick_index: playback.cursor,
                     tick_label: Some(row.date.clone()),
@@ -191,7 +194,7 @@ fn spawn_csv_asset_feeder(
                 messages.extend(ta_tick_messages_for_asset(
                     playback.node_id,
                     0,
-                    sim_tick,
+                    playback.cursor,
                     Some(row.date.clone()),
                     &playback.ticker,
                     &window,
@@ -222,7 +225,16 @@ fn spawn_csv_asset_feeder(
             }
 
             if any_processed {
-                ta_execution.finish_simulation_tick(&csv_engine, last_close);
+                let bar_time = last_label
+                    .as_deref()
+                    .and_then(pulsar_marketlab::stage_time_from_bar_date)
+                    .unwrap_or(0.0);
+                let ticker = playbacks
+                    .iter()
+                    .find(|playback| !playback.rows.is_empty())
+                    .map(|playback| playback.ticker.as_str())
+                    .unwrap_or("SPY");
+                ta_execution.finish_simulation_tick(bar_time, &[ticker], last_close);
             }
             if epoch_end {
                 finalize_csv_playback_at_eof(&mut playbacks, &tx, last_label);
@@ -240,10 +252,26 @@ fn main() {
     let pipeline_graph = SharedPipelineGraph::new(default_nodes.clone(), default_connections);
 
     let (pipeline_tx, pipeline_rx) = mpsc::channel::<PipelineSystemMessage>();
+    let fix_clock = Arc::new(FixPlayheadClock::new());
+    spawn_mock_fix_bridge(
+        {
+            let tx = pipeline_tx.clone();
+            move |write| {
+                let _ = tx.send(PipelineSystemMessage::StageSample {
+                    prim_path: write.prim_path,
+                    attribute: write.attribute,
+                    time: write.time,
+                    value: write.value,
+                });
+            }
+        },
+        fix_clock.clone(),
+    );
     spawn_csv_asset_feeder(
         pipeline_tx.clone(),
         csv_path_registry.clone(),
         pipeline_graph.clone(),
+        fix_clock,
     );
 
     Application::new().with_assets(NoAssets).run(|cx: &mut App| {

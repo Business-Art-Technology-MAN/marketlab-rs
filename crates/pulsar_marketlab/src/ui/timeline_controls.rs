@@ -15,6 +15,8 @@ impl TradingSystemWorkspace {
             return;
         }
         self.playhead_current = index.min(self.playhead_total_bars - 1);
+        self.sync_playhead_time_from_index();
+        self.synchronize_inspector_view();
         self.recompute_playhead_diagnostics();
         cx.notify();
     }

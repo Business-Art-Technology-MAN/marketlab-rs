@@ -13,9 +13,10 @@ use pulsar_marketlab::technical_analysis::{
 use std::path::PathBuf;
 use crate::asset_path_input::PathInputEvent;
 use crate::workspace_state::{
-    load_yahoo_finance_csv, chart_buffer_from_csv_rows, ohlc_bars_from_csv_rows, csv_node_label_from_path,
-    format_currency, format_percent_magnitude, format_percent_signed, format_ratio, format_tick_label,
-    MatrixDataRow, TradingSystemWorkspace, SIM_INITIAL_CASH,
+    chart_buffer_from_csv_rows, csv_node_label_from_path, hydrate_market_stage_from_ohlc,
+    load_yahoo_finance_csv, ohlc_bars_from_csv_rows, format_currency, format_percent_magnitude,
+    format_percent_signed, format_ratio, format_tick_label, MatrixDataRow, TradingSystemWorkspace,
+    SIM_INITIAL_CASH,
 };
 
 impl TradingSystemWorkspace {
@@ -179,8 +180,19 @@ impl TradingSystemWorkspace {
                 if ohlc_bars.is_empty() {
                     self.asset_ohlc_history.remove(&node_id);
                 } else {
-                    self.asset_ohlc_history.insert(node_id, ohlc_bars);
+                    self.asset_ohlc_history
+                        .insert(node_id, ohlc_bars.clone());
+                    if let Some(node) = self.nodes.iter().find(|node| node.id == node_id) {
+                        hydrate_market_stage_from_ohlc(
+                            &mut self.market_stage,
+                            &node.name,
+                            &ohlc_bars,
+                        );
+                    }
                 }
+                self.sync_playhead_bounds();
+                self.sync_playhead_time_from_index();
+                self.synchronize_inspector_view();
             }
             Err(error) => {
                 self.push_status_log(format!("Chart reload failed for `{path}`: {error}"));

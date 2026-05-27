@@ -23,15 +23,10 @@ use crate::execution_engine::ExecutionEngine;
 
 /// Read-only surface Layer 2 exposes to the signal kernel.
 pub trait ExecutionEngineFeed {
-    fn tracking_matrix(&self) -> &Array2<f64>;
     fn master_timeline_len(&self) -> usize;
 }
 
 impl ExecutionEngineFeed for ExecutionEngine {
-    fn tracking_matrix(&self) -> &Array2<f64> {
-        self.tracking().values()
-    }
-
     fn master_timeline_len(&self) -> usize {
         self.master_len()
     }
@@ -845,8 +840,6 @@ impl SignalKernel {
 mod tests {
     use super::*;
     use crate::execution_engine::ExecutionEngine;
-    use crate::trading_stage::TradingStage;
-    use ndarray::Array2;
 
     fn sample_close(n: usize) -> Vec<f64> {
         (0..n).map(|i| 100.0 + (i as f64) * 0.5 + (i as f64).sin()).collect()
@@ -924,15 +917,7 @@ mod tests {
 
     #[test]
     fn kernel_bootstraps_from_execution_engine() {
-        let stage = TradingStage::new(Array2::zeros((32, 3)));
-        let engine = ExecutionEngine::bootstrap(
-            &stage,
-            &["exec.a".into()],
-            1,
-            10_000.0,
-            &[0.0],
-        )
-        .unwrap();
+        let engine = ExecutionEngine::bootstrap(32).unwrap();
         let kernel = SignalKernel::bootstrap(
             &engine,
             &["sig.macd".into(), "sig.adx".into()],
@@ -945,8 +930,7 @@ mod tests {
 
     #[test]
     fn ingest_macd_binds_projection_channels() {
-        let stage = TradingStage::new(Array2::zeros((48, 1)));
-        let engine = ExecutionEngine::bootstrap(&stage, &["x".into()], 1, 0.0, &[0.0]).unwrap();
+        let engine = ExecutionEngine::bootstrap(48).unwrap();
         let mut kernel = SignalKernel::bootstrap(
             &engine,
             &["macd.line".into(), "macd.signal".into(), "macd.hist".into()],

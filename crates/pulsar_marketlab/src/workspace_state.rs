@@ -16,15 +16,19 @@ use crate::graph_compiler::{
     SharedPipelineGraph, VisualNode,
 };
 use crate::ohlc_chart_pane::OhlcBar;
-use pulsar_marketlab::execution_engine::{ExecutionEngine, SimulationTransaction};
-use pulsar_marketlab::trading_stage::TradingStage;
+use pulsar_marketlab::execution_engine::{
+    ExecutionEngine, SimulationTransaction, StageSimulationLedger, EXECUTION_CASH_ATTR,
+    EXECUTION_CASH_PATH, position_prim_path,
+};
+use pulsar_marketlab::trading_stage::{
+    analytics_prim_path, asset_prim_path, stage_time_from_bar_date, MarketStage,
+};
 use pulsar_marketlab::technical_analysis::{
     build_ta_evaluation_closure, ta_indicator_label, MarketSeriesWindow, DEFAULT_TA_INDICATOR_ID,
     DEFAULT_TA_LOOKBACK,
 };
 
 pub const DEFAULT_CSV_ASSET_PATH: &str = "data/SPY.csv";
-pub const INSPECTOR_BUFFER_CAP: usize = 256;
 pub(crate) const CHART_Y_PADDING_RATIO: f32 = 0.08;
 pub(crate) const CHART_Y_MIN_SPAN: f32 = 1.0;
 pub(crate) const CHART_STROKE_WIDTH: f32 = 1.5;
@@ -36,7 +40,7 @@ pub const SIM_DEPLOY_FRACTION: f64 = 0.95;
 pub const SIM_INITIAL_CASH: f64 = 10_000.0;
 pub const SHARPE_ANNUALIZATION: f64 = 252.0;
 const CSV_PLAYBACK_INTERVAL: Duration = Duration::from_millis(400);
-const CSV_EXECUTION_TIMELINE_CAP: usize = 4096;
+pub const CSV_EXECUTION_TIMELINE_CAP: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub enum PipelineSystemMessage {
@@ -87,9 +91,41 @@ pub enum PipelineSystemMessage {
         #[allow(dead_code)]
         tick_label: Option<String>,
     },
+    /// Hydrate UI `market_stage` from simulation-thread ledger or FIX bridge writes.
+    StageSample {
+        prim_path: String,
+        attribute: String,
+        time: f64,
+        value: f32,
+    },
 }
 pub(crate) fn format_tick_label(tick_index: usize) -> String {
     format!("{tick_index:04}")
+}
+
+fn mirror_ledger_transaction(
+    tx: &Sender<PipelineSystemMessage>,
+    stage: &MarketStage,
+    transaction: &SimulationTransaction,
+) {
+    let cash = StageSimulationLedger::cash_at(stage, transaction.time);
+    let _ = tx.send(PipelineSystemMessage::StageSample {
+        prim_path: EXECUTION_CASH_PATH.to_string(),
+        attribute: EXECUTION_CASH_ATTR.to_string(),
+        time: transaction.time,
+        value: cash as f32,
+    });
+    for (ticker, _) in &transaction.position_deltas {
+        if let Ok(path) = position_prim_path(ticker) {
+            let shares = StageSimulationLedger::shares_at(stage, ticker, transaction.time);
+            let _ = tx.send(PipelineSystemMessage::StageSample {
+                prim_path: path,
+                attribute: "shares".to_string(),
+                time: transaction.time,
+                value: shares as f32,
+            });
+        }
+    }
 }
 
 pub(crate) fn format_multivector_scalar(value: f64) -> String {
@@ -150,23 +186,56 @@ fn sim_buy_qty(cash: f64, price: f64) -> f64 {
     ((cash * SIM_DEPLOY_FRACTION) / price).floor()
 }
 
-fn nav_at_tick(engine: &ExecutionEngine, t: usize, mark_price: f64) -> Option<f64> {
-    let resolved_mark = resolve_mark_price_for_tick(engine, t, mark_price);
-    let cash = engine.account().cash_at(t).ok()?;
-    let qty = engine.account().asset_qty_at(t, 0).ok()?;
-    Some(cash + qty * resolved_mark)
+fn nav_at_time(stage: &MarketStage, t: f64, tickers: &[&str]) -> Option<f64> {
+    if !t.is_finite() {
+        return None;
+    }
+    Some(StageSimulationLedger::nav_at_time(stage, t, tickers))
 }
 
-/// Prefer a finite non-zero `market.raw` sample at `t`, walking backward; else use `fallback`.
-fn resolve_mark_price_for_tick(engine: &ExecutionEngine, t: usize, fallback: f64) -> f64 {
-    let resolved = engine.resolve_mark_price_at(t);
-    if resolved.is_finite() && resolved > 0.0 {
-        return resolved;
-    }
-    if fallback.is_finite() && fallback > 0.0 {
-        return fallback;
-    }
-    fallback.max(0.0)
+fn resolve_mark_price_at_time(
+    stage: &MarketStage,
+    ticker: &str,
+    t: f64,
+    fallback: f64,
+) -> f64 {
+    StageSimulationLedger::mark_price_at(stage, ticker, t).unwrap_or_else(|| {
+        if fallback.is_finite() && fallback > 0.0 {
+            fallback
+        } else {
+            fallback.max(0.0)
+        }
+    })
+}
+
+fn compute_portfolio_diagnostics(
+    nav_history: &[f64],
+    mark_prices: &[f64],
+    exposure_samples: &[f64],
+    trade_count: u32,
+    simulation_epoch: u64,
+    tick_index: usize,
+    tick_label: Option<String>,
+    mark_price: f64,
+    cash: f64,
+    position_qty: f64,
+    initial_cash: f64,
+) -> PortfolioDiagnosticsSnapshot {
+    let mut sanitized_marks = mark_prices.to_vec();
+    sanitize_mark_price_series(&mut sanitized_marks);
+    compute_metrics_from_nav_history(
+        nav_history,
+        &sanitized_marks,
+        exposure_samples,
+        trade_count,
+        simulation_epoch,
+        tick_index,
+        tick_label,
+        mark_price,
+        cash,
+        position_qty,
+        initial_cash,
+    )
 }
 
 fn sanitize_mark_price_series(mark_prices: &mut [f64]) {
@@ -182,38 +251,6 @@ fn sanitize_mark_price_series(mark_prices: &mut [f64]) {
             *price = last_valid;
         }
     }
-}
-
-fn compute_portfolio_diagnostics(
-    nav_history: &[f64],
-    mark_prices: &[f64],
-    exposure_samples: &[f64],
-    trade_count: u32,
-    simulation_epoch: u64,
-    tick_index: usize,
-    tick_label: Option<String>,
-    mark_price: f64,
-    cash: f64,
-    position_qty: f64,
-    initial_cash: f64,
-    engine: &ExecutionEngine,
-) -> PortfolioDiagnosticsSnapshot {
-    let mut sanitized_marks = mark_prices.to_vec();
-    sanitize_mark_price_series(&mut sanitized_marks);
-    let resolved_mark = resolve_mark_price_for_tick(engine, tick_index, mark_price);
-    compute_metrics_from_nav_history(
-        nav_history,
-        &sanitized_marks,
-        exposure_samples,
-        trade_count,
-        simulation_epoch,
-        tick_index,
-        tick_label,
-        resolved_mark,
-        cash,
-        position_qty,
-        initial_cash,
-    )
 }
 
 fn compute_metrics_from_nav_history(
@@ -410,11 +447,13 @@ pub(crate) struct TaExecutionBridge {
     simulation_tick: usize,
     /// Incremented on every replay so UI can ignore stale metric frames.
     simulation_epoch: u64,
+    /// Continuous-time execution ledger for the CSV simulation thread.
+    simulation_stage: MarketStage,
 }
 
 impl TaExecutionBridge {
     pub(crate) fn new() -> Self {
-        Self {
+        let mut bridge = Self {
             prior_values: HashMap::new(),
             nav_history: Vec::new(),
             mark_prices: Vec::new(),
@@ -422,18 +461,26 @@ impl TaExecutionBridge {
             trade_count: 0,
             simulation_tick: 0,
             simulation_epoch: 0,
-        }
+            simulation_stage: MarketStage::new(),
+        };
+        bridge.reset_simulation_ledger();
+        bridge
     }
 
-    pub(crate) fn simulation_tick(&self) -> usize {
-        self.simulation_tick
+    pub(crate) fn simulation_stage_mut(&mut self) -> &mut MarketStage {
+        &mut self.simulation_stage
+    }
+
+    pub(crate) fn reset_simulation_ledger(&mut self) {
+        StageSimulationLedger::reset_execution_paths(&mut self.simulation_stage);
+        let _ = StageSimulationLedger::seed_initial_cash(&mut self.simulation_stage, SIM_INITIAL_CASH);
     }
 
     fn simulation_epoch(&self) -> u64 {
         self.simulation_epoch
     }
 
-    fn begin_new_epoch(&mut self) {
+    pub(crate) fn begin_new_epoch(&mut self) {
         self.simulation_epoch = self.simulation_epoch.saturating_add(1);
         self.prior_values.clear();
         self.nav_history.clear();
@@ -441,30 +488,36 @@ impl TaExecutionBridge {
         self.exposure_samples.clear();
         self.trade_count = 0;
         self.simulation_tick = 0;
+        self.reset_simulation_ledger();
     }
 
-    fn ta_tracking_channel(ta_node_id: usize) -> String {
-        format!("ta.{ta_node_id}.value")
-    }
-
-    pub(crate) fn clear_ta_signal_slot(&mut self, ta_node_id: usize, engine: &mut ExecutionEngine) {
+    pub(crate) fn clear_ta_signal_slot(&mut self, ta_node_id: usize, ui_stage: &mut MarketStage) {
         self.prior_values.remove(&ta_node_id);
-        let _ = engine.clear_channel_data(&Self::ta_tracking_channel(ta_node_id));
+        let indicator_id = format!("ta_{ta_node_id}");
+        if let Ok(path) = analytics_prim_path(&indicator_id) {
+            ui_stage.prims.remove(&path);
+            self.simulation_stage.prims.remove(&path);
+        }
     }
 
     pub(crate) fn record_market_price(
-        engine: &mut ExecutionEngine,
-        tick_index: usize,
+        stage: &mut MarketStage,
+        ticker: &str,
+        bar_time: f64,
         price: f64,
     ) {
-        let _ = engine.write_tracking_sample(tick_index, "market.raw", price);
+        if !price.is_finite() || price <= 0.0 || !bar_time.is_finite() {
+            return;
+        }
+        if let Ok(prim) = asset_prim_path(ticker) {
+            let _ = stage.set_sample(&prim, "close", bar_time, price as f32);
+        }
     }
 
     fn ingest_ta_sample(
         &mut self,
-        engine: &mut ExecutionEngine,
-        ta_node: &VisualNode,
-        tick_index: usize,
+        node: &VisualNode,
+        bar_time: f64,
         value: Option<f64>,
         price: f64,
         asset_label: &str,
@@ -473,19 +526,22 @@ impl TaExecutionBridge {
         let Some(value) = value else {
             return;
         };
-        if !value.is_finite() {
+        if !value.is_finite() || !bar_time.is_finite() {
             return;
         }
 
-        let channel = Self::ta_tracking_channel(ta_node.id);
-        let _ = engine.write_tracking_sample(tick_index, &channel, value);
-        Self::record_market_price(engine, tick_index, price);
+        let indicator_id = analytics_indicator_id(node);
+        if let Ok(prim) = analytics_prim_path(&indicator_id) {
+            let _ = self
+                .simulation_stage
+                .set_sample(&prim, "value", bar_time, value as f32);
+        }
+        Self::record_market_price(&mut self.simulation_stage, asset_label, bar_time, price);
 
-        if ta_node.ta_indicator_id.as_deref() == Some("rsi") {
+        if node.ta_indicator_id.as_deref() == Some("rsi") {
             self.evaluate_rsi_crossing(
-                engine,
-                ta_node.id,
-                tick_index,
+                node.id,
+                bar_time,
                 value,
                 price,
                 asset_label,
@@ -496,9 +552,8 @@ impl TaExecutionBridge {
 
     fn evaluate_rsi_crossing(
         &mut self,
-        engine: &mut ExecutionEngine,
         ta_node_id: usize,
-        tick_index: usize,
+        bar_time: f64,
         value: f64,
         price: f64,
         asset_label: &str,
@@ -510,18 +565,19 @@ impl TaExecutionBridge {
         };
 
         if prior <= TA_RSI_OVERSOLD && value > TA_RSI_OVERSOLD {
-            let cash = engine.account().cash_at(tick_index).unwrap_or(0.0);
+            let cash = StageSimulationLedger::cash_at(&self.simulation_stage, bar_time);
             let qty = sim_buy_qty(cash, price);
             if qty <= f64::EPSILON {
                 return;
             }
             let cost = price * qty;
             let transaction = SimulationTransaction {
-                time_index: tick_index,
+                time: bar_time,
                 cash_delta: -cost,
-                asset_deltas: vec![(0, qty)],
+                position_deltas: vec![(asset_label.to_string(), qty)],
             };
-            if engine.apply_transaction(&transaction).is_ok() {
+            if ExecutionEngine::apply_transaction(&mut self.simulation_stage, &transaction).is_ok() {
+                mirror_ledger_transaction(tx, &self.simulation_stage, &transaction);
                 self.trade_count = self.trade_count.saturating_add(1);
                 let _ = tx.send(PipelineSystemMessage::StatusAlert {
                     text: format!(
@@ -530,17 +586,18 @@ impl TaExecutionBridge {
                 });
             }
         } else if prior >= TA_RSI_OVERBOUGHT && value < TA_RSI_OVERBOUGHT {
-            let qty = engine.account().asset_qty_at(tick_index, 0).unwrap_or(0.0);
+            let qty = StageSimulationLedger::shares_at(&self.simulation_stage, asset_label, bar_time);
             if qty <= f64::EPSILON {
                 return;
             }
             let proceeds = price * qty;
             let transaction = SimulationTransaction {
-                time_index: tick_index,
+                time: bar_time,
                 cash_delta: proceeds,
-                asset_deltas: vec![(0, -qty)],
+                position_deltas: vec![(asset_label.to_string(), -qty)],
             };
-            if engine.apply_transaction(&transaction).is_ok() {
+            if ExecutionEngine::apply_transaction(&mut self.simulation_stage, &transaction).is_ok() {
+                mirror_ledger_transaction(tx, &self.simulation_stage, &transaction);
                 self.trade_count = self.trade_count.saturating_add(1);
                 let _ = tx.send(PipelineSystemMessage::StatusAlert {
                     text: format!(
@@ -560,17 +617,14 @@ impl TaExecutionBridge {
         )
     }
 
-    fn ledger_tick_index(&self, engine: &ExecutionEngine) -> usize {
-        self.simulation_tick
-            .min(engine.master_len().saturating_sub(1))
-    }
-
     /// Append NAV for the current simulation step (CSV feeder live alerts path).
-    pub(crate) fn finish_simulation_tick(&mut self, engine: &ExecutionEngine, mark_price: f64) {
-        let tick_index = self.ledger_tick_index(engine);
-        let resolved_mark = resolve_mark_price_for_tick(engine, tick_index, mark_price);
-        if let Some(nav) = nav_at_tick(engine, tick_index, resolved_mark) {
-            let position_qty = engine.account().asset_qty_at(tick_index, 0).unwrap_or(0.0);
+    pub(crate) fn finish_simulation_tick(&mut self, bar_time: f64, tickers: &[&str], mark_price: f64) {
+        let resolved_mark = resolve_mark_price_at_time(&self.simulation_stage, tickers[0], bar_time, mark_price);
+        if let Some(nav) = nav_at_time(&self.simulation_stage, bar_time, tickers) {
+            let position_qty = tickers
+                .first()
+                .map(|ticker| StageSimulationLedger::shares_at(&self.simulation_stage, ticker, bar_time))
+                .unwrap_or(0.0);
             let exposure = if nav.abs() > f64::EPSILON {
                 (position_qty * resolved_mark) / nav
             } else {
@@ -617,54 +671,32 @@ impl TaExecutionBridge {
     }
 }
 
-pub fn bootstrap_csv_execution_engine() -> Result<ExecutionEngine, String> {
-    let stage = TradingStage::zeros(CSV_EXECUTION_TIMELINE_CAP, 1)
-        .map_err(|error| format!("CSV execution timeline bootstrap failed: {error}"))?;
-    ExecutionEngine::bootstrap(
-        &stage,
-        &["market.raw".into()],
-        1,
-        SIM_INITIAL_CASH,
-        &[0.0],
-    )
-    .map_err(|error| format!("CSV ExecutionEngine bootstrap failed: {error}"))
-}
-
 pub fn restart_csv_playback(
     playbacks: &mut [CsvAssetPlayback],
-    csv_engine: &mut ExecutionEngine,
     ta_execution: &mut TaExecutionBridge,
     tx: &Sender<PipelineSystemMessage>,
 ) {
-    match bootstrap_csv_execution_engine() {
-        Ok(engine) => {
-            *csv_engine = engine;
-            ta_execution.begin_new_epoch();
-            for playback in playbacks.iter_mut() {
-                playback.cursor = 0;
-                playback.reader_paused = playback.rows.is_empty();
-            }
-            let epoch = ta_execution.simulation_epoch();
-            let _ = tx.send(PipelineSystemMessage::ResetSimulation { simulation_epoch: epoch });
-            ta_execution.publish_baseline(tx);
-            let active_sources = playbacks
-                .iter()
-                .filter(|playback| !playback.rows.is_empty())
-                .count();
-            if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
-                send_playhead_set(tx, 0, playback.rows.len(), None);
-            }
-            let _ = tx.send(PipelineSystemMessage::StatusAlert {
-                text: format!(
-                    "CSV replay started — epoch {epoch}, {active_sources} source(s) @ {}ms/tick",
-                    CSV_PLAYBACK_INTERVAL.as_millis()
-                ),
-            });
-        }
-        Err(error) => {
-            let _ = tx.send(PipelineSystemMessage::StatusAlert { text: error });
-        }
+    ta_execution.begin_new_epoch();
+    for playback in playbacks.iter_mut() {
+        playback.cursor = 0;
+        playback.reader_paused = playback.rows.is_empty();
     }
+    let epoch = ta_execution.simulation_epoch();
+    let _ = tx.send(PipelineSystemMessage::ResetSimulation { simulation_epoch: epoch });
+    ta_execution.publish_baseline(tx);
+    let active_sources = playbacks
+        .iter()
+        .filter(|playback| !playback.rows.is_empty())
+        .count();
+    if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
+        send_playhead_set(tx, 0, playback.rows.len(), None);
+    }
+    let _ = tx.send(PipelineSystemMessage::StatusAlert {
+        text: format!(
+            "CSV replay started — epoch {epoch}, {active_sources} source(s) @ {}ms/tick",
+            CSV_PLAYBACK_INTERVAL.as_millis()
+        ),
+    });
 }
 
 pub fn finalize_csv_playback_at_eof(
@@ -713,7 +745,6 @@ pub fn csv_playback_is_active(playbacks: &[CsvAssetPlayback]) -> bool {
 }
 
 type TaExecutionSideEffects<'a> = (
-    &'a mut ExecutionEngine,
     &'a mut TaExecutionBridge,
     &'a Sender<PipelineSystemMessage>,
 );
@@ -737,7 +768,7 @@ pub fn ta_tick_messages_for_asset(
                          wired_nodes: &[&VisualNode],
                          execution: Option<TaExecutionSideEffects<'_>>| {
         match execution {
-            Some((engine, bridge, tx)) => {
+            Some((bridge, tx)) => {
                 for node in wired_nodes {
                     if portfolio_ta_filter.is_some_and(|allowed| !allowed.contains(&node.id)) {
                         continue;
@@ -747,10 +778,13 @@ pub fn ta_tick_messages_for_asset(
                     };
                     let label = ta_indicator_label(indicator_id).unwrap_or(indicator_id);
                     let value = ta_compute_for_node(node, window);
+                    let bar_time = tick_label
+                        .as_deref()
+                        .and_then(stage_time_from_bar_date)
+                        .unwrap_or(tick_index as f64);
                     bridge.ingest_ta_sample(
-                        engine,
                         node,
-                        tick_index,
+                        bar_time,
                         value,
                         price,
                         asset_source,
@@ -906,9 +940,15 @@ fn evaluate_portfolio_at_playhead(
         return None;
     }
 
-    let mut engine = bootstrap_csv_execution_engine().ok()?;
     let mut bridge = TaExecutionBridge::new();
     let sink = mpsc::channel::<PipelineSystemMessage>().0;
+    let primary_ticker = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == primary_asset)
+        .map(|node| node.name.clone())
+        .unwrap_or_else(|| "SPY".to_string());
+    let tickers = [primary_ticker.as_str()];
 
     let nodes_by_id: HashMap<usize, VisualNode> = graph
         .nodes
@@ -917,7 +957,7 @@ fn evaluate_portfolio_at_playhead(
         .collect();
 
     for tick in 0..=end {
-        let sim_tick = bridge.simulation_tick();
+        let bar_time = stage_time_from_bar_date(&primary_bars[tick].date)?;
         let mut last_close = primary_bars
             .get(tick)
             .map(|bar| bar.close)
@@ -938,7 +978,12 @@ fn evaluate_portfolio_at_playhead(
                     }
                     let row = &rows[tick];
                     if row.close.is_finite() && row.close > 0.0 {
-                        TaExecutionBridge::record_market_price(&mut engine, sim_tick, row.close);
+                        TaExecutionBridge::record_market_price(
+                            bridge.simulation_stage_mut(),
+                            &node.name,
+                            bar_time,
+                            row.close,
+                        );
                         last_close = row.close;
                     }
                 }
@@ -978,9 +1023,8 @@ fn evaluate_portfolio_at_playhead(
                     let value = (closure.run)(tick, ta_lookback_for_node(node))
                         .map(f64::from);
                     bridge.ingest_ta_sample(
-                        &mut engine,
                         node,
-                        sim_tick,
+                        bar_time,
                         value,
                         price,
                         &ticker,
@@ -991,21 +1035,20 @@ fn evaluate_portfolio_at_playhead(
             }
         }
 
-        bridge.finish_simulation_tick(&engine, last_close);
+        bridge.finish_simulation_tick(bar_time, &tickers, last_close);
     }
 
-    let tick_index = bridge.nav_history.len().saturating_sub(1);
-    let ledger_tick = tick_index.min(engine.master_len().saturating_sub(1));
+    let playhead_time = stage_time_from_bar_date(&primary_bars[end].date)?;
     let bar_close = primary_bars.get(end).map(|bar| bar.close).unwrap_or(0.0);
-    let mark_price = resolve_mark_price_for_tick(&engine, ledger_tick, bar_close);
-    let cash = engine
-        .account()
-        .cash_at(ledger_tick)
-        .unwrap_or(SIM_INITIAL_CASH);
-    let position_qty = engine
-        .account()
-        .asset_qty_at(ledger_tick, 0)
-        .unwrap_or(0.0);
+    let mark_price = resolve_mark_price_at_time(
+        &bridge.simulation_stage,
+        &primary_ticker,
+        playhead_time,
+        bar_close,
+    );
+    let cash = StageSimulationLedger::cash_at(&bridge.simulation_stage, playhead_time);
+    let position_qty =
+        StageSimulationLedger::shares_at(&bridge.simulation_stage, &primary_ticker, playhead_time);
     let (nav_history, mark_prices, exposure_samples, trade_count) = bridge.metrics_inputs();
     Some(compute_portfolio_diagnostics(
         nav_history,
@@ -1013,13 +1056,12 @@ fn evaluate_portfolio_at_playhead(
         exposure_samples,
         trade_count,
         0,
-        tick_index,
+        end,
         tick_label,
         mark_price,
         cash,
         position_qty,
         SIM_INITIAL_CASH,
-        &engine,
     ))
 }
 
@@ -1056,6 +1098,55 @@ pub fn preload_asset_ohlc_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, Vec
         }
     }
     history
+}
+
+fn analytics_indicator_id(node: &VisualNode) -> String {
+    node.ta_indicator_id
+        .clone()
+        .unwrap_or_else(|| format!("ta_{}", node.id))
+}
+
+pub(crate) fn hydrate_market_stage_from_ohlc(
+    stage: &mut MarketStage,
+    ticker: &str,
+    bars: &[OhlcBar],
+) {
+    let Ok(prim) = asset_prim_path(ticker) else {
+        return;
+    };
+    for bar in bars {
+        let Some(time) = stage_time_from_bar_date(&bar.date) else {
+            continue;
+        };
+        let _ = stage.set_sample(&prim, "open", time, bar.open as f32);
+        let _ = stage.set_sample(&prim, "high", time, bar.high as f32);
+        let _ = stage.set_sample(&prim, "low", time, bar.low as f32);
+        let _ = stage.set_sample(&prim, "close", time, bar.close as f32);
+    }
+}
+
+pub(crate) fn hydrate_market_stage_from_workspace(
+    stage: &mut MarketStage,
+    nodes: &[VisualNode],
+    ohlc_by_node: &HashMap<usize, Vec<OhlcBar>>,
+) {
+    stage.prims.clear();
+    for node in nodes {
+        if !matches!(node.node_type, NodeType::Asset) {
+            continue;
+        }
+        if !matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) {
+            continue;
+        }
+        let Some(bars) = ohlc_by_node.get(&node.id) else {
+            continue;
+        };
+        hydrate_market_stage_from_ohlc(stage, &node.name, bars);
+    }
+}
+
+fn stage_time_for_bar_index(bars: &[OhlcBar], index: usize) -> Option<f64> {
+    bars.get(index).and_then(|bar| stage_time_from_bar_date(&bar.date))
 }
 
 pub fn send_chart_series_preload(
@@ -1113,6 +1204,8 @@ pub struct TradingSystemWorkspace {
     pub pipeline_graph: SharedPipelineGraph,
     pub asset_chart_history: HashMap<usize, ChartHistoryBuffer>,
     pub asset_ohlc_history: HashMap<usize, Vec<OhlcBar>>,
+    /// Phase B Layer 1 market stage (path-addressable time-sampled attributes).
+    pub(crate) market_stage: MarketStage,
     pub selected_node_id: Option<usize>,
     pub active_drag_node_id: Option<usize>,
     pub drag_offset: Point<Pixels>,
@@ -1132,11 +1225,13 @@ pub struct TradingSystemWorkspace {
     pub(crate) portfolio_metrics_epoch: u64,
     /// Global synchronized OHLC playhead (0-based bar index).
     pub(crate) playhead_current: usize,
+    /// Continuous stage coordinate for the active playhead (derived from bar date).
+    pub(crate) playhead_time: f64,
     pub(crate) playhead_total_bars: usize,
     pub(crate) playhead_scrubbing: bool,
     pub(crate) ohlc_chart_bounds: Option<Bounds<Pixels>>,
-    /// Cached `(playhead_current, graph_revision)` for playhead evaluation short-circuit.
-    pub(crate) last_calculated_state: (usize, u64),
+    /// Cached `(playhead_time, graph_revision)` for playhead evaluation short-circuit.
+    pub(crate) last_calculated_state: (f64, u64),
     /// Editable CSV path field for the selected asset node.
     pub(crate) asset_path_input: Entity<AssetPathInput>,
     /// Cached bounds for the TA lookback slider track (inspector sidebar).
@@ -1223,32 +1318,21 @@ impl TradingSystemWorkspace {
         .detach();
 
         let nodes = default_pipeline_nodes();
+        let asset_ohlc_history = preload_asset_ohlc_from_nodes(&nodes);
+        let mut market_stage = MarketStage::new();
+        hydrate_market_stage_from_workspace(&mut market_stage, &nodes, &asset_ohlc_history);
         let mut workspace = Self {
             nodes: nodes.clone(),
             connections: default_pipeline_connections(),
-            inspector_data: vec![
-                MatrixDataRow {
-                    tick: "2024-01-02".to_string(),
-                    asset: "SPY".to_string(),
-                    grade_type: "Scalar".to_string(),
-                    multivector_value: "[472.65]".to_string(),
-                    associated_node_id: Some(1),
-                },
-                MatrixDataRow {
-                    tick: "0020".to_string(),
-                    asset: "ES_F (VectorTA::ALMA)".to_string(),
-                    grade_type: "Scalar".to_string(),
-                    multivector_value: "[5120.18]".to_string(),
-                    associated_node_id: Some(2),
-                },
-            ],
+            inspector_data: Vec::new(),
             pipeline_status_log: vec![
                 "Pipeline status console ready.".to_string(),
             ],
             csv_path_registry,
             pipeline_graph,
             asset_chart_history: preload_asset_charts_from_nodes(&nodes),
-            asset_ohlc_history: preload_asset_ohlc_from_nodes(&nodes),
+            asset_ohlc_history,
+            market_stage,
             selected_node_id: None,
             active_drag_node_id: None,
             drag_offset: point(px(0.0), px(0.0)),
@@ -1264,15 +1348,18 @@ impl TradingSystemWorkspace {
             portfolio_diagnostics: None,
             portfolio_metrics_epoch: 0,
             playhead_current: 0,
+            playhead_time: 0.0,
             playhead_total_bars: 0,
             playhead_scrubbing: false,
             ohlc_chart_bounds: None,
-            last_calculated_state: (usize::MAX, u64::MAX),
+            last_calculated_state: (f64::NAN, u64::MAX),
             asset_path_input,
             ta_lookback_slider_bounds: None,
         };
 
         workspace.sync_playhead_bounds();
+        workspace.sync_playhead_time_from_index();
+        workspace.synchronize_inspector_view();
         workspace.recompute_playhead_diagnostics();
         workspace.sync_pipeline_graph();
         workspace.spawn_pipeline_ingestion_worker(rx, cx);
@@ -1336,6 +1423,126 @@ impl TradingSystemWorkspace {
                 .playhead_current
                 .min(self.playhead_total_bars - 1);
         }
+        self.sync_playhead_time_from_index();
+    }
+
+    pub(crate) fn sync_playhead_time_from_index(&mut self) {
+        let bars = self.chart_bars_for_selection();
+        if bars.is_empty() {
+            self.playhead_time = 0.0;
+            return;
+        }
+        let index = self.playhead_current.min(bars.len() - 1);
+        self.playhead_time =
+            stage_time_for_bar_index(&bars, index).unwrap_or(self.playhead_current as f64);
+    }
+
+    pub(crate) fn playhead_tick_label(&self) -> String {
+        let bars = self.chart_bars_for_selection();
+        if bars.is_empty() {
+            return format!("t={:.2}", self.playhead_time);
+        }
+        let index = self.playhead_current.min(bars.len() - 1);
+        format!(
+            "{}/{} · {}",
+            index + 1,
+            bars.len(),
+            bars[index].date
+        )
+    }
+
+    /// Rebuild the global inspector register from stage lookups at [`playhead_time`].
+    pub(crate) fn synchronize_inspector_view(&mut self) {
+        if self.playhead_total_bars == 0 {
+            return;
+        }
+        let t = self.playhead_time;
+        let tick = self.playhead_tick_label();
+        let mut rows = Vec::new();
+
+        for node in &self.nodes {
+            match node.node_type {
+                NodeType::Asset if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) => {
+                    let Ok(prim) = asset_prim_path(&node.name) else {
+                        continue;
+                    };
+                    let Some(close) = self.market_stage.resolve_attribute_at(&prim, "close", t)
+                    else {
+                        continue;
+                    };
+                    rows.push(MatrixDataRow {
+                        tick: tick.clone(),
+                        asset: node.name.clone(),
+                        grade_type: format!("{:?}", node.grade),
+                        multivector_value: format!("[{close:.2}]"),
+                        associated_node_id: Some(node.id),
+                    });
+                }
+                NodeType::TechnicalAnalysis => {
+                    let indicator_id = analytics_indicator_id(node);
+                    let Ok(prim) = analytics_prim_path(&indicator_id) else {
+                        continue;
+                    };
+                    let Some(value) = self.market_stage.resolve_attribute_at(&prim, "value", t)
+                    else {
+                        continue;
+                    };
+                    rows.push(MatrixDataRow {
+                        tick: tick.clone(),
+                        asset: format!("{} ({})", node.name, indicator_id),
+                        grade_type: format!("{:?}", node.grade),
+                        multivector_value: format!("[{value:.4}]"),
+                        associated_node_id: Some(node.id),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if rows.is_empty() {
+            return;
+        }
+        self.inspector_data = rows;
+    }
+
+    pub(crate) fn record_stage_sample_for_tick(
+        &mut self,
+        node_id: usize,
+        source: &str,
+        tick_index: usize,
+        attribute: &str,
+        value: f32,
+    ) {
+        let Some(bars) = self.asset_ohlc_history.get(&node_id) else {
+            return;
+        };
+        let Some(time) = stage_time_for_bar_index(bars, tick_index) else {
+            return;
+        };
+        if let Ok(prim) = asset_prim_path(source) {
+            let _ = self
+                .market_stage
+                .set_sample(&prim, attribute, time, value);
+        }
+    }
+
+    pub(crate) fn record_stage_analytics_sample(
+        &mut self,
+        node: &VisualNode,
+        tick_index: usize,
+        value: f32,
+    ) {
+        let bars = self
+            .chart_bars_for_selection();
+        let Some(time) = stage_time_for_bar_index(&bars, tick_index) else {
+            return;
+        };
+        let indicator_id = analytics_indicator_id(node);
+        if let Ok(prim) = analytics_prim_path(&indicator_id) {
+            let _ = self
+                .market_stage
+                .set_sample(&prim, "value", time, value);
+        }
     }
 
     pub(crate) fn recompute_playhead_diagnostics(&mut self) {
@@ -1344,22 +1551,24 @@ impl TradingSystemWorkspace {
             return;
         }
         let graph_revision = self.pipeline_graph.revision();
-        if self.playhead_current == self.last_calculated_state.0
+        if self.playhead_time == self.last_calculated_state.0
             && graph_revision == self.last_calculated_state.1
         {
             return;
         }
+        self.sync_playhead_time_from_index();
+        self.synchronize_inspector_view();
         let graph = self.pipeline_graph.snapshot();
         self.portfolio_diagnostics = evaluate_portfolio_at_playhead(
             &self.asset_ohlc_history,
             self.playhead_current,
             &graph,
         );
-        self.last_calculated_state = (self.playhead_current, graph_revision);
+        self.last_calculated_state = (self.playhead_time, graph_revision);
     }
 
     pub(crate) fn invalidate_playhead_evaluation_cache(&mut self) {
-        self.last_calculated_state = (usize::MAX, u64::MAX);
+        self.last_calculated_state = (f64::NAN, u64::MAX);
     }
 
     pub(crate) fn push_status_log(&mut self, text: String) {
@@ -1370,13 +1579,6 @@ impl TradingSystemWorkspace {
         }
     }
 
-    pub(crate) fn push_inspector_row(&mut self, row: MatrixDataRow) {
-        self.inspector_data.push(row);
-        if self.inspector_data.len() > INSPECTOR_BUFFER_CAP {
-            let overflow = self.inspector_data.len() - INSPECTOR_BUFFER_CAP;
-            self.inspector_data.drain(0..overflow);
-        }
-    }
     fn spawn_pipeline_ingestion_worker(
         &self,
         rx: Receiver<PipelineSystemMessage>,
@@ -1396,24 +1598,49 @@ impl TradingSystemWorkspace {
                             value,
                         } => {
                             let csv_date = tick_label.clone();
-                            let tick =
-                                csv_date.clone().unwrap_or_else(|| format_tick_label(tick_index));
                             let _ = cx.update(|cx| {
                                 if let Some(view) = this.upgrade() {
                                     view.update(cx, |workspace, cx| {
-                                        let grade_type = workspace
+                                        let ta_node = workspace
                                             .nodes
                                             .iter()
                                             .find(|node| node.id == node_id)
-                                            .map(|node| format!("{:?}", node.grade))
-                                            .unwrap_or_else(|| "Unknown".to_string());
-                                        workspace.push_inspector_row(MatrixDataRow {
-                                            tick: tick.clone(),
-                                            asset: source,
-                                            grade_type,
-                                            multivector_value: value.clone(),
-                                            associated_node_id: Some(node_id),
-                                        });
+                                            .filter(|node| node.node_type == NodeType::TechnicalAnalysis)
+                                            .cloned();
+                                        if let Some(node) = ta_node {
+                                            if let Some(value) =
+                                                parse_chart_scalar_value(&value)
+                                            {
+                                                workspace.record_stage_analytics_sample(
+                                                    &node,
+                                                    tick_index,
+                                                    value,
+                                                );
+                                            }
+                                        }
+
+                                        if let Some(close) = parse_chart_scalar_value(&value) {
+                                            workspace.record_stage_sample_for_tick(
+                                                node_id,
+                                                &source,
+                                                tick_index,
+                                                "close",
+                                                close,
+                                            );
+                                            if let Some(date) = csv_date.as_deref() {
+                                                if let Some(time) = stage_time_from_bar_date(date)
+                                                {
+                                                    if let Ok(prim) = asset_prim_path(&source) {
+                                                        let _ = workspace.market_stage.set_sample(
+                                                            &prim,
+                                                            "close",
+                                                            time,
+                                                            close,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
 
                                         if let (Some(date), Some(close)) =
                                             (csv_date, parse_chart_scalar_value(&value))
@@ -1437,6 +1664,7 @@ impl TradingSystemWorkspace {
                                                 }
                                             }
                                         }
+                                        workspace.synchronize_inspector_view();
                                         cx.notify();
                                     });
                                 }
@@ -1461,10 +1689,21 @@ impl TradingSystemWorkspace {
                                         } else {
                                             workspace
                                                 .asset_ohlc_history
-                                                .insert(node_id, ohlc_bars);
+                                                .insert(node_id, ohlc_bars.clone());
+                                            if let Some(node) =
+                                                workspace.nodes.iter().find(|node| node.id == node_id)
+                                            {
+                                                hydrate_market_stage_from_ohlc(
+                                                    &mut workspace.market_stage,
+                                                    &node.name,
+                                                    &ohlc_bars,
+                                                );
+                                            }
                                         }
                                         workspace.playhead_current = 0;
                                         workspace.sync_playhead_bounds();
+                                        workspace.sync_playhead_time_from_index();
+                                        workspace.synchronize_inspector_view();
                                         workspace.recompute_playhead_diagnostics();
                                         cx.notify();
                                     });
@@ -1569,7 +1808,27 @@ impl TradingSystemWorkspace {
                                         } else {
                                             index.min(total_bars - 1)
                                         };
+                                        workspace.sync_playhead_time_from_index();
+                                        workspace.synchronize_inspector_view();
                                         workspace.recompute_playhead_diagnostics();
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        }
+                        PipelineSystemMessage::StageSample {
+                            prim_path,
+                            attribute,
+                            time,
+                            value,
+                        } => {
+                            let _ = cx.update(|cx| {
+                                if let Some(view) = this.upgrade() {
+                                    view.update(cx, |workspace, cx| {
+                                        let _ = workspace
+                                            .market_stage
+                                            .set_sample(&prim_path, &attribute, time, value);
+                                        workspace.synchronize_inspector_view();
                                         cx.notify();
                                     });
                                 }

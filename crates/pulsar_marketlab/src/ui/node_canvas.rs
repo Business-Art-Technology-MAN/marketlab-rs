@@ -16,7 +16,7 @@ use crate::graph_compiler::{
 use pulsar_marketlab::technical_analysis::{ta_indicator_label, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK};
 use crate::workspace_state::{
     parse_chart_date_ordinal, ChartHistoryBuffer, CHART_Y_MIN_SPAN, CHART_Y_PADDING_RATIO,
-    bootstrap_csv_execution_engine, format_percent_signed, format_ratio,
+    format_percent_signed, format_ratio,
     TaExecutionBridge, TradingSystemWorkspace, CHART_STROKE_WIDTH,
 };
 
@@ -317,10 +317,8 @@ impl TradingSystemWorkspace {
         });
 
         if from_is_ta {
-            if let Ok(mut engine) = bootstrap_csv_execution_engine() {
-                let mut bridge = TaExecutionBridge::new();
-                bridge.clear_ta_signal_slot(from_node_id, &mut engine);
-            }
+            let mut bridge = TaExecutionBridge::new();
+            bridge.clear_ta_signal_slot(from_node_id, &mut self.market_stage);
         }
 
         self.push_status_log(format!(
