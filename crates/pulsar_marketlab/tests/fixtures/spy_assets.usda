@@ -1,0 +1,14 @@
+#usda 1.0
+(
+    defaultPrim = "assets"
+)
+
+def Xform "assets"
+{
+    def Xform "SPY" (
+        active = true
+    )
+    {
+        custom float risk_budget = 1.0
+    }
+}

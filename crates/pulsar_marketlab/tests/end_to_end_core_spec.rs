@@ -1,7 +1,9 @@
-//! End-to-end OTL core spec: stage → provider → compiled closure → terminal vector.
+//! End-to-end OTL core spec: OpenUSD structure → temporal stage → closure → vector.
+
+use std::sync::Arc;
 
 use pulsar_marketlab::signal_dsl::{compile_formula, invoke_closure, CompileContext, OtlClosure};
-use pulsar_marketlab::stage_bridge::ProductionStageProvider;
+use pulsar_marketlab::stage_bridge::{fixture_path, ProductionStageProvider, UsdStageBridge};
 use pulsar_marketlab::trading_stage::{asset_prim_path, MarketStage};
 
 fn seed_spy_close_stage(stage: &mut MarketStage) {
@@ -19,13 +21,20 @@ fn seed_spy_close_stage(stage: &mut MarketStage) {
     }
 }
 
+fn production_provider() -> ProductionStageProvider {
+    let mut temporal = MarketStage::new();
+    seed_spy_close_stage(&mut temporal);
+
+    let usd = Arc::new(
+        UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open native usd stage"),
+    );
+    ProductionStageProvider::new(usd, Arc::new(temporal), "/assets/SPY/close")
+}
+
 #[test]
 fn otl_script_executes_via_production_stage_provider_at_playhead() {
-    let mut stage = MarketStage::new();
-    seed_spy_close_stage(&mut stage);
-
     let close_path = "/assets/SPY/close";
-    let provider = ProductionStageProvider::new(&stage, close_path);
+    let provider = production_provider();
     let ctx = CompileContext {
         timeline_close_path: close_path.to_string(),
     };
@@ -42,11 +51,8 @@ fn otl_script_executes_via_production_stage_provider_at_playhead() {
 
 #[test]
 fn otl_rsi_integrator_routes_through_production_provider() {
-    let mut stage = MarketStage::new();
-    seed_spy_close_stage(&mut stage);
-
     let close_path = "/assets/SPY/close";
-    let provider = ProductionStageProvider::new(&stage, close_path);
+    let provider = production_provider();
     let ctx = CompileContext {
         timeline_close_path: close_path.to_string(),
     };
@@ -59,9 +65,7 @@ fn otl_rsi_integrator_routes_through_production_provider() {
 
 #[test]
 fn compiled_closure_and_provider_are_send_sync() {
-    let mut stage = MarketStage::new();
-    seed_spy_close_stage(&mut stage);
-    let provider = ProductionStageProvider::new(&stage, "/assets/SPY/close");
+    let provider = production_provider();
     let closure = compile_formula("close", &CompileContext::default()).expect("compile");
 
     fn assert_send_sync<T: Send + Sync>(_: &T) {}

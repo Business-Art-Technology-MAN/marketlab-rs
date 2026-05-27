@@ -1,0 +1,15 @@
+#usda 1.0
+(
+    subLayers = [
+        @./spy_assets.usda@
+    ]
+)
+
+def Xform "assets"
+{
+    def Xform "SPY" (
+        active = false
+    )
+    {
+    }
+}

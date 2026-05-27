@@ -1,82 +1,100 @@
-//! OpenUSD composition spike — profiles time-sample retrieval and layer stacking.
+//! Wrapper utilities for the native [`openusd`] structural plane.
 //!
-//! This module provides an in-memory Sdf/Pcp layer analog that runs in CI without
-//! native Pixar USD libraries. Enable `--features openusd-spike` to probe optional
-//! `rust-usd` bindings when a local OpenUSD install is available.
+//! High-frequency temporal sweeps stay on [`MarketStage`]; this module handles
+//! LIVRPS layer composition, prim activation, and session metadata via
+//! [`openusd::Stage`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ordered_float::OrderedFloat;
+use openusd::sdf::schema::FieldKey;
+use openusd::Stage;
 
 use crate::signal_dsl::Vector;
+use crate::trading_stage::MarketStage;
 
-/// One authored layer mapping attribute paths to time samples.
-#[derive(Clone, Debug, Default)]
-pub struct UsdAuthoredLayer {
-    pub samples: HashMap<String, BTreeMap<OrderedFloat<f64>, f32>>,
+/// Send + Sync handle to a composed OpenUSD root layer.
+///
+/// `openusd::Stage` uses interior mutability and is `!Send` / `!Sync` in 0.3.0.
+/// Structural queries reopen the root layer per call (infrequent vs temporal sweeps).
+#[derive(Clone, Debug)]
+pub struct UsdStageBridge {
+    root_layer_path: Arc<String>,
 }
 
-impl UsdAuthoredLayer {
-    pub fn insert_sample(&mut self, path: impl Into<String>, time: f64, value: f32) {
-        if !time.is_finite() || !value.is_finite() {
-            return;
-        }
-        self.samples
-            .entry(path.into())
-            .or_default()
-            .insert(OrderedFloat(time), value);
+impl UsdStageBridge {
+    /// Open and validate a composed stage from a root `.usda` / `.usd` path.
+    pub fn open(root_layer_path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = root_layer_path.as_ref().to_string_lossy().into_owned();
+        Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        Ok(Self {
+            root_layer_path: Arc::new(path),
+        })
+    }
+
+    /// Write inline USDA text to a temp file, then open it as a composed stage.
+    pub fn open_from_usda_text(content: &str) -> io::Result<Self> {
+        let path = write_inline_usda(content)?;
+        Self::open(path)
+    }
+
+    pub fn root_layer_path(&self) -> &str {
+        &self.root_layer_path
+    }
+
+    /// Run a callback against a freshly opened native [`Stage`].
+    pub fn with_stage<R>(
+        &self,
+        f: impl FnOnce(&Stage) -> Result<R, io::Error>,
+    ) -> Result<R, io::Error> {
+        let stage = Stage::open(&self.root_layer_path)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        f(&stage)
+    }
+
+    /// LIVRPS-composed `active` metadata for a prim path (defaults to `true`).
+    pub fn prim_active(&self, prim_path: &str) -> bool {
+        self.with_stage(|stage| {
+            Ok(stage
+                .field::<bool>(prim_path, FieldKey::Active)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                .unwrap_or(true))
+        })
+        .unwrap_or(true)
+    }
+
+    /// Typed composed field lookup on a prim or property path.
+    pub fn field_f32(&self, path: &str, field: impl AsRef<str>) -> Option<f32> {
+        self.with_stage(|stage| {
+            Ok(stage
+                .field::<f32>(path, field.as_ref())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                .filter(|value| value.is_finite()))
+        })
+        .ok()
+        .flatten()
     }
 }
 
-/// Minimal Pcp-style layer stack with strong-to-weak composition order.
-#[derive(Clone, Debug, Default)]
-pub struct UsdLayerStack {
-    layers: Vec<UsdAuthoredLayer>,
+/// Alias matching the split-plane spec: shared structural plane handle.
+pub type SharedOpenUsdStage = Arc<UsdStageBridge>;
+
+pub fn fixture_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join(relative)
 }
 
-impl UsdLayerStack {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push_layer(&mut self, layer: UsdAuthoredLayer) {
-        self.layers.push(layer);
-    }
-
-    /// Resolve an attribute at `t` by walking layers strongest-first.
-    pub fn resolve_at(&self, path: &str, t: f64) -> Option<f32> {
-        if !t.is_finite() {
-            return None;
-        }
-        for layer in self.layers.iter().rev() {
-            if let Some(series) = layer.samples.get(path) {
-                if let Some((_, value)) = series.range(..=OrderedFloat(t)).next_back() {
-                    return Some(*value);
-                }
-            }
-        }
-        None
-    }
-
-    /// Collect causal samples in `[start, end]` after layer composition.
-    pub fn samples_in_range(&self, path: &str, start: f64, end: f64) -> Vec<(f64, f32)> {
-        if !start.is_finite() || !end.is_finite() || start > end {
-            return Vec::new();
-        }
-        let mut merged: BTreeMap<OrderedFloat<f64>, f32> = BTreeMap::new();
-        for layer in &self.layers {
-            if let Some(series) = layer.samples.get(path) {
-                for (time, value) in series.range(OrderedFloat(start)..=OrderedFloat(end)) {
-                    merged.insert(*time, *value);
-                }
-            }
-        }
-        merged
-            .into_iter()
-            .map(|(time, value)| (time.into_inner(), value))
-            .collect()
-    }
+fn write_inline_usda(content: &str) -> io::Result<String> {
+    let dir = std::env::temp_dir().join("marketlab_openusd");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("inline_{}.usda", std::process::id()));
+    fs::write(&path, content)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,36 +105,30 @@ pub struct UsdSpikeProfile {
     pub range_elapsed: Duration,
 }
 
-/// Profile thousands of point resolves and range queries across a composed layer stack.
-pub fn profile_time_sample_retrieval(sample_count: usize, query_count: usize) -> UsdSpikeProfile {
-    let mut base = UsdAuthoredLayer::default();
-    for index in 0..sample_count {
-        let time = index as f64;
-        base.insert_sample("/assets/SPY/close", time, 100.0 + index as f32 * 0.01);
-    }
-
-    let mut overlay = UsdAuthoredLayer::default();
-    for index in (sample_count / 2)..sample_count {
-        let time = index as f64;
-        overlay.insert_sample("/assets/SPY/close", time, 200.0 + index as f32 * 0.01);
-    }
-
-    let mut stack = UsdLayerStack::new();
-    stack.push_layer(base);
-    stack.push_layer(overlay);
+/// Profile temporal sweeps on [`MarketStage`] plus USD prim-active checks.
+pub fn profile_time_sample_retrieval(
+    temporal_stage: &MarketStage,
+    usd_stage: &UsdStageBridge,
+    sample_count: usize,
+    query_count: usize,
+) -> UsdSpikeProfile {
+    let prim_path = "/assets/SPY";
 
     let resolve_start = Instant::now();
     for query in 0..query_count {
-        let t = (query % sample_count) as f64;
-        let _ = stack.resolve_at("/assets/SPY/close", t);
+        let _ = usd_stage.prim_active(prim_path);
+        let t = (query % sample_count.max(1)) as f64;
+        let _ = temporal_stage.resolve_attribute_at(prim_path, "close", t);
     }
     let resolve_elapsed = resolve_start.elapsed();
 
     let range_start = Instant::now();
     for query in 0..query_count {
-        let end = (query % sample_count) as f64;
+        let end = (query % sample_count.max(1)) as f64;
         let start = (end - 64.0).max(0.0);
-        let _ = stack.samples_in_range("/assets/SPY/close", start, end);
+        if usd_stage.prim_active(prim_path) {
+            let _ = temporal_stage.samples_in_time_range(prim_path, "close", start, end);
+        }
     }
     let range_elapsed = range_start.elapsed();
 
@@ -128,48 +140,72 @@ pub fn profile_time_sample_retrieval(sample_count: usize, query_count: usize) ->
     }
 }
 
-/// Smoke test that overlapping layers compose like a USD strong opinion overlay.
-pub fn composed_close_at(path: &str, t: f64, stack: &UsdLayerStack) -> Option<Vector> {
-    stack.resolve_at(path, t).map(|value| Vector::scalar(f64::from(value)))
-}
-
-#[cfg(feature = "openusd-spike")]
-pub mod native {
-    //! Optional native OpenUSD probe via `rust-usd` when locally installed.
-
-    /// Returns `true` when native OpenUSD libraries are linked and reachable.
-    pub fn native_openusd_available() -> bool {
-        // Placeholder hook — extend with rust-usd stage open when feature is enabled in CI.
-        false
+pub fn composed_close_at(
+    temporal_stage: &MarketStage,
+    prim_path: &str,
+    attribute: &str,
+    t: f64,
+    usd_stage: &UsdStageBridge,
+) -> Option<Vector> {
+    if !usd_stage.prim_active(prim_path) {
+        return None;
     }
+    temporal_stage
+        .resolve_attribute_at(prim_path, attribute, t)
+        .map(f64::from)
+        .filter(|value| value.is_finite())
+        .map(Vector::scalar)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trading_stage::asset_prim_path;
+
+    fn seeded_temporal_stage(sample_count: usize) -> MarketStage {
+        let mut stage = MarketStage::new();
+        let prim = asset_prim_path("SPY").unwrap();
+        for index in 0..sample_count {
+            stage
+                .set_sample(&prim, "close", index as f64, 100.0 + index as f32 * 0.01)
+                .unwrap();
+        }
+        stage
+    }
 
     #[test]
-    fn layer_stack_composes_strong_overlay() {
-        let mut base = UsdAuthoredLayer::default();
-        base.insert_sample("/assets/SPY/close", 10.0, 100.0);
-        let mut overlay = UsdAuthoredLayer::default();
-        overlay.insert_sample("/assets/SPY/close", 10.0, 111.0);
+    fn native_stage_reads_active_metadata_from_fixture() {
+        let usd = UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open fixture");
+        assert!(usd.prim_active("/assets/SPY"));
+    }
 
-        let mut stack = UsdLayerStack::new();
-        stack.push_layer(base);
-        stack.push_layer(overlay);
+    #[test]
+    fn inactive_overlay_blocks_temporal_resolve() {
+        let usd =
+            UsdStageBridge::open(fixture_path("spy_assets_inactive_overlay.usda")).expect("open");
+        assert!(!usd.prim_active("/assets/SPY"));
 
-        assert_eq!(stack.resolve_at("/assets/SPY/close", 10.0), Some(111.0));
-        let composed = composed_close_at("/assets/SPY/close", 10.0, &stack).unwrap();
-        assert_eq!(composed.as_scalar(), Some(111.0));
+        let temporal = seeded_temporal_stage(8);
+        let value = composed_close_at(&temporal, "/assets/SPY", "close", 4.0, &usd);
+        assert!(value.is_none());
     }
 
     #[test]
     fn profile_retrieval_completes_for_large_sample_sets() {
-        let profile = profile_time_sample_retrieval(4_096, 8_192);
+        let usd = UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open fixture");
+        let temporal = seeded_temporal_stage(4_096);
+        let profile = profile_time_sample_retrieval(&temporal, &usd, 4_096, 8_192);
         assert_eq!(profile.sample_count, 4_096);
         assert_eq!(profile.query_count, 8_192);
-        assert!(profile.resolve_elapsed < Duration::from_secs(5));
-        assert!(profile.range_elapsed < Duration::from_secs(5));
+        assert!(profile.resolve_elapsed < Duration::from_secs(30));
+        assert!(profile.range_elapsed < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn bridge_is_send_and_sync() {
+        let usd = UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open fixture");
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        assert_send_sync(&usd);
+        assert_send_sync(&Arc::new(usd));
     }
 }

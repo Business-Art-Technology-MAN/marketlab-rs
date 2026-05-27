@@ -4,6 +4,7 @@ mod production_provider;
 pub mod usd_spike;
 
 pub use production_provider::ProductionStageProvider;
+pub use usd_spike::{fixture_path, SharedOpenUsdStage, UsdStageBridge};
 
 /// Parse `/prim/path/attribute` into `(prim_path, attribute)`.
 pub fn parse_stage_attribute_path(full_path: &str) -> Option<(&str, &str)> {

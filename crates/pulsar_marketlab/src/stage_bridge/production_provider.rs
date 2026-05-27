@@ -1,4 +1,9 @@
-//! Live [`MarketStage`] adapter for OTL closure execution.
+//! Split-plane adapter: OpenUSD structural plane + [`MarketStage`] temporal plane.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use openusd::sdf::schema::FieldKey;
 
 use crate::execution_engine::{EXECUTION_CASH_ATTR, EXECUTION_CASH_PATH};
 use crate::signal_dsl::{MarketProviderServices, OtlClosure, Vector};
@@ -6,47 +11,88 @@ use crate::technical_analysis::{compute_ta_latest_with_params, MarketSeriesWindo
 use crate::trading_stage::MarketStage;
 
 use super::parse_stage_attribute_path;
+use super::usd_spike::UsdStageBridge;
 
-/// Routes OTL evaluation against a real in-memory [`MarketStage`].
+/// Routes OTL evaluation across OpenUSD structure and [`MarketStage`] time series.
 #[derive(Clone, Debug)]
-pub struct ProductionStageProvider<'a> {
-    stage: &'a MarketStage,
-    active_close_path: String,
+pub struct ProductionStageProvider {
+    usd_stage: Arc<UsdStageBridge>,
+    temporal_stage: Arc<MarketStage>,
+    active_path: String,
 }
 
-impl<'a> ProductionStageProvider<'a> {
-    pub fn new(stage: &'a MarketStage, active_close_path: impl Into<String>) -> Self {
+impl ProductionStageProvider {
+    pub fn new(
+        usd_stage: Arc<UsdStageBridge>,
+        temporal_stage: Arc<MarketStage>,
+        active_path: impl Into<String>,
+    ) -> Self {
         Self {
-            stage,
-            active_close_path: active_close_path.into(),
+            usd_stage,
+            temporal_stage,
+            active_path: active_path.into(),
         }
     }
 
-    pub fn stage(&self) -> &MarketStage {
-        self.stage
+    pub fn from_usd_root(
+        usd_root_path: impl AsRef<Path>,
+        temporal_stage: Arc<MarketStage>,
+        active_path: impl Into<String>,
+    ) -> std::io::Result<Self> {
+        let usd_stage = Arc::new(UsdStageBridge::open(usd_root_path)?);
+        Ok(Self::new(usd_stage, temporal_stage, active_path))
     }
 
-    pub fn active_close_path(&self) -> &str {
-        &self.active_close_path
+    pub fn usd_stage(&self) -> &Arc<UsdStageBridge> {
+        &self.usd_stage
+    }
+
+    pub fn temporal_stage(&self) -> &MarketStage {
+        &self.temporal_stage
+    }
+
+    pub fn active_path(&self) -> &str {
+        &self.active_path
+    }
+
+    fn active_prim_path(&self) -> Option<&str> {
+        parse_stage_attribute_path(&self.active_path).map(|(prim, _)| prim)
+    }
+
+    fn prim_active(&self, prim_path: &str) -> bool {
+        self.usd_stage.prim_active(prim_path)
     }
 
     fn resolve_scalar_attribute(&self, full_path: &str, t: f64) -> Option<Vector> {
         let (prim_path, attribute) = parse_stage_attribute_path(full_path)?;
-        self.stage
+        if !self.prim_active(prim_path) {
+            return None;
+        }
+        self.temporal_stage
             .resolve_attribute_at(prim_path, attribute, t)
             .map(f64::from)
             .filter(|value| value.is_finite())
             .map(Vector::scalar)
     }
 
+    fn resolve_global_metadata(&self, name: &str) -> Option<Vector> {
+        let field = name.strip_prefix("global::")?;
+        let prim_path = self.active_prim_path()?;
+        let property_path = format!("{prim_path}.{field}");
+        self.usd_stage
+            .field_f32(&property_path, FieldKey::Default)
+            .map(f64::from)
+            .map(Vector::scalar)
+    }
+
     fn build_close_window(&self, t: f64, bar_count: usize) -> Option<MarketSeriesWindow> {
-        let (prim_path, _) = parse_stage_attribute_path(&self.active_close_path)?;
-        if bar_count == 0 {
+        let (prim_path, _) = parse_stage_attribute_path(&self.active_path)?;
+        if !self.prim_active(prim_path) || bar_count == 0 {
             return None;
         }
         let start = t - bar_count as f64 + 1.0;
         let samples = self
-            .stage
+            .temporal_stage
             .samples_in_time_range(prim_path, "close", start, t);
         if samples.is_empty() {
             return None;
@@ -55,22 +101,22 @@ impl<'a> ProductionStageProvider<'a> {
         for (time, close) in samples {
             let close = f64::from(close);
             let open = self
-                .stage
+                .temporal_stage
                 .resolve_attribute_at(prim_path, "open", time)
                 .map(f64::from)
                 .unwrap_or(close);
             let high = self
-                .stage
+                .temporal_stage
                 .resolve_attribute_at(prim_path, "high", time)
                 .map(f64::from)
                 .unwrap_or(close);
             let low = self
-                .stage
+                .temporal_stage
                 .resolve_attribute_at(prim_path, "low", time)
                 .map(f64::from)
                 .unwrap_or(close);
             let volume = self
-                .stage
+                .temporal_stage
                 .resolve_attribute_at(prim_path, "volume", time)
                 .map(f64::from)
                 .unwrap_or(0.0);
@@ -80,12 +126,27 @@ impl<'a> ProductionStageProvider<'a> {
     }
 }
 
-impl MarketProviderServices for ProductionStageProvider<'_> {
+impl MarketProviderServices for ProductionStageProvider {
     fn sample_timeline(&self, path: &str, start_time: f64, end_time: f64) -> Vec<Vector> {
         let Some((prim_path, attribute)) = parse_stage_attribute_path(path) else {
             return Vec::new();
         };
-        self.stage
+
+        let active = self
+            .usd_stage
+            .with_stage(|stage| {
+                Ok(stage
+                    .field::<bool>(prim_path, FieldKey::Active)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+                    .unwrap_or(true))
+            })
+            .unwrap_or(true);
+
+        if !active {
+            return Vec::new();
+        }
+
+        self.temporal_stage
             .samples_in_time_range(prim_path, attribute, start_time, end_time)
             .into_iter()
             .map(|(_, value)| Vector::scalar(f64::from(value)))
@@ -93,18 +154,25 @@ impl MarketProviderServices for ProductionStageProvider<'_> {
     }
 
     fn get_global_attribute(&self, name: &str, t: f64) -> Option<Vector> {
+        if name.starts_with("global::") {
+            return self.resolve_global_metadata(name);
+        }
+
         match name {
-            "close" => self.resolve_scalar_attribute(&self.active_close_path, t),
+            "close" => self.resolve_scalar_attribute(&self.active_path, t),
             "open" | "high" | "low" | "volume" => {
-                let (prim_path, _) = parse_stage_attribute_path(&self.active_close_path)?;
-                self.stage
+                let (prim_path, _) = parse_stage_attribute_path(&self.active_path)?;
+                if !self.prim_active(prim_path) {
+                    return None;
+                }
+                self.temporal_stage
                     .resolve_attribute_at(prim_path, name, t)
                     .map(f64::from)
                     .filter(|value| value.is_finite())
                     .map(Vector::scalar)
             }
             "portfolio::cash" => self
-                .stage
+                .temporal_stage
                 .resolve_attribute_at(EXECUTION_CASH_PATH, EXECUTION_CASH_ATTR, t)
                 .map(f64::from)
                 .filter(|value| value.is_finite())
@@ -148,9 +216,10 @@ impl MarketProviderServices for ProductionStageProvider<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage_bridge::usd_spike::fixture_path;
     use crate::trading_stage::asset_prim_path;
 
-    fn seeded_stage() -> MarketStage {
+    fn seeded_temporal_stage() -> Arc<MarketStage> {
         let mut stage = MarketStage::new();
         let prim = asset_prim_path("SPY").unwrap();
         for (time, price) in [(0.0, 100.0), (1.0, 102.0), (2.0, 101.0), (3.0, 105.0), (4.0, 104.0)]
@@ -159,30 +228,54 @@ mod tests {
                 .set_sample(&prim, "close", time, price as f32)
                 .unwrap();
         }
-        stage
+        Arc::new(stage)
+    }
+
+    fn provider_from_fixture() -> ProductionStageProvider {
+        let usd = Arc::new(
+            UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open spy fixture"),
+        );
+        ProductionStageProvider::new(usd, seeded_temporal_stage(), "/assets/SPY/close")
     }
 
     #[test]
     fn sample_timeline_reads_contiguous_stage_slice() {
-        let stage = seeded_stage();
-        let provider = ProductionStageProvider::new(&stage, "/assets/SPY/close");
+        let provider = provider_from_fixture();
         let samples = provider.sample_timeline("/assets/SPY/close", 1.0, 3.0);
         assert_eq!(samples.len(), 3);
         assert_eq!(samples[0].as_scalar(), Some(102.0));
     }
 
     #[test]
+    fn sample_timeline_empty_when_usd_deactivates_prim() {
+        let usd = Arc::new(
+            UsdStageBridge::open(fixture_path("spy_assets_inactive_overlay.usda"))
+                .expect("open inactive overlay"),
+        );
+        let provider =
+            ProductionStageProvider::new(usd, seeded_temporal_stage(), "/assets/SPY/close");
+        assert!(provider.sample_timeline("/assets/SPY/close", 0.0, 4.0).is_empty());
+    }
+
+    #[test]
     fn get_global_attribute_resolves_close_at_playhead() {
-        let stage = seeded_stage();
-        let provider = ProductionStageProvider::new(&stage, "/assets/SPY/close");
+        let provider = provider_from_fixture();
         let close = provider.get_global_attribute("close", 4.0).unwrap();
         assert_eq!(close.as_scalar(), Some(104.0));
     }
 
     #[test]
+    fn get_global_attribute_reads_usd_metadata_prefix() {
+        let provider = provider_from_fixture();
+        let budget = provider
+            .get_global_attribute("global::risk_budget", 0.0)
+            .unwrap();
+        assert_eq!(budget.as_scalar(), Some(1.0));
+    }
+
+    #[test]
     fn provider_is_send_and_sync() {
-        let stage = seeded_stage();
-        let provider = ProductionStageProvider::new(&stage, "/assets/SPY/close");
+        let provider = provider_from_fixture();
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(&provider);
     }
