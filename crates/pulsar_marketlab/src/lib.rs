@@ -2,6 +2,7 @@ pub mod execution_engine;
 pub mod fix_engine;
 pub mod signal_dsl;
 pub mod signal_kernel;
+pub mod stage_bridge;
 pub mod technical_analysis;
 pub mod trading_stage;
 
@@ -18,6 +19,7 @@ pub use signal_dsl::{
     compile, compile_formula, parse, tokenize, MarketProviderServices, OtlClosure, Vector,
     CompileContext, DslError, DslExpression, evaluate_formula, invoke_closure,
 };
+pub use stage_bridge::ProductionStageProvider;
 pub use trading_stage::{
     analytics_prim_path, asset_prim_path, stage_time_from_bar_date, MarketPrim, MarketStage,
     MarketStagePathError, TimeSampledAttribute,
