@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates\\pulsar_marketlab"
+    "crates\\pulsar_marketlab",
+    "crates\\pulsar_marketlab_core",
+    "crates\\pulsar_marketlab_ui",
 ]
 
 [workspace.dependencies]

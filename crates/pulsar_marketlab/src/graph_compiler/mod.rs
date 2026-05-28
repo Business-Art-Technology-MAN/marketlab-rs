@@ -6,7 +6,8 @@ mod registry;
 mod tests;
 
 pub use registry::{
-    connection_is_valid, effective_otl_script, validate_graph_wiring, NodeType, WireValidationError,
+    connection_is_valid, effective_otl_script, input_port_kind, output_port_kind,
+    sync_otl_shader_aov_ports, validate_graph_wiring, NodeType, PortWireKind, WireValidationError,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -243,6 +244,18 @@ impl SharedCsvAssetPaths {
             .lock()
             .map(|guard| guard.paths.clone())
             .unwrap_or_default()
+    }
+
+    pub fn replace_from_nodes(&self, nodes: &[VisualNode]) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.revision = guard.revision.saturating_add(1);
+            guard.paths.clear();
+            for node in nodes {
+                if let Some(AssetSourceType::Csv { path }) = &node.asset_source {
+                    guard.paths.insert(node.id, path.clone());
+                }
+            }
+        }
     }
 }
 

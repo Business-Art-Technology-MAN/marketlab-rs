@@ -19,6 +19,9 @@ num-traits = "0.2"
 ordered-float = "4.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 openusd = "0.3.0"
+pulsar_marketlab_core = { path = "../pulsar_marketlab_core" }
+pulsar_marketlab_ui = { path = "../pulsar_marketlab_ui" }
+rfd = "0.15"
 
 [dev-dependencies]
 

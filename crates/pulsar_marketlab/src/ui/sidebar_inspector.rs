@@ -134,6 +134,7 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn sync_inspector_from_selection(&mut self, cx: &mut Context<Self>) {
+        self.reset_otl_script_input();
         self.sync_asset_path_draft_from_selection(cx);
         self.sync_ta_inspector_category_from_selection();
     }

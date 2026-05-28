@@ -119,6 +119,21 @@ pub struct WireValidationError {
     pub message: String,
 }
 
+pub fn sync_otl_shader_aov_ports(node: &mut VisualNode) {
+    if !node.node_type.is_otl_shader() {
+        return;
+    }
+    let numeric_label = node
+        .outputs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "TA Out".to_string());
+    node.outputs = vec![numeric_label];
+    for aov in &node.aov_outputs {
+        node.outputs.push(format!("AOV: {aov}"));
+    }
+}
+
 pub fn effective_otl_script(node: &VisualNode) -> Option<&str> {
     if let Some(formula) = node
         .dsl_formula

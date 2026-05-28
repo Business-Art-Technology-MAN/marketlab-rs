@@ -4,14 +4,19 @@ use std::collections::HashSet;
 
 use gpui::*;
 
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+
 use crate::graph_compiler::{
-    portfolio_signal_port_label, NodeConnection,
+    input_port_kind, output_port_kind, portfolio_signal_port_label, NodeConnection,
     portfolio_wired_source_count,
     connection_is_valid, input_port_world_center, node_shows_price_chart,
     output_port_world_center, portfolio_ensure_spare_input_port, portfolio_resolve_input_port,
-    NodeGradeType, NodeType, VisualNode, CONNECTION_STROKE_WIDTH, MAX_ZOOM, MIN_ZOOM,
+    NodeGradeType, NodeType, PortWireKind, VisualNode, CONNECTION_STROKE_WIDTH, MAX_ZOOM, MIN_ZOOM,
     NODE_CHART_HEIGHT, NODE_SPAWN_STAGGER_X, NODE_SPAWN_STAGGER_Y, NODE_WIDTH,
     WIRE_PORT_HIT_RADIUS, ZOOM_WHEEL_SENSITIVITY,
+};
+use pulsar_marketlab_ui::workspace::{
+    paint_socket_dot, render_wiring_alerts, socket_pin, SocketWireKind,
 };
 use pulsar_marketlab::technical_analysis::{ta_indicator_label, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK};
 use crate::workspace_state::{
@@ -20,8 +25,32 @@ use crate::workspace_state::{
     TaExecutionBridge, TradingSystemWorkspace, CHART_STROKE_WIDTH,
 };
 
+fn socket_kind_from_port(kind: PortWireKind) -> SocketWireKind {
+    match kind {
+        PortWireKind::StructuralPath => SocketWireKind::StructuralPath,
+        PortWireKind::NumericSignal => SocketWireKind::NumericSignal,
+        PortWireKind::Aov => SocketWireKind::Aov,
+    }
+}
+
+fn union_canvas_bounds(bounds: &[Bounds<Pixels>]) -> Option<Bounds<Pixels>> {
+    let mut iter = bounds.iter();
+    let first = *iter.next()?;
+    Some(iter.fold(first, |acc, next| {
+        let top_left = point(
+            acc.origin.x.min(next.origin.x),
+            acc.origin.y.min(next.origin.y),
+        );
+        let bottom_right = point(
+            acc.bottom_right().x.max(next.bottom_right().x),
+            acc.bottom_right().y.max(next.bottom_right().y),
+        );
+        Bounds::from_corners(top_left, bottom_right)
+    }))
+}
+
 impl TradingSystemWorkspace {
-    fn canvas_local_position(&self, position: Point<Pixels>) -> (f32, f32) {
+    pub(crate) fn canvas_local_position(&self, position: Point<Pixels>) -> (f32, f32) {
         let mouse_x: f32 = position.x.into();
         let mouse_y: f32 = position.y.into();
         let canvas_x: f32 = self.canvas_origin.x.into();
@@ -29,7 +58,7 @@ impl TradingSystemWorkspace {
         (mouse_x - canvas_x, mouse_y - canvas_y)
     }
 
-    fn screen_to_world(&self, local_x: f32, local_y: f32) -> (f32, f32) {
+    pub(crate) fn screen_to_world(&self, local_x: f32, local_y: f32) -> (f32, f32) {
         let pan_x: f32 = self.pan_offset.x.into();
         let pan_y: f32 = self.pan_offset.y.into();
         (
@@ -150,7 +179,7 @@ impl TradingSystemWorkspace {
     fn dismiss_context_menu(&mut self) {
         self.context_menu_pos = None;
     }
-    fn next_node_id(&self) -> usize {
+    pub(crate) fn next_node_id(&self) -> usize {
         self.nodes.iter().map(|node| node.id).max().unwrap_or(0) + 1
     }
 
@@ -222,10 +251,18 @@ impl TradingSystemWorkspace {
             inputs: vec![],
             outputs: vec!["Close Out".to_string()],
         });
+        let prim_path = self
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .and_then(|node| node.node_type.prim_path().map(str::to_string));
         self.selected_node_id = Some(node_id);
         self.asset_path_input.update(cx, |input, cx| {
             input.set_content(String::new(), cx);
         });
+        if let Some(prim_path) = prim_path.as_deref() {
+            self.register_asset_prim_in_usd_stage(prim_path, cx);
+        }
         self.context_menu_pos = None;
         self.sync_pipeline_graph();
         self.invalidate_playhead_evaluation_cache();
@@ -612,7 +649,6 @@ impl TradingSystemWorkspace {
         zoom_scale: f32,
         window: &mut Window,
     ) {
-        let stroke = rgb(0x3b82f6);
         let pan_x: f32 = pan_offset.x.into();
         let pan_y: f32 = pan_offset.y.into();
 
@@ -635,6 +671,15 @@ impl TradingSystemWorkspace {
                 .find(|node| node.id == connection.to_node_id)
             else {
                 continue;
+            };
+
+            let wire_kind = output_port_kind(from_node, connection.from_port_idx)
+                .map(socket_kind_from_port)
+                .unwrap_or(SocketWireKind::NumericSignal);
+            let stroke = match wire_kind {
+                SocketWireKind::StructuralPath => rgb(0x71717a),
+                SocketWireKind::NumericSignal => rgb(0x22c55e),
+                SocketWireKind::Aov => rgb(0x22d3ee),
             };
 
             let (out_x, out_y) =
@@ -662,8 +707,55 @@ impl TradingSystemWorkspace {
                 screen_out_y,
                 active_mouse_pos,
                 window,
-                stroke,
+                rgb(0x3b82f6),
             );
+        }
+    }
+
+    fn paint_node_sockets(
+        bounds: Bounds<Pixels>,
+        nodes: &[VisualNode],
+        chart_node_ids: &HashSet<usize>,
+        pan_offset: Point<Pixels>,
+        zoom_scale: f32,
+        window: &mut Window,
+    ) {
+        let pan_x: f32 = pan_offset.x.into();
+        let pan_y: f32 = pan_offset.y.into();
+        let world_to_screen = |world_x: f32, world_y: f32| -> (f32, f32) {
+            (
+                world_x * zoom_scale + pan_x,
+                world_y * zoom_scale + pan_y,
+            )
+        };
+
+        for node in nodes {
+            for (port_idx, _) in node.inputs.iter().enumerate() {
+                let kind = input_port_kind(node, port_idx)
+                    .map(socket_kind_from_port)
+                    .unwrap_or(SocketWireKind::NumericSignal);
+                let (world_x, world_y) =
+                    Self::input_port_origin(node, port_idx, chart_node_ids.contains(&node.id));
+                let (screen_x, screen_y) = world_to_screen(world_x, world_y);
+                paint_socket_dot(
+                    window,
+                    Self::canvas_point(bounds, screen_x, screen_y),
+                    kind,
+                );
+            }
+            for (port_idx, _) in node.outputs.iter().enumerate() {
+                let kind = output_port_kind(node, port_idx)
+                    .map(socket_kind_from_port)
+                    .unwrap_or(SocketWireKind::NumericSignal);
+                let (world_x, world_y) =
+                    Self::output_port_origin(node, port_idx, chart_node_ids.contains(&node.id));
+                let (screen_x, screen_y) = world_to_screen(world_x, world_y);
+                paint_socket_dot(
+                    window,
+                    Self::canvas_point(bounds, screen_x, screen_y),
+                    kind,
+                );
+            }
         }
     }
     pub(crate) fn render_node_graph(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -682,74 +774,52 @@ impl TradingSystemWorkspace {
         let pan_offset = self.pan_offset;
         let zoom_scale = self.zoom_scale;
 
+        let wiring_messages: Vec<String> = self
+            .pipeline_graph
+            .snapshot()
+            .wiring_errors
+            .iter()
+            .map(|error| error.message.clone())
+            .collect();
+
         let mut canvas = div()
-            .flex_1()
-            .min_h_0()
-            .bg(rgb(0x111114))
-            .relative()
-            .overflow_hidden()
             .on_children_prepainted({
                 move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                    if let Some(canvas_bounds) = bounds.first() {
+                    if let Some(canvas_bounds) = union_canvas_bounds(&bounds) {
                         let origin = canvas_bounds.origin;
-                        view
-                            .update(cx, |this, _cx| {
-                                this.canvas_origin = origin;
-                            })
-                            .ok();
+                        let _ = view.update(cx, |this, _cx| {
+                            this.canvas_origin = origin;
+                        });
                     }
                 }
             })
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                            this.open_context_menu(event.position);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                            if this.context_menu_pos.is_some() {
-                                this.dismiss_context_menu();
-                            } else if this.active_wire_source.is_some() {
-                                this.cancel_wire();
-                            } else {
-                                this.selected_node_id = None;
-                                this.ta_inspector_category = None;
-                            }
-                            cx.notify();
-                        }),
-                    ),
+            .id("node-canvas")
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .bg(rgb(0x111114))
+            .relative()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.open_context_menu(event.position);
+                    cx.notify();
+                }),
             )
-            .child(
-                canvas(
-                    |bounds, _window, _cx| bounds,
-                    move |bounds, _state, window, _cx| {
-                        TradingSystemWorkspace::paint_connection_wires(
-                            bounds,
-                            &nodes_for_wires,
-                            &connections_for_wires,
-                            &chart_node_ids_for_wires,
-                            active_wire_source,
-                            active_mouse_pos,
-                            pan_offset,
-                            zoom_scale,
-                            window,
-                        );
-                    },
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    if this.context_menu_pos.is_some() {
+                        this.dismiss_context_menu();
+                    } else if this.active_wire_source.is_some() {
+                        this.cancel_wire();
+                    } else {
+                        this.selected_node_id = None;
+                        this.ta_inspector_category = None;
+                    }
+                    cx.notify();
+                }),
             )
             .on_mouse_move(cx.listener(
                 |this, event: &MouseMoveEvent, _window, cx| {
@@ -766,6 +836,7 @@ impl TradingSystemWorkspace {
                         this.update_wire_tracking(event.position);
                         changed = true;
                     }
+                    this.active_mouse_pos = event.position;
                     if changed {
                         cx.notify();
                     }
@@ -817,6 +888,36 @@ impl TradingSystemWorkspace {
                 }),
             )
             .child(
+                canvas(
+                    |bounds, _window, _cx| bounds,
+                    move |bounds, _state, window, _cx| {
+                        TradingSystemWorkspace::paint_node_sockets(
+                            bounds,
+                            &nodes_for_wires,
+                            &chart_node_ids_for_wires,
+                            pan_offset,
+                            zoom_scale,
+                            window,
+                        );
+                        TradingSystemWorkspace::paint_connection_wires(
+                            bounds,
+                            &nodes_for_wires,
+                            &connections_for_wires,
+                            &chart_node_ids_for_wires,
+                            active_wire_source,
+                            active_mouse_pos,
+                            pan_offset,
+                            zoom_scale,
+                            window,
+                        );
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .child(
                 div()
                     .absolute()
                     .top_3()
@@ -857,10 +958,14 @@ impl TradingSystemWorkspace {
                 let has_wire = self.connections.iter().any(|connection| {
                     connection.to_node_id == input_node_id && connection.to_port_idx == port_idx
                 });
+                let input_kind = input_port_kind(node, port_idx)
+                    .map(socket_kind_from_port)
+                    .unwrap_or(SocketWireKind::NumericSignal);
                 ports = ports.child(
                     div()
                         .flex()
                         .items_center()
+                        .gap_1()
                         .py_1()
                         .px_1()
                         .cursor_pointer()
@@ -901,15 +1006,21 @@ impl TradingSystemWorkspace {
                         .text_size(px(9.0))
                         .font_family("monospace")
                         .text_color(rgb(0x888893))
-                        .child(format!("→ [ ] {input}")),
+                        .child(socket_pin(input_kind))
+                        .child(format!("→ {input}")),
                 );
             }
             for (port_idx, output) in node.outputs.iter().enumerate() {
                 let output_node_id = node_id;
+                let output_kind = output_port_kind(node, port_idx)
+                    .map(socket_kind_from_port)
+                    .unwrap_or(SocketWireKind::NumericSignal);
                 ports = ports.child(
                     div()
                         .flex()
+                        .items_center()
                         .justify_end()
+                        .gap_1()
                         .py_1()
                         .px_1()
                         .cursor_pointer()
@@ -931,7 +1042,8 @@ impl TradingSystemWorkspace {
                         .text_size(px(9.0))
                         .font_family("monospace")
                         .text_color(rgb(0x888893))
-                        .child(format!("[ ] → {output}")),
+                        .child(format!("{output} →"))
+                        .child(socket_pin(output_kind)),
                 );
             }
 
@@ -1144,82 +1256,45 @@ impl TradingSystemWorkspace {
             );
         }
 
-        if let Some(menu_pos) = self.context_menu_pos {
-            let menu_x: f32 = menu_pos.x.into();
-            let menu_y: f32 = menu_pos.y.into();
-            let (menu_screen_x, menu_screen_y) = self.world_to_screen(menu_x, menu_y);
-            canvas = canvas.child(
-                div()
-                    .absolute()
-                    .left(px(menu_screen_x))
-                    .top(px(menu_screen_y))
-                    .bg(rgb(0x1c1c21))
-                    .border_1()
-                    .border_color(rgb(0x2d2d34))
-                    .rounded_md()
-                    .p_1()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0xf59e0b))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x25252b)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                                    this.spawn_csv_asset_node(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )
-                            .child("Spawn Asset Node"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0xc084fc))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x25252b)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                                    this.spawn_technical_analysis_node(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )
-                            .child("Spawn TA Node"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x14b8a6))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x25252b)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                                    this.spawn_portfolio_node(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )
-                            .child("Spawn Portfolio Node"),
-                    ),
-            );
-        }
+        canvas = canvas.child(render_wiring_alerts(&wiring_messages));
 
-        canvas
+        let view = cx.entity();
+        canvas.context_menu({
+            let view = view.clone();
+            move |menu, _window, _cx| {
+                let view = view.clone();
+                menu
+                    .item(
+                        PopupMenuItem::new("Spawn Asset Node").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_csv_asset_node(cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Spawn TA Node").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_technical_analysis_node(cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Spawn Portfolio Node").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_portfolio_node(cx);
+                                });
+                            }
+                        }),
+                    )
+            }
+        })
     }
 }

@@ -4,10 +4,11 @@
 //! LIVRPS layer composition, prim activation, and session metadata via
 //! [`openusd::Stage`].
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use openusd::sdf::schema::FieldKey;
@@ -23,6 +24,7 @@ use crate::trading_stage::MarketStage;
 #[derive(Clone, Debug)]
 pub struct UsdStageBridge {
     root_layer_path: Arc<String>,
+    active_overrides: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl UsdStageBridge {
@@ -32,6 +34,7 @@ impl UsdStageBridge {
         Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         Ok(Self {
             root_layer_path: Arc::new(path),
+            active_overrides: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -57,6 +60,25 @@ impl UsdStageBridge {
 
     /// LIVRPS-composed `active` metadata for a prim path (defaults to `true`).
     pub fn prim_active(&self, prim_path: &str) -> bool {
+        if let Some(active) = self
+            .active_overrides
+            .lock()
+            .ok()
+            .and_then(|overrides| overrides.get(prim_path).copied())
+        {
+            return active;
+        }
+        self.read_prim_active_from_stage(prim_path)
+    }
+
+    /// Mutate composed `FieldKey::Active` for a prim path in the bridge overlay.
+    pub fn set_prim_active(&self, prim_path: &str, active: bool) {
+        if let Ok(mut overrides) = self.active_overrides.lock() {
+            overrides.insert(prim_path.to_string(), active);
+        }
+    }
+
+    fn read_prim_active_from_stage(&self, prim_path: &str) -> bool {
         self.with_stage(|stage| {
             Ok(stage
                 .field::<bool>(prim_path, FieldKey::Active)
@@ -77,6 +99,62 @@ impl UsdStageBridge {
         .ok()
         .flatten()
     }
+
+    /// Replace the root layer path and clear runtime overlays.
+    pub fn reload_from_path(&mut self, root_layer_path: impl AsRef<Path>) -> io::Result<()> {
+        let path = root_layer_path.as_ref().to_string_lossy().into_owned();
+        Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        self.root_layer_path = Arc::new(path);
+        if let Ok(mut overrides) = self.active_overrides.lock() {
+            overrides.clear();
+        }
+        Ok(())
+    }
+
+    /// Write the composed stage hierarchy to a USDA text stream on disk.
+    pub fn dump_to_path(&self, target: impl AsRef<Path>) -> io::Result<()> {
+        let overrides = self
+            .active_overrides
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let content = if overrides.is_empty() {
+            fs::read_to_string(self.root_layer_path.as_str())?
+        } else {
+            self.export_usda_text()?
+        };
+        fs::write(target.as_ref(), content)
+    }
+
+    fn export_usda_text(&self) -> io::Result<String> {
+        self.with_stage(|stage| {
+            let mut out = String::from("#usda 1.0\n(\n");
+            if let Some(default_prim) = stage.default_prim() {
+                out.push_str(&format!("    defaultPrim = \"{default_prim}\"\n"));
+            }
+            out.push_str(")\n\n");
+            export_prim_tree(self, stage, &openusd::sdf::Path::abs_root(), 0, &mut out)?;
+            Ok(out)
+        })
+    }
+
+    /// Flatten the composed USD hierarchy for the stage composer pane.
+    pub fn stage_prim_rows(&self) -> io::Result<Vec<StagePrimRowSnapshot>> {
+        self.with_stage(|stage| {
+            let mut rows = Vec::new();
+            collect_prim_rows(self, stage, &openusd::sdf::Path::abs_root(), 0, &mut rows)?;
+            Ok(rows)
+        })
+    }
+}
+
+/// One prim row read from the composed OpenUSD stage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagePrimRowSnapshot {
+    pub path: String,
+    pub label: String,
+    pub depth: usize,
+    pub active: bool,
 }
 
 /// Alias matching the split-plane spec: shared structural plane handle.
@@ -95,6 +173,89 @@ fn write_inline_usda(content: &str) -> io::Result<String> {
     let path = dir.join(format!("inline_{}.usda", std::process::id()));
     fs::write(&path, content)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn export_prim_tree(
+    bridge: &UsdStageBridge,
+    stage: &Stage,
+    path: &openusd::sdf::Path,
+    depth: usize,
+    out: &mut String,
+) -> io::Result<()> {
+    let children = stage
+        .prim_children(path.clone())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    for child_name in children {
+        let child_path = path
+            .append_path(child_name.as_str())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let path_str = child_path.to_string();
+        let active = bridge.prim_active(&path_str);
+        let indent = "    ".repeat(depth + 1);
+        let inner = "    ".repeat(depth + 2);
+
+        out.push_str(&format!("{indent}def Xform \"{child_name}\" (\n"));
+        out.push_str(&format!("{inner}active = {}\n", if active { "true" } else { "false" }));
+        out.push_str(&format!("{indent})\n"));
+        out.push_str(&format!("{indent}{{\n"));
+
+        if let Ok(properties) = stage.prim_properties(child_path.clone()) {
+            for property in properties {
+                if property == "active" {
+                    continue;
+                }
+                let property_path = child_path
+                    .append_property(&property)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                let property_path_str = property_path.to_string();
+                if let Ok(Some(value)) = stage.field::<f32>(property_path_str.as_str(), "default") {
+                    out.push_str(&format!(
+                        "{inner}custom float {property} = {value}\n"
+                    ));
+                }
+            }
+        }
+
+        export_prim_tree(bridge, stage, &child_path, depth + 1, out)?;
+        out.push_str(&format!("{indent}}}\n"));
+    }
+    Ok(())
+}
+
+fn collect_prim_rows(
+    bridge: &UsdStageBridge,
+    stage: &Stage,
+    path: &openusd::sdf::Path,
+    depth: usize,
+    rows: &mut Vec<StagePrimRowSnapshot>,
+) -> io::Result<()> {
+    let children = stage
+        .prim_children(path.clone())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    for child_name in children {
+        let child_path = path
+            .append_path(child_name.as_str())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let path_str = child_path.to_string();
+        let label = child_path
+            .name()
+            .map(|name| {
+                if depth == 0 && path == &openusd::sdf::Path::abs_root() {
+                    format!("{name} (Xform)")
+                } else {
+                    name.to_string()
+                }
+            })
+            .unwrap_or_else(|| path_str.clone());
+        rows.push(StagePrimRowSnapshot {
+            path: path_str.clone(),
+            label,
+            depth,
+            active: bridge.prim_active(&path_str),
+        });
+        collect_prim_rows(bridge, stage, &child_path, depth + 1, rows)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]

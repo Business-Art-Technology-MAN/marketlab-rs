@@ -1,0 +1,54 @@
+#usda 1.0
+(
+    subLayers = [
+        @usd/schema.usda@
+    ]
+)
+
+over "Plugins"
+{
+    string usdPrimKey = "marketLab"
+}
+
+class "FinancialAsset" (
+    inherits = </Typed>
+    doc = "A schema defining an institutional financial instrument or derivative contract."
+) {
+    bool inputs:active = 1
+    token inputs:symbol = ""
+    token inputs:asset_class = "Equity" (
+        allowedTokens = ["Equity", "ETF", "Commodity", "Future", "Option", "FixedIncome"]
+    )
+    token inputs:provider = "yahoo" (
+        allowedTokens = ["yahoo", "bloomberg", "synth"]
+    )
+    string inputs:category = ""
+    string inputs:sub_category = ""
+    rel inputs:underlying
+}
+
+class "OtlOperator" (
+    inherits = </Typed>
+    doc = "An analytical operator node executing geometric algebra or OTL math scripts."
+) {
+    token inputs:id = ""
+    string inputs:script_src = ""
+    rel inputs:underlying
+    token outputs:signal
+}
+
+class "PortfolioIntegrator" (
+    inherits = </Typed>
+    doc = "A terminal portfolio aggregator primitive compiling individual assets and signal models."
+) {
+    token inputs:id = "Allocation::HierarchicalRiskParity" (
+        allowedTokens = ["Allocation::HierarchicalRiskParity", "Allocation::EqualWeight", "Allocation::MeanVariance"]
+    )
+    double inputs:initial_capital = 10000000.0
+    token inputs:rebalance_frequency = "monthly" (
+        allowedTokens = ["daily", "weekly", "monthly", "quarterly", "annually"]
+    )
+    double inputs:max_volatility_cap = 1.0
+    rel inputs:sources
+    token outputs:portfolio_wealth
+}
