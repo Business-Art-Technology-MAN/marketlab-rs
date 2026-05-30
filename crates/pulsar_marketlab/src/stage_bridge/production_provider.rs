@@ -248,13 +248,13 @@ mod tests {
         let usd = Arc::new(
             UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open spy fixture"),
         );
-        ProductionStageProvider::new(usd, seeded_temporal_stage(), "/assets/SPY/close")
+        ProductionStageProvider::new(usd, seeded_temporal_stage(), "/MarketLab/SPY/close")
     }
 
     #[test]
     fn sample_timeline_reads_contiguous_stage_slice() {
         let provider = provider_from_fixture();
-        let samples = provider.sample_timeline("/assets/SPY/close", 1.0, 3.0);
+        let samples = provider.sample_timeline("/MarketLab/SPY/close", 1.0, 3.0);
         assert_eq!(samples.len(), 3);
         assert_eq!(samples[0].as_scalar(), Some(102.0));
     }
@@ -266,8 +266,8 @@ mod tests {
                 .expect("open inactive overlay"),
         );
         let provider =
-            ProductionStageProvider::new(usd, seeded_temporal_stage(), "/assets/SPY/close");
-        assert!(provider.sample_timeline("/assets/SPY/close", 0.0, 4.0).is_empty());
+            ProductionStageProvider::new(usd, seeded_temporal_stage(), "/MarketLab/SPY/close");
+        assert!(provider.sample_timeline("/MarketLab/SPY/close", 0.0, 4.0).is_empty());
     }
 
     #[test]

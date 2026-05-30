@@ -25,7 +25,7 @@ impl NodeType {
             .split_whitespace()
             .find(|token| !token.eq_ignore_ascii_case("csv") && !token.eq_ignore_ascii_case("asset"))
             .unwrap_or("ASSET");
-        Self::asset_adaptor(format!("/assets/{ticker}"))
+        Self::asset_adaptor(format!("/MarketLab/{ticker}"))
     }
 
     pub fn asset_adaptor_from_csv_path(path: &str) -> Self {
@@ -34,7 +34,7 @@ impl NodeType {
             .next()
             .unwrap_or(path)
             .trim_end_matches(".csv");
-        Self::asset_adaptor(format!("/assets/{}", stem.to_ascii_uppercase()))
+        Self::asset_adaptor(format!("/MarketLab/{}", stem.to_ascii_uppercase()))
     }
 
     pub fn otl_shader(script: impl Into<String>) -> Self {
@@ -201,7 +201,8 @@ pub fn tier_topology_allows(from: &VisualNode, to: &VisualNode) -> bool {
         (NodeType::AssetAdaptor { .. }, NodeType::OtlShader { .. })
             | (NodeType::OtlShader { .. }, NodeType::OtlShader { .. })
             | (NodeType::OtlShader { .. }, NodeType::TerminalIntegrator { .. })
-    )
+    ) || (from.node_type.is_asset_adaptor() && to.node_type.is_portfolio())
+        || (from.node_type.is_portfolio() && to.node_type.is_portfolio())
 }
 
 pub fn connection_is_valid(
@@ -216,7 +217,12 @@ pub fn connection_is_valid(
     let Some(to_kind) = input_port_kind(to_node, to_port_idx) else {
         return false;
     };
-    wire_kinds_compatible(from_kind, to_kind) && tier_topology_allows(from_node, to_node)
+    let kinds_compatible = wire_kinds_compatible(from_kind, to_kind)
+        || (from_kind == PortWireKind::StructuralPath
+            && to_kind == PortWireKind::NumericSignal
+            && from_node.node_type.is_asset_adaptor()
+            && to_node.node_type.is_portfolio());
+    kinds_compatible && tier_topology_allows(from_node, to_node)
 }
 
 pub fn validate_graph_wiring(snapshot: &PipelineGraphSnapshot) -> Vec<WireValidationError> {

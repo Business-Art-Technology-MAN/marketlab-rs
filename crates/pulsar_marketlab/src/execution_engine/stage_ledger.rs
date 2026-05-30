@@ -158,7 +158,7 @@ mod tests {
         let mut stage = MarketStage::new();
         StageSimulationLedger::seed_initial_cash(&mut stage, 1_000.0).unwrap();
         stage
-            .set_sample("/assets/SPY", "close", 100.0, 50.0)
+            .set_sample("/MarketLab/SPY", "close", 100.0, 50.0)
             .unwrap();
         StageSimulationLedger::apply_transaction(
             &mut stage,
@@ -178,7 +178,7 @@ mod tests {
     fn nav_at_time_uses_forward_filled_inputs() {
         let mut stage = MarketStage::new();
         StageSimulationLedger::seed_initial_cash(&mut stage, 1_000.0).unwrap();
-        stage.set_sample("/assets/SPY", "close", 100.0, 50.0).unwrap();
+        stage.set_sample("/MarketLab/SPY", "close", 100.0, 50.0).unwrap();
         StageSimulationLedger::apply_transaction(
             &mut stage,
             &SimulationTransaction {

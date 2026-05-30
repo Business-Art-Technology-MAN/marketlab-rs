@@ -39,41 +39,28 @@ impl SplitLayoutHost for TradingSystemWorkspace {
             return;
         };
         let mut layout = self.split_layout.clamp();
+        let Some(upper) = self.upper_row_bounds else {
+            return;
+        };
+        let width: f32 = upper.size.width.into();
+        if width <= f32::EPSILON {
+            return;
+        }
+        let x: f32 = position.x.into();
+        let origin_x: f32 = upper.origin.x.into();
+        let normalized = ((x - origin_x) / width).clamp(0.12, 0.88);
         match handle {
-            SplitHandle::Vertical => {
-                let height: f32 = container.size.height.into();
-                if height <= f32::EPSILON {
-                    return;
-                }
-                let y: f32 = position.y.into();
-                let origin_y: f32 = container.origin.y.into();
-                layout.upper_share = ((y - origin_y) / height).clamp(0.30, 0.85);
+            SplitHandle::StageCanvas => {
+                layout.stage_share = normalized;
+                layout.inspector_share = (layout.inspector_share)
+                    .min(1.0 - layout.stage_share - 0.15);
             }
-            SplitHandle::StageCanvas | SplitHandle::CanvasInspector => {
-                let Some(upper) = self.upper_row_bounds else {
-                    return;
-                };
-                let width: f32 = upper.size.width.into();
-                if width <= f32::EPSILON {
-                    return;
-                }
-                let x: f32 = position.x.into();
-                let origin_x: f32 = upper.origin.x.into();
-                let normalized = ((x - origin_x) / width).clamp(0.12, 0.88);
-                match handle {
-                    SplitHandle::StageCanvas => {
-                        layout.stage_share = normalized;
-                        layout.inspector_share = (layout.inspector_share)
-                            .min(1.0 - layout.stage_share - 0.15);
-                    }
-                    SplitHandle::CanvasInspector => {
-                        layout.inspector_share = (1.0 - normalized).clamp(0.12, 0.45);
-                        layout.stage_share = layout.stage_share.min(1.0 - layout.inspector_share - 0.15);
-                    }
-                    SplitHandle::Vertical => {}
-                }
+            SplitHandle::CanvasInspector => {
+                layout.inspector_share = (1.0 - normalized).clamp(0.12, 0.45);
+                layout.stage_share = layout.stage_share.min(1.0 - layout.inspector_share - 0.15);
             }
         }
+        let _ = container;
         self.split_layout = layout.clamp();
         cx.notify();
     }

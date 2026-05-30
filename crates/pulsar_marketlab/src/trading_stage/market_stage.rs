@@ -57,26 +57,31 @@ pub fn stage_time_from_bar_date(date: &str) -> Option<f64> {
     Some(Utc.from_utc_datetime(&naive).timestamp() as f64)
 }
 
-/// Build a canonical asset prim path: `/assets/{ticker}`.
+/// Build a canonical asset prim path: `/MarketLab/{ticker}`.
 pub fn asset_prim_path(ticker: &str) -> Result<String, MarketStagePathError> {
     let ticker = ticker.trim();
     if ticker.is_empty() || ticker.contains('/') {
         return Err(MarketStagePathError::InvalidPath);
     }
-    let path = format!("/assets/{ticker}");
-    validate_stage_path(&path)?;
-    Ok(path)
+    crate::trading_stage::scene::marketlab_leaf_path(ticker)
 }
 
-/// Build a canonical analytics prim path: `/analytics/{indicator_id}`.
+/// Build a canonical analytics prim path: `/MarketLab/{indicator_id}`.
 pub fn analytics_prim_path(indicator_id: &str) -> Result<String, MarketStagePathError> {
     let indicator_id = indicator_id.trim();
     if indicator_id.is_empty() || indicator_id.contains('/') {
         return Err(MarketStagePathError::InvalidPath);
     }
-    let path = format!("/analytics/{indicator_id}");
-    validate_stage_path(&path)?;
-    Ok(path)
+    crate::trading_stage::scene::marketlab_leaf_path(indicator_id)
+}
+
+/// Build a canonical portfolio integrator prim path: `/MarketLab/{label}`.
+pub fn portfolio_prim_path(label: &str) -> Result<String, MarketStagePathError> {
+    let slug = label.trim().replace(' ', "_");
+    if slug.is_empty() || slug.contains('/') {
+        return Err(MarketStagePathError::InvalidPath);
+    }
+    crate::trading_stage::scene::marketlab_leaf_path(&slug)
 }
 
 /// Sparse time series stored as sorted `(timestamp → value)` samples.
@@ -137,10 +142,19 @@ impl MarketPrim {
     }
 }
 
+/// One composed USD-style relationship edge on a target prim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageRelationship {
+    pub relationship: String,
+    pub source_path: String,
+}
+
 /// Central in-memory market stage mapping hierarchical paths to prims.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MarketStage {
     pub prims: HashMap<String, MarketPrim>,
+    /// Target prim path → ordered relationship bindings (`inputs:underlying`, `inputs:sources`, …).
+    pub relationships: HashMap<String, Vec<StageRelationship>>,
 }
 
 impl MarketStage {
@@ -162,6 +176,62 @@ impl MarketStage {
     ) -> Result<(), MarketStagePathError> {
         let prim = self.prim_mut(prim_path)?;
         prim.attribute_mut(attribute).set_sample(time, value);
+        Ok(())
+    }
+
+    /// Bind `source_prim_path` onto `target_prim_path` via a named relationship token.
+    pub fn set_relationship(
+        &mut self,
+        target_prim_path: &str,
+        relationship: &str,
+        source_prim_path: &str,
+    ) -> Result<(), MarketStagePathError> {
+        validate_stage_path(target_prim_path)?;
+        validate_stage_path(source_prim_path)?;
+        let entry = self
+            .relationships
+            .entry(target_prim_path.to_string())
+            .or_default();
+        if relationship == "inputs:sources" {
+            if !entry.iter().any(|edge| {
+                edge.relationship == relationship && edge.source_path == source_prim_path
+            }) {
+                entry.push(StageRelationship {
+                    relationship: relationship.to_string(),
+                    source_path: source_prim_path.to_string(),
+                });
+            }
+        } else if let Some(existing) = entry
+            .iter_mut()
+            .find(|edge| edge.relationship == relationship)
+        {
+            existing.source_path = source_prim_path.to_string();
+        } else {
+            entry.push(StageRelationship {
+                relationship: relationship.to_string(),
+                source_path: source_prim_path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Remove a composed relationship edge from the target prim.
+    pub fn remove_relationship(
+        &mut self,
+        target_prim_path: &str,
+        relationship: &str,
+        source_prim_path: &str,
+    ) -> Result<(), MarketStagePathError> {
+        validate_stage_path(target_prim_path)?;
+        validate_stage_path(source_prim_path)?;
+        if let Some(edges) = self.relationships.get_mut(target_prim_path) {
+            edges.retain(|edge| {
+                !(edge.relationship == relationship && edge.source_path == source_prim_path)
+            });
+            if edges.is_empty() {
+                self.relationships.remove(target_prim_path);
+            }
+        }
         Ok(())
     }
 
@@ -284,7 +354,7 @@ mod tests {
         stage.set_sample(&prim, "close", 100.0, 420.0).unwrap();
         stage.set_sample(&prim, "close", 200.0, 430.0).unwrap();
         assert_eq!(stage.resolve_attribute_at(&prim, "close", 150.0), Some(420.0));
-        assert_eq!(stage.resolve_at("/assets/SPY/close", 200.0), Some(430.0));
+        assert_eq!(stage.resolve_at(&format!("{prim}/close"), 200.0), Some(430.0));
     }
 
     #[test]
@@ -324,5 +394,56 @@ mod tests {
         assert!(validate_stage_path("assets/SPY").is_err());
         assert!(validate_stage_path("/assets//SPY").is_err());
         assert!(asset_prim_path("").is_err());
+    }
+
+    #[test]
+    fn set_relationship_updates_existing_edge() {
+        let mut stage = MarketStage::new();
+        stage
+            .set_relationship("/MarketLab/rsi", "inputs:underlying", "/MarketLab/SPY")
+            .unwrap();
+        stage
+            .set_relationship("/MarketLab/rsi", "inputs:underlying", "/MarketLab/QQQ")
+            .unwrap();
+        let edges = stage.relationships.get("/MarketLab/rsi").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].source_path, "/MarketLab/QQQ");
+    }
+
+    #[test]
+    fn set_relationship_appends_portfolio_sources() {
+        let mut stage = MarketStage::new();
+        stage
+            .set_relationship("/MarketLab/Sim_Portfolio", "inputs:sources", "/MarketLab/rsi")
+            .unwrap();
+        stage
+            .set_relationship("/MarketLab/Sim_Portfolio", "inputs:sources", "/MarketLab/macd")
+            .unwrap();
+        let edges = stage.relationships.get("/MarketLab/Sim_Portfolio").unwrap();
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[test]
+    fn remove_relationship_drops_matching_edge() {
+        let mut stage = MarketStage::new();
+        stage
+            .set_relationship("/MarketLab/Sim_Portfolio", "inputs:sources", "/MarketLab/rsi")
+            .unwrap();
+        stage
+            .remove_relationship(
+                "/MarketLab/Sim_Portfolio",
+                "inputs:sources",
+                "/MarketLab/rsi",
+            )
+            .unwrap();
+        assert!(stage.relationships.get("/MarketLab/Sim_Portfolio").is_none());
+    }
+
+    #[test]
+    fn portfolio_prim_path_slugifies_labels() {
+        assert_eq!(
+            portfolio_prim_path("Sim Portfolio").unwrap(),
+            "/MarketLab/Sim_Portfolio"
+        );
     }
 }

@@ -5,7 +5,7 @@ use gpui::prelude::FluentBuilder;
 use gpui_component::scroll::ScrollableElement;
 
 use crate::asset_path_input::render_asset_path_input;
-use crate::graph_compiler::{VisualNode, AssetSourceType};
+use crate::graph_compiler::{AssetSourceType, NodeType, VisualNode};
 use pulsar_marketlab::technical_analysis::{
     category_display_label, ta_category_for_indicator, ta_indicator_catalog_hierarchy,
     ta_indicator_label, TA_SIDEBAR_ALGORITHMS, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK, clamp_ta_lookback,
@@ -46,7 +46,7 @@ impl TradingSystemWorkspace {
             node.ta_indicator_id = Some(indicator_id.clone());
             node.name = label;
             self.ta_inspector_category = ta_category_for_indicator(&indicator_id);
-            self.sync_pipeline_graph();
+            self.sync_pipeline_graph(cx);
             self.invalidate_playhead_evaluation_cache();
             self.recompute_playhead_diagnostics();
             cx.notify();
@@ -54,7 +54,7 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn commit_ta_parameter_change(&mut self, cx: &mut Context<Self>) {
-        self.sync_pipeline_graph();
+        self.sync_pipeline_graph(cx);
         self.invalidate_playhead_evaluation_cache();
         self.recompute_playhead_diagnostics();
         cx.notify();
@@ -84,14 +84,18 @@ impl TradingSystemWorkspace {
         let Some(bounds) = self.ta_lookback_slider_bounds else {
             return;
         };
+        self.ta_lookback_scrubbing = true;
         self.set_ta_lookback_period(
             node_id,
             self.lookback_from_slider_position(mouse_x, bounds),
         );
-        self.commit_ta_parameter_change(cx);
+        cx.notify();
     }
 
     pub(crate) fn update_ta_lookback_scrub(&mut self, node_id: usize, mouse_x: f32, cx: &mut Context<Self>) {
+        if !self.ta_lookback_scrubbing {
+            return;
+        }
         let Some(bounds) = self.ta_lookback_slider_bounds else {
             return;
         };
@@ -104,8 +108,16 @@ impl TradingSystemWorkspace {
             .unwrap_or(DEFAULT_TA_LOOKBACK as u32);
         if next != current {
             self.set_ta_lookback_period(node_id, next);
-            self.commit_ta_parameter_change(cx);
+            cx.notify();
         }
+    }
+
+    pub(crate) fn end_ta_lookback_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.ta_lookback_scrubbing {
+            return;
+        }
+        self.ta_lookback_scrubbing = false;
+        self.commit_ta_parameter_change(cx);
     }
 
     pub(crate) fn adjust_ta_lookback_period(&mut self, node_id: usize, delta: i32, cx: &mut Context<Self>) {
@@ -201,32 +213,43 @@ impl TradingSystemWorkspace {
         }
     }
 
-    pub(crate) fn apply_asset_path_to_node(&mut self, node_id: usize, path: String) {
+    pub(crate) fn apply_asset_path_to_node(
+        &mut self,
+        node_id: usize,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(node) = self
             .nodes
             .iter_mut()
             .find(|node| node.id == node_id && node.node_type.is_asset_adaptor())
         {
+            node.node_type = NodeType::asset_adaptor_from_csv_path(&path);
             node.asset_source = Some(AssetSourceType::Csv {
                 path: path.clone(),
             });
             node.name = csv_node_label_from_path(&path);
             self.csv_path_registry.set_path(node_id, path.clone());
             self.reload_asset_chart_from_path(node_id, &path);
+            self.sync_pipeline_graph(cx);
         }
     }
 
-    pub(crate) fn apply_asset_path_to_selected_node(&mut self, path: String) {
+    pub(crate) fn apply_asset_path_to_selected_node(
+        &mut self,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(selected_id) = self.selected_node_id else {
             return;
         };
-        self.apply_asset_path_to_node(selected_id, path);
+        self.apply_asset_path_to_node(selected_id, path, cx);
     }
 
     pub(crate) fn on_asset_path_input_event(&mut self, event: &PathInputEvent, cx: &mut Context<Self>) {
         match event {
             PathInputEvent::Changed(path) => {
-                self.apply_asset_path_to_selected_node(path.clone());
+                self.apply_asset_path_to_selected_node(path.clone(), cx);
             }
             PathInputEvent::Submit => {
                 cx.notify();
@@ -263,7 +286,7 @@ impl TradingSystemWorkspace {
                             workspace.asset_path_input.update(cx, |input, cx| {
                                 input.set_content(path_str.clone(), cx);
                             });
-                            workspace.apply_asset_path_to_node(node_id, path_str);
+                            workspace.apply_asset_path_to_node(node_id, path_str, cx);
                             workspace.push_status_log(format!(
                                 "CSV Asset bound — node {node_id} loaded"
                             ));
@@ -987,6 +1010,19 @@ impl TradingSystemWorkspace {
                                     this.update_ta_lookback_scrub(node_id, event.position.x.into(), cx);
                                 },
                             ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                                    this.end_ta_lookback_scrub(cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                                    this.end_ta_lookback_scrub(cx);
+                                }),
+                            )
                             .child(
                                 div()
                                     .absolute()

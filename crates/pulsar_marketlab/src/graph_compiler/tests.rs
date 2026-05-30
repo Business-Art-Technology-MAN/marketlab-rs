@@ -9,11 +9,13 @@ fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
         grade: NodeGradeType::Scalar,
         ta_indicator_id: None,
         ta_lookback_period: 14,
+        portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
         asset_source: None,
         x: 0.0,
         y: 0.0,
+        collapsed: false,
         inputs: vec![],
         outputs: vec!["Prim Out".into()],
     }
@@ -27,11 +29,13 @@ fn sample_shader_node(id: usize) -> VisualNode {
         grade: NodeGradeType::Scalar,
         ta_indicator_id: Some("rsi".into()),
         ta_lookback_period: 14,
+        portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: vec!["confidence".into()],
         asset_source: None,
         x: 0.0,
         y: 0.0,
+        collapsed: false,
         inputs: vec!["Timeline In".into(), "Mix In".into()],
         outputs: vec!["Signal Out".into(), "AOV: confidence".into()],
     }
@@ -45,11 +49,13 @@ fn sample_portfolio_node(id: usize) -> VisualNode {
         grade: NodeGradeType::Scalar,
         ta_indicator_id: None,
         ta_lookback_period: 14,
+        portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
         asset_source: None,
         x: 0.0,
         y: 0.0,
+        collapsed: false,
         inputs: vec![portfolio_signal_port_label(0)],
         outputs: vec!["NAV Out".into()],
     }
@@ -84,10 +90,10 @@ fn structural_path_rejected_on_shader_numeric_port() {
 }
 
 #[test]
-fn asset_to_portfolio_direct_wire_is_rejected() {
+fn asset_to_portfolio_direct_wire_is_buy_and_hold() {
     let asset = sample_asset_node(1, "/assets/SPY");
     let portfolio = sample_portfolio_node(3);
-    assert!(!connection_is_valid(&asset, 0, &portfolio, 0));
+    assert!(connection_is_valid(&asset, 0, &portfolio, 0));
 }
 
 #[test]
@@ -95,6 +101,13 @@ fn shader_numeric_output_wires_into_portfolio() {
     let shader = sample_shader_node(2);
     let portfolio = sample_portfolio_node(3);
     assert!(connection_is_valid(&shader, 0, &portfolio, 0));
+}
+
+#[test]
+fn portfolio_output_wires_into_parent_portfolio() {
+    let sub = sample_portfolio_node(2);
+    let master = sample_portfolio_node(3);
+    assert!(connection_is_valid(&sub, 0, &master, 0));
 }
 
 #[test]
@@ -122,8 +135,7 @@ fn validate_graph_wiring_reports_invalid_connections() {
         wiring_errors: Vec::new(),
     };
     let errors = validate_graph_wiring(&snapshot);
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("incompatible wire kinds"));
+    assert!(errors.is_empty());
 }
 
 #[test]
@@ -135,11 +147,13 @@ fn ta_compute_prefers_dsl_formula_over_indicator_id() {
         grade: NodeGradeType::Scalar,
         ta_indicator_id: Some("sma".into()),
         ta_lookback_period: 14,
+        portfolio_allocation_id: None,
         dsl_formula: Some("close - sma(3)".into()),
         aov_outputs: Vec::new(),
         asset_source: None,
         x: 0.0,
         y: 0.0,
+        collapsed: false,
         inputs: vec!["In".into()],
         outputs: vec!["Out".into()],
     };
@@ -160,11 +174,13 @@ fn ta_compute_uses_node_type_script_when_dsl_formula_missing() {
         grade: NodeGradeType::Scalar,
         ta_indicator_id: Some("sma".into()),
         ta_lookback_period: 14,
+        portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
         asset_source: None,
         x: 0.0,
         y: 0.0,
+        collapsed: false,
         inputs: vec!["In".into()],
         outputs: vec!["Out".into()],
     };

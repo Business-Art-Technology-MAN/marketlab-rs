@@ -5,9 +5,10 @@
     ]
 )
 
-def Xform "assets"
+def Scope "MarketLab"
 {
-    def Xform "SPY" (
+    over "SPY"
+    (
         active = false
     )
     {

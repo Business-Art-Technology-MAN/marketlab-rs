@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+openusd = "0.3.0"
+pulsar_marketlab_core = { path = "../pulsar_marketlab_core" }

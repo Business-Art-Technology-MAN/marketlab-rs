@@ -1,14 +1,16 @@
 #usda 1.0
 (
-    defaultPrim = "assets"
+    defaultPrim = "MarketLab"
 )
 
-def Xform "assets"
+def Scope "MarketLab"
 {
-    def Xform "SPY" (
-        active = true
-    )
+    def FinancialAsset "SPY"
     {
+        bool inputs:active = 1
+        token inputs:symbol = "SPY"
+        token inputs:asset_class = "Equity"
+        token inputs:provider = "yahoo"
         custom float risk_budget = 1.0
     }
 }

@@ -4,15 +4,22 @@
 //! LIVRPS layer composition, prim activation, and session metadata via
 //! [`openusd::Stage`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use openusd::sdf::schema::FieldKey;
+use openusd::sdf::PathListOp;
+use crate::trading_stage::{
+    is_legacy_bucket_path, is_schema_template_prim, prim_type_name, should_show_prim_in_stage_tree,
+    MARKETLAB_ROOT,
+};
 use openusd::Stage;
+use pulsar_marketlab_core::financial_schema_defaults;
 
 use crate::signal_dsl::Vector;
 use crate::trading_stage::MarketStage;
@@ -30,7 +37,9 @@ pub struct UsdStageBridge {
 impl UsdStageBridge {
     /// Open and validate a composed stage from a root `.usda` / `.usd` path.
     pub fn open(root_layer_path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = root_layer_path.as_ref().to_string_lossy().into_owned();
+        let path_ref = root_layer_path.as_ref();
+        pulsar_marketlab_core::ensure_schema_sidecar_for_document(path_ref)?;
+        let path = path_ref.to_string_lossy().into_owned();
         Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         Ok(Self {
             root_layer_path: Arc::new(path),
@@ -100,6 +109,58 @@ impl UsdStageBridge {
         .flatten()
     }
 
+    /// Read a composed `float2` attribute (e.g. `ui:canvas:pos`).
+    pub fn field_vec2f(&self, prim_path: &str, attribute: &str) -> Option<[f32; 2]> {
+        let property_path = format!("{prim_path}.{attribute}");
+        self.with_stage(|stage| {
+            let value = stage
+                .field::<[f32; 2]>(property_path.as_str(), "default")
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            let value = if value.is_some() {
+                value
+            } else {
+                stage
+                    .field::<[f32; 2]>(property_path.as_str(), FieldKey::Default)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            };
+            Ok(value.filter(|[x, y]| x.is_finite() && y.is_finite()))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Read a composed string/token attribute default.
+    pub fn field_string(&self, prim_path: &str, attribute: &str) -> Option<String> {
+        let property_path = format!("{prim_path}.{attribute}");
+        self.with_stage(|stage| {
+            Ok(stage
+                .field::<String>(property_path.as_str(), FieldKey::Default)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Composed `typeName` metadata for a prim path.
+    pub fn prim_type_name(&self, prim_path: &str) -> Option<String> {
+        self.with_stage(|stage| Ok(prim_type_name(stage, prim_path)))
+            .ok()
+            .flatten()
+    }
+
+    /// Composed relationship targets for a prim (e.g. `inputs:underlying`).
+    pub fn relationship_targets(&self, prim_path: &str, relationship: &str) -> Vec<String> {
+        let property_path = format!("{prim_path}.{relationship}");
+        self.with_stage(|stage| {
+            Ok(stage
+                .field::<PathListOp>(property_path.as_str(), FieldKey::TargetPaths)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                .map(path_list_op_targets)
+                .unwrap_or_default())
+        })
+        .unwrap_or_default()
+    }
+
     /// Replace the root layer path and clear runtime overlays.
     pub fn reload_from_path(&mut self, root_layer_path: impl AsRef<Path>) -> io::Result<()> {
         let path = root_layer_path.as_ref().to_string_lossy().into_owned();
@@ -146,6 +207,37 @@ impl UsdStageBridge {
             Ok(rows)
         })
     }
+
+    /// Property grid rows for the Stage Ledger Explorer (four parsing tracks).
+    pub fn stage_ledger_entries(&self) -> io::Result<Vec<StageLedgerEntrySnapshot>> {
+        let layer_text = fs::read_to_string(self.root_layer_path.as_str()).unwrap_or_default();
+        let schema_defaults = financial_schema_defaults();
+        self.with_stage(|stage| {
+            let mut entries = Vec::new();
+            collect_ledger_entries(
+                self,
+                stage,
+                &layer_text,
+                &schema_defaults,
+                &openusd::sdf::Path::abs_root(),
+                0,
+                &mut entries,
+            )?;
+            Ok(entries)
+        })
+    }
+
+    fn prim_override_layer(&self, prim_path: &str, layer_text: &str) -> bool {
+        let runtime_overlay = self
+            .active_overrides
+            .lock()
+            .ok()
+            .and_then(|overrides| overrides.get(prim_path).copied())
+            .is_some();
+        runtime_overlay
+            || layer_contains_override_for_prim(layer_text, prim_path)
+            || (layer_text.contains("subLayers") && !self.prim_active(prim_path))
+    }
 }
 
 /// One prim row read from the composed OpenUSD stage.
@@ -155,6 +247,19 @@ pub struct StagePrimRowSnapshot {
     pub label: String,
     pub depth: usize,
     pub active: bool,
+}
+
+/// One ledger grid row for the Stage Ledger Explorer pane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageLedgerEntrySnapshot {
+    pub prim_path: String,
+    pub property: String,
+    pub depth: usize,
+    pub active: bool,
+    pub override_layer: bool,
+    pub deviates_from_schema: bool,
+    pub value_label: String,
+    pub lineage: Vec<String>,
 }
 
 /// Alias matching the split-plane spec: shared structural plane handle.
@@ -167,12 +272,49 @@ pub fn fixture_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
+fn path_list_op_targets(list_op: PathListOp) -> Vec<String> {
+    list_op
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+static INLINE_USDA_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn write_inline_usda(content: &str) -> io::Result<String> {
     let dir = std::env::temp_dir().join("marketlab_openusd");
     fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("inline_{}.usda", std::process::id()));
+    let unique = INLINE_USDA_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "inline_{}_{unique}.usda",
+        std::process::id()
+    ));
     fs::write(&path, content)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn prim_def_type(path_str: &str, stage: &Stage) -> &'static str {
+    if let Some(type_name) = prim_type_name(stage, path_str) {
+        return match type_name.as_str() {
+            "FinancialAsset" => "FinancialAsset",
+            "OtlOperator" => "OtlOperator",
+            "PortfolioIntegrator" => "PortfolioIntegrator",
+            "Scope" => "Scope",
+            _ => "Scope",
+        };
+    }
+    if path_str == MARKETLAB_ROOT || is_legacy_bucket_path(path_str) {
+        return "Scope";
+    }
+    "Scope"
+}
+
+fn stage_tree_label(stage: &Stage, path_str: &str, child_name: &str) -> String {
+    prim_type_name(stage, path_str)
+        .map(|type_name| format!("{child_name} ({type_name})"))
+        .unwrap_or_else(|| child_name.to_string())
 }
 
 fn export_prim_tree(
@@ -190,13 +332,21 @@ fn export_prim_tree(
             .append_path(child_name.as_str())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let path_str = child_path.to_string();
+        if !should_show_prim_in_stage_tree(stage, &path_str) {
+            continue;
+        }
+        let label = stage_tree_label(stage, &path_str, child_name.as_str());
         let active = bridge.prim_active(&path_str);
         let indent = "    ".repeat(depth + 1);
         let inner = "    ".repeat(depth + 2);
+        let def_type = prim_def_type(&path_str, stage);
 
-        out.push_str(&format!("{indent}def Xform \"{child_name}\" (\n"));
-        out.push_str(&format!("{inner}active = {}\n", if active { "true" } else { "false" }));
-        out.push_str(&format!("{indent})\n"));
+        out.push_str(&format!("{indent}def {def_type} \"{child_name}\"\n"));
+        if !active {
+            out.push_str(&format!("{indent}(\n"));
+            out.push_str(&format!("{inner}active = false\n"));
+            out.push_str(&format!("{indent})\n"));
+        }
         out.push_str(&format!("{indent}{{\n"));
 
         if let Ok(properties) = stage.prim_properties(child_path.clone()) {
@@ -208,10 +358,42 @@ fn export_prim_tree(
                     .append_property(&property)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
                 let property_path_str = property_path.to_string();
-                if let Ok(Some(value)) = stage.field::<f32>(property_path_str.as_str(), "default") {
-                    out.push_str(&format!(
-                        "{inner}custom float {property} = {value}\n"
-                    ));
+                if let Ok(Some(value)) =
+                    stage.field::<String>(property_path_str.as_str(), "default")
+                {
+                    if property.starts_with("inputs:") || property.starts_with("outputs:") {
+                        if property.contains("script") || property.contains("category") {
+                            write_usda_string(out, &inner, &property, &value);
+                        } else {
+                            write_usda_token(out, &inner, &property, &value);
+                        }
+                    } else {
+                        write_usda_string(out, &inner, &property, &value);
+                    }
+                } else if let Ok(Some(value)) =
+                    stage.field::<f64>(property_path_str.as_str(), "default")
+                {
+                    write_usda_double(out, &inner, &property, value);
+                } else if let Ok(Some(value)) =
+                    stage.field::<f32>(property_path_str.as_str(), "default")
+                {
+                    if property.starts_with("ui:") {
+                        write_usda_custom_float(out, &inner, &property, value);
+                    } else {
+                        write_usda_float(out, &inner, &property, value);
+                    }
+                } else if let Ok(Some(value)) =
+                    stage.field::<[f32; 2]>(property_path_str.as_str(), "default")
+                {
+                    if property.starts_with("ui:") {
+                        write_usda_custom_float2(out, &inner, &property, value);
+                    } else {
+                        write_usda_float2(out, &inner, &property, value);
+                    }
+                } else if let Ok(Some(value)) =
+                    stage.field::<bool>(property_path_str.as_str(), "default")
+                {
+                    write_usda_bool(out, &inner, &property, value);
                 }
             }
         }
@@ -220,6 +402,213 @@ fn export_prim_tree(
         out.push_str(&format!("{indent}}}\n"));
     }
     Ok(())
+}
+
+fn write_usda_token(out: &mut String, indent: &str, name: &str, value: &str) {
+    let escaped = value.replace('"', "\\\"");
+    out.push_str(&format!("{indent}token {name} = \"{escaped}\"\n"));
+}
+
+fn write_usda_string(out: &mut String, indent: &str, name: &str, value: &str) {
+    let escaped = value.replace('"', "\\\"");
+    out.push_str(&format!("{indent}string {name} = \"{escaped}\"\n"));
+}
+
+fn write_usda_bool(out: &mut String, indent: &str, name: &str, value: bool) {
+    out.push_str(&format!(
+        "{indent}bool {name} = {}\n",
+        if value { "1" } else { "0" }
+    ));
+}
+
+fn write_usda_float(out: &mut String, indent: &str, name: &str, value: f32) {
+    out.push_str(&format!("{indent}float {name} = {value}\n"));
+}
+
+fn write_usda_double(out: &mut String, indent: &str, name: &str, value: f64) {
+    out.push_str(&format!("{indent}double {name} = {value}\n"));
+}
+
+fn write_usda_custom_float(out: &mut String, indent: &str, name: &str, value: f32) {
+    out.push_str(&format!("{indent}custom float {name} = {value}\n"));
+}
+
+fn write_usda_float2(out: &mut String, indent: &str, name: &str, value: [f32; 2]) {
+    out.push_str(&format!(
+        "{indent}float2 {name} = ({}, {})\n",
+        value[0], value[1]
+    ));
+}
+
+fn write_usda_custom_float2(out: &mut String, indent: &str, name: &str, value: [f32; 2]) {
+    out.push_str(&format!(
+        "{indent}custom float2 {name} = ({}, {})\n",
+        value[0], value[1]
+    ));
+}
+
+const LINEAGE_RELATIONSHIPS: &[&str] = &["inputs:target", "inputs:constituents", "inputs:underlying", "inputs:sources"];
+
+fn layer_contains_override_for_prim(layer_text: &str, prim_path: &str) -> bool {
+    let prim_name = prim_path.rsplit('/').next().unwrap_or(prim_path);
+    layer_text.contains(&format!("over \"{prim_name}\""))
+        || layer_text.contains(&format!("over '{prim_name}'"))
+}
+
+fn collect_ledger_entries(
+    bridge: &UsdStageBridge,
+    stage: &Stage,
+    layer_text: &str,
+    schema_defaults: &HashMap<String, String>,
+    path: &openusd::sdf::Path,
+    depth: usize,
+    entries: &mut Vec<StageLedgerEntrySnapshot>,
+) -> io::Result<()> {
+    let children = stage
+        .prim_children(path.clone())
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    for child_name in children {
+        let child_path = path
+            .append_path(child_name.as_str())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let path_str = child_path.to_string();
+        let active = bridge.prim_active(&path_str);
+        let override_layer = bridge.prim_override_layer(&path_str, layer_text);
+
+        let inputs_active = read_inputs_active(stage, &path_str).unwrap_or(active);
+        entries.push(StageLedgerEntrySnapshot {
+            prim_path: path_str.clone(),
+            property: "inputs:active".to_string(),
+            depth,
+            active: inputs_active,
+            override_layer,
+            deviates_from_schema: schema_deviates(schema_defaults, "inputs:active", &bool_label(inputs_active)),
+            value_label: bool_label(inputs_active),
+            lineage: lineage_for_property(layer_text, &path_str, "inputs:active"),
+        });
+
+        if let Ok(properties) = stage.prim_properties(child_path.clone()) {
+            for property in properties {
+                if property == "active" {
+                    continue;
+                }
+                let property_path = child_path
+                    .append_property(&property)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                let property_path_str = property_path.to_string();
+                let value_label = read_property_value_label(stage, &property_path_str, &property);
+                let schema_key = normalize_schema_key(&property);
+                let deviates = schema_deviates(schema_defaults, &schema_key, &value_label);
+                let lineage = if LINEAGE_RELATIONSHIPS.iter().any(|rel| *rel == schema_key.as_str()) {
+                    lineage_for_property(layer_text, &path_str, &schema_key)
+                } else {
+                    Vec::new()
+                };
+                entries.push(StageLedgerEntrySnapshot {
+                    prim_path: path_str.clone(),
+                    property: property.clone(),
+                    depth: depth + 1,
+                    active: inputs_active,
+                    override_layer,
+                    deviates_from_schema: deviates,
+                    value_label,
+                    lineage,
+                });
+            }
+        }
+
+        collect_ledger_entries(
+            bridge,
+            stage,
+            layer_text,
+            schema_defaults,
+            &child_path,
+            depth + 1,
+            entries,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_inputs_active(stage: &Stage, prim_path: &str) -> Option<bool> {
+    let property_path = format!("{prim_path}.inputs:active");
+    stage
+        .field::<bool>(property_path.as_str(), FieldKey::Default)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            stage
+                .field::<bool>(prim_path, FieldKey::Active)
+                .ok()
+                .flatten()
+        })
+}
+
+fn read_property_value_label(stage: &Stage, property_path: &str, property: &str) -> String {
+    if let Ok(Some(value)) = stage.field::<bool>(property_path, FieldKey::Default) {
+        return bool_label(value);
+    }
+    if let Ok(Some(value)) = stage.field::<f32>(property_path, FieldKey::Default) {
+        return format!("{value}");
+    }
+    if let Ok(Some(value)) = stage.field::<f64>(property_path, FieldKey::Default) {
+        return format!("{value}");
+    }
+    if let Ok(Some(value)) = stage.field::<String>(property_path, FieldKey::Default) {
+        return value;
+    }
+    if let Ok(Some(value)) = stage.field::<String>(property_path, "default") {
+        return value;
+    }
+    property.to_string()
+}
+
+fn normalize_schema_key(property: &str) -> String {
+    if property.starts_with("inputs:") || property.starts_with("outputs:") {
+        property.to_string()
+    } else {
+        format!("inputs:{property}")
+    }
+}
+
+fn bool_label(value: bool) -> String {
+    if value { "1".to_string() } else { "0".to_string() }
+}
+
+fn schema_deviates(
+    schema_defaults: &HashMap<String, String>,
+    schema_key: &str,
+    value_label: &str,
+) -> bool {
+    schema_defaults
+        .get(schema_key)
+        .is_some_and(|default| default != value_label)
+}
+
+fn lineage_for_property(layer_text: &str, prim_path: &str, relationship: &str) -> Vec<String> {
+    let prim_name = prim_path.rsplit('/').next().unwrap_or(prim_path);
+    let mut labels = Vec::new();
+    let mut in_prim = false;
+    for line in layer_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(&format!("\"{prim_name}\"")) || trimmed.contains(&format!("'{prim_name}'")) {
+            in_prim = true;
+        }
+        if in_prim && trimmed.contains(relationship) {
+            for token in trimmed.split_whitespace() {
+                if token.starts_with("</") {
+                    labels.push(format!("→ {token}"));
+                }
+            }
+        }
+        if in_prim && trimmed == "}" {
+            break;
+        }
+    }
+    if labels.is_empty() && (relationship == "inputs:underlying" || relationship == "inputs:sources") {
+        labels.push(format!("→ (unbound {relationship})"));
+    }
+    labels
 }
 
 fn collect_prim_rows(
@@ -237,16 +626,15 @@ fn collect_prim_rows(
             .append_path(child_name.as_str())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let path_str = child_path.to_string();
-        let label = child_path
-            .name()
-            .map(|name| {
-                if depth == 0 && path == &openusd::sdf::Path::abs_root() {
-                    format!("{name} (Xform)")
-                } else {
-                    name.to_string()
-                }
-            })
-            .unwrap_or_else(|| path_str.clone());
+        if !bridge
+            .with_stage(|stage| Ok(should_show_prim_in_stage_tree(stage, &path_str)))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let label = bridge
+            .with_stage(|stage| Ok(stage_tree_label(stage, &path_str, child_name.as_str())))
+            .unwrap_or_else(|_| child_name.clone());
         rows.push(StagePrimRowSnapshot {
             path: path_str.clone(),
             label,
@@ -273,7 +661,7 @@ pub fn profile_time_sample_retrieval(
     sample_count: usize,
     query_count: usize,
 ) -> UsdSpikeProfile {
-    let prim_path = "/assets/SPY";
+    let prim_path = "/MarketLab/SPY";
 
     let resolve_start = Instant::now();
     for query in 0..query_count {
@@ -337,17 +725,17 @@ mod tests {
     #[test]
     fn native_stage_reads_active_metadata_from_fixture() {
         let usd = UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open fixture");
-        assert!(usd.prim_active("/assets/SPY"));
+        assert!(usd.prim_active("/MarketLab/SPY"));
     }
 
     #[test]
     fn inactive_overlay_blocks_temporal_resolve() {
         let usd =
             UsdStageBridge::open(fixture_path("spy_assets_inactive_overlay.usda")).expect("open");
-        assert!(!usd.prim_active("/assets/SPY"));
+        assert!(!usd.prim_active("/MarketLab/SPY"));
 
         let temporal = seeded_temporal_stage(8);
-        let value = composed_close_at(&temporal, "/assets/SPY", "close", 4.0, &usd);
+        let value = composed_close_at(&temporal, "/MarketLab/SPY", "close", 4.0, &usd);
         assert!(value.is_none());
     }
 
@@ -368,5 +756,40 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         assert_send_sync(&usd);
         assert_send_sync(&Arc::new(usd));
+    }
+
+    #[test]
+    fn open_document_without_schema_sidecar_still_loads_operational_prims() {
+        let dir = std::env::temp_dir().join(format!("marketlab_open_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let doc = dir.join("solo.usda");
+        fs::write(
+            &doc,
+            r#"#usda 1.0
+(
+    subLayers = [
+        @./schema.usda@
+    ]
+    defaultPrim = "MarketLab"
+)
+
+def Scope "MarketLab"
+{
+    def FinancialAsset "SPY"
+    {
+        bool inputs:active = 1
+        token inputs:symbol = "SPY"
+    }
+}
+"#,
+        )
+        .expect("write temp usda");
+
+        let bridge = UsdStageBridge::open(&doc).expect("open document without schema sidecar");
+        assert!(bridge.prim_active("/MarketLab/SPY"));
+        let rows = bridge.stage_prim_rows().expect("stage tree rows");
+        assert!(rows.iter().any(|row| row.path == "/MarketLab/SPY"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

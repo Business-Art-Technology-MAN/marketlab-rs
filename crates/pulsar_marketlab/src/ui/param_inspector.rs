@@ -2,12 +2,22 @@
 
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
-use pulsar_marketlab_ui::workspace::ParamInspectorPane;
+use pulsar_marketlab_ui::workspace::{GlobalPipelineOverview, ParamInspectorPane};
 
-use crate::graph_compiler::{effective_otl_script, sync_otl_shader_aov_ports};
+use crate::graph_compiler::{
+    effective_otl_script, portfolio_wired_source_count, sync_otl_shader_aov_ports,
+};
 use crate::workspace_state::TradingSystemWorkspace;
 
 const AOV_CHANNELS: &[&str] = &["confidence", "variance", "raw_signal"];
+
+fn layer_display_name(identifier: &str) -> String {
+    std::path::Path::new(identifier)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(identifier)
+        .to_string()
+}
 
 impl TradingSystemWorkspace {
     fn selected_otl_node_id(&self) -> Option<usize> {
@@ -50,7 +60,7 @@ impl TradingSystemWorkspace {
             } else {
                 node.dsl_formula = Some(trimmed.to_string());
             }
-            self.sync_pipeline_graph();
+            self.sync_pipeline_graph(cx);
             self.invalidate_playhead_evaluation_cache();
             self.recompute_playhead_diagnostics();
             cx.notify();
@@ -78,6 +88,54 @@ impl ParamInspectorPane for TradingSystemWorkspace {
                 format!("Inspector // {node_name}")
             }
         }
+    }
+
+    fn param_inspector_global_overview(&self, cx: &App) -> Option<GlobalPipelineOverview> {
+        let workspace = self.workspace_context.read(cx);
+        if workspace.selected_path().is_some() {
+            return None;
+        }
+
+        let edit_target_layer = workspace
+            .edit_target_layer()
+            .map(layer_display_name)
+            .or_else(|| {
+                workspace
+                    .layer_identifiers()
+                    .first()
+                    .map(|id| layer_display_name(id))
+            })
+            .unwrap_or_else(|| "—".to_string());
+
+        let total_assets = self
+            .nodes
+            .iter()
+            .filter(|node| node.node_type.is_asset_adaptor())
+            .count();
+
+        let active_sinks = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.node_type.is_portfolio()
+                    && portfolio_wired_source_count(&self.connections, node.id) > 0
+            })
+            .count();
+
+        let compilation_status = if self.graph_engine_recompile_inflight {
+            "Compiling…".to_string()
+        } else if workspace.is_engine_cache_dirty(self.graph_engine_last_compiled_generation) {
+            "Pending recompile".to_string()
+        } else {
+            "Ready".to_string()
+        };
+
+        Some(GlobalPipelineOverview {
+            edit_target_layer,
+            total_assets,
+            active_sinks,
+            compilation_status,
+        })
     }
 
     fn ensure_otl_script_input(
@@ -154,7 +212,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             node.aov_outputs.retain(|name| name != channel);
         }
         self.sync_otl_aov_ports(node_id);
-        self.sync_pipeline_graph();
+        self.sync_pipeline_graph(cx);
         self.invalidate_playhead_evaluation_cache();
         self.recompute_playhead_diagnostics();
         cx.notify();

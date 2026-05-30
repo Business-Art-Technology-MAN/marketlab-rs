@@ -7,18 +7,15 @@ use gpui_component::AxisExt;
 /// Which splitter handle is being dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitHandle {
-    /// Upper workstation band vs lower render viewport.
-    Vertical,
     /// Stage composer vs node canvas.
     StageCanvas,
     /// Node canvas vs param inspector.
     CanvasInspector,
 }
 
-/// Persisted flex shares for the nested workstation tree.
+/// Persisted flex shares for the horizontal workstation row.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkstationSplitLayout {
-    pub upper_share: f32,
     pub stage_share: f32,
     pub inspector_share: f32,
 }
@@ -26,7 +23,6 @@ pub struct WorkstationSplitLayout {
 impl Default for WorkstationSplitLayout {
     fn default() -> Self {
         Self {
-            upper_share: 0.68,
             stage_share: 0.22,
             inspector_share: 0.30,
         }
@@ -35,7 +31,6 @@ impl Default for WorkstationSplitLayout {
 
 impl WorkstationSplitLayout {
     pub fn clamp(self) -> Self {
-        let upper_share = self.upper_share.clamp(0.30, 0.85);
         let mut stage_share = self.stage_share.clamp(0.12, 0.45);
         let mut inspector_share = self.inspector_share.clamp(0.12, 0.45);
         let mut canvas = 1.0 - stage_share - inspector_share;
@@ -47,7 +42,6 @@ impl WorkstationSplitLayout {
         }
         let _ = canvas;
         Self {
-            upper_share,
             stage_share,
             inspector_share,
         }
@@ -85,9 +79,8 @@ pub fn render_split_handle<H: SplitLayoutHost>(
     };
 
     let handle_id = match handle {
-        SplitHandle::Vertical => 0usize,
-        SplitHandle::StageCanvas => 1usize,
-        SplitHandle::CanvasInspector => 2usize,
+        SplitHandle::StageCanvas => 0usize,
+        SplitHandle::CanvasInspector => 1usize,
     };
 
     div()

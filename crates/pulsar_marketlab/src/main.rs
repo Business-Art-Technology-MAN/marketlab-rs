@@ -11,6 +11,8 @@ use gpui_component::Root;
 use pulsar_marketlab::fix_engine::{spawn_mock_fix_bridge, FixPlayheadClock};
 
 mod asset_path_input;
+mod canvas_compose;
+mod canvas_hydrate;
 mod graph_compiler;
 mod ohlc_chart_pane;
 mod ui;
@@ -18,10 +20,10 @@ mod workspace_state;
 
 use graph_compiler::{portfolio_wired_ta_node_ids, SharedCsvAssetPaths, SharedPipelineGraph};
 use workspace_state::{
-    csv_playback_is_active, default_pipeline_connections, default_pipeline_nodes,
-    finalize_csv_playback_at_eof, format_multivector_scalar, hot_swap_csv_playback, init_csv_playback_from_path,
-    market_window_from_yahoo_rows, restart_csv_playback, send_chart_series_preload, send_playhead_set,
-    ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge, TradingSystemWorkspace,
+    csv_playback_is_active, finalize_csv_playback_at_eof, format_multivector_scalar,
+    hot_swap_csv_playback, init_csv_playback_from_path, market_window_from_yahoo_rows,
+    restart_csv_playback, send_chart_series_preload, send_playhead_set, ta_tick_messages_for_asset,
+    CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge, TradingSystemWorkspace,
     ticker_from_csv_path,
 };
 
@@ -246,10 +248,8 @@ fn spawn_csv_asset_feeder(
 fn main() {
     println!("Starting MarketLab Integrated UI Pipeline...");
 
-    let default_nodes = default_pipeline_nodes();
-    let default_connections = default_pipeline_connections();
-    let csv_path_registry = SharedCsvAssetPaths::from_nodes(&default_nodes);
-    let pipeline_graph = SharedPipelineGraph::new(default_nodes.clone(), default_connections);
+    let csv_path_registry = SharedCsvAssetPaths::from_nodes(&[]);
+    let pipeline_graph = SharedPipelineGraph::new(Vec::new(), Vec::new());
 
     let (pipeline_tx, pipeline_rx) = mpsc::channel::<PipelineSystemMessage>();
     let fix_clock = Arc::new(FixPlayheadClock::new());
@@ -298,6 +298,16 @@ fn main() {
                     pipeline_graph.clone(),
                     cx,
                 )
+            });
+            let workspace_for_sweep = workspace.clone();
+            cx.defer(move |cx| {
+                workspace_for_sweep.update(cx, |host, cx| {
+                    pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(
+                        host,
+                        workspace_for_sweep.clone(),
+                        cx,
+                    );
+                });
             });
             cx.new(|cx| Root::new(workspace, window, cx))
         })

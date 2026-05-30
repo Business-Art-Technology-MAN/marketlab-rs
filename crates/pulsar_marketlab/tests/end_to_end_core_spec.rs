@@ -28,12 +28,12 @@ fn production_provider() -> ProductionStageProvider {
     let usd = Arc::new(
         UsdStageBridge::open(fixture_path("spy_assets.usda")).expect("open native usd stage"),
     );
-    ProductionStageProvider::new(usd, Arc::new(temporal), "/assets/SPY/close")
+    ProductionStageProvider::new(usd, Arc::new(temporal), "/MarketLab/SPY/close")
 }
 
 #[test]
 fn otl_script_executes_via_production_stage_provider_at_playhead() {
-    let close_path = "/assets/SPY/close";
+    let close_path = "/MarketLab/SPY/close";
     let provider = production_provider();
     let ctx = CompileContext {
         timeline_close_path: close_path.to_string(),
@@ -51,7 +51,7 @@ fn otl_script_executes_via_production_stage_provider_at_playhead() {
 
 #[test]
 fn otl_rsi_integrator_routes_through_production_provider() {
-    let close_path = "/assets/SPY/close";
+    let close_path = "/MarketLab/SPY/close";
     let provider = production_provider();
     let ctx = CompileContext {
         timeline_close_path: close_path.to_string(),
@@ -65,7 +65,7 @@ fn otl_rsi_integrator_routes_through_production_provider() {
 
 #[test]
 fn production_rtn_log_executes_via_stage_provider() {
-    let close_path = "/assets/SPY/close";
+    let close_path = "/MarketLab/SPY/close";
     let provider = production_provider();
     let ctx = CompileContext {
         timeline_close_path: close_path.to_string(),

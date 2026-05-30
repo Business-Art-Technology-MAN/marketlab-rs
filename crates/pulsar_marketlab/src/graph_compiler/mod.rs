@@ -298,6 +298,8 @@ pub struct VisualNode {
     pub ta_indicator_id: Option<String>,
     /// Lookback period passed to VectorTA `period` param (sidebar slider).
     pub ta_lookback_period: u32,
+    /// Portfolio allocation strategy token (`inputs:id` on portfolio prims).
+    pub portfolio_allocation_id: Option<String>,
     /// OSL-inspired formula evaluated against the upstream market window when set.
     pub dsl_formula: Option<String>,
     /// OTL arbitrary output variable names exposed as dedicated AOV output ports.
@@ -306,6 +308,8 @@ pub struct VisualNode {
     pub asset_source: Option<AssetSourceType>,
     pub x: f32,
     pub y: f32,
+    /// Blender capsule mode: pill shell only, active sockets on perimeter.
+    pub collapsed: bool,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
 }
@@ -416,7 +420,35 @@ pub(crate) fn node_body_height_world(node: &VisualNode, include_chart: bool) -> 
     height
 }
 
-pub(crate) fn input_port_world_center(node: &VisualNode, port_idx: usize, include_chart: bool) -> (f32, f32) {
+pub(crate) fn input_port_world_center(
+    node: &VisualNode,
+    port_idx: usize,
+    include_chart: bool,
+    connections: &[NodeConnection],
+) -> (f32, f32) {
+    if node.collapsed {
+        let connected: Vec<usize> = connections
+            .iter()
+            .filter(|connection| connection.to_node_id == node.id)
+            .map(|connection| connection.to_port_idx)
+            .collect();
+        if let Some(slot) = connected.iter().position(|&idx| idx == port_idx) {
+            return pulsar_marketlab_ui::theme::capsule_socket_world_center(
+                node.x,
+                node.y,
+                pulsar_marketlab_ui::theme::CapsuleSocketSide::Input,
+                slot,
+                connected.len(),
+            );
+        }
+        return pulsar_marketlab_ui::theme::capsule_socket_world_center(
+            node.x,
+            node.y,
+            pulsar_marketlab_ui::theme::CapsuleSocketSide::Input,
+            0,
+            1,
+        );
+    }
     let y = node.y
         + node_body_height_world(node, include_chart)
         + NODE_PORTS_PADDING
@@ -425,11 +457,61 @@ pub(crate) fn input_port_world_center(node: &VisualNode, port_idx: usize, includ
     (node.x + 12.0, y)
 }
 
-pub(crate) fn output_port_world_center(node: &VisualNode, port_idx: usize, include_chart: bool) -> (f32, f32) {
+pub(crate) fn output_port_world_center(
+    node: &VisualNode,
+    port_idx: usize,
+    include_chart: bool,
+    connections: &[NodeConnection],
+) -> (f32, f32) {
+    if node.collapsed {
+        let connected: Vec<usize> = connections
+            .iter()
+            .filter(|connection| connection.from_node_id == node.id)
+            .map(|connection| connection.from_port_idx)
+            .collect();
+        if let Some(slot) = connected.iter().position(|&idx| idx == port_idx) {
+            return pulsar_marketlab_ui::theme::capsule_socket_world_center(
+                node.x,
+                node.y,
+                pulsar_marketlab_ui::theme::CapsuleSocketSide::Output,
+                slot,
+                connected.len(),
+            );
+        }
+        return pulsar_marketlab_ui::theme::capsule_socket_world_center(
+            node.x,
+            node.y,
+            pulsar_marketlab_ui::theme::CapsuleSocketSide::Output,
+            0,
+            1,
+        );
+    }
     let y = node.y
         + node_body_height_world(node, include_chart)
         + NODE_PORTS_PADDING
         + port_idx as f32 * PORT_ROW_HEIGHT
         + PORT_ROW_HEIGHT * 0.5;
     (node.x + NODE_WIDTH - 12.0, y)
+}
+
+pub(crate) fn input_port_is_wired(
+    node: &VisualNode,
+    port_idx: usize,
+    connections: &[NodeConnection],
+) -> bool {
+    connections
+        .iter()
+        .any(|connection| connection.to_node_id == node.id && connection.to_port_idx == port_idx)
+}
+
+pub(crate) fn output_port_is_wired(
+    node: &VisualNode,
+    port_idx: usize,
+    connections: &[NodeConnection],
+) -> bool {
+    connections
+        .iter()
+        .any(|connection| {
+            connection.from_node_id == node.id && connection.from_port_idx == port_idx
+        })
 }
