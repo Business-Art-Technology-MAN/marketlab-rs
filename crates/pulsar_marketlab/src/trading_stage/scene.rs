@@ -16,6 +16,7 @@ pub const MARKETLAB_DEFAULT_PRIM: &str = "MarketLab";
 pub const SCHEMA_TEMPLATE_PRIM_PATHS: &[&str] = &[
     "/FinancialAsset",
     "/OtlOperator",
+    "/OtlTaUberSignal",
     "/PortfolioIntegrator",
     "/Typed",
     "/Plugins",
@@ -47,7 +48,8 @@ pub fn is_schema_template_prim(path: &str) -> bool {
     segments.len() == 1
         && matches!(
             segments[0],
-            "FinancialAsset" | "OtlOperator" | "PortfolioIntegrator" | "Typed" | "Plugins"
+            "FinancialAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator" | "Typed"
+                | "Plugins"
         )
 }
 
@@ -83,6 +85,7 @@ pub fn classify_type_name(type_name: &str) -> Option<ExecutablePrimKind> {
     match type_name {
         "FinancialAsset" => Some(ExecutablePrimKind::FinancialAsset),
         "OtlOperator" => Some(ExecutablePrimKind::OtlOperator),
+        "OtlTaUberSignal" => Some(ExecutablePrimKind::OtlTaUberSignal),
         "PortfolioIntegrator" => Some(ExecutablePrimKind::PortfolioIntegrator),
         _ => None,
     }
@@ -92,6 +95,7 @@ pub fn classify_type_name(type_name: &str) -> Option<ExecutablePrimKind> {
 pub enum ExecutablePrimKind {
     FinancialAsset,
     OtlOperator,
+    OtlTaUberSignal,
     PortfolioIntegrator,
 }
 
@@ -100,6 +104,7 @@ impl ExecutablePrimKind {
         match self {
             Self::FinancialAsset => "FinancialAsset",
             Self::OtlOperator => "OtlOperator",
+            Self::OtlTaUberSignal => "OtlTaUberSignal",
             Self::PortfolioIntegrator => "PortfolioIntegrator",
         }
     }

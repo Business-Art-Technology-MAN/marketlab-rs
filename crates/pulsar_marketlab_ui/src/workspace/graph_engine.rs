@@ -43,6 +43,12 @@ pub trait GraphEngineInvalidationHost: Sized + 'static {
 
     fn set_graph_engine_recompile_pending(&mut self, pending: bool);
 
+    fn graph_engine_last_compile_ms(&self) -> u64 {
+        0
+    }
+
+    fn set_graph_engine_last_compile_ms(&mut self, _ms: u64) {}
+
     fn apply_graph_engine_streams(
         &mut self,
         streams: Vec<ComputedAttributeStream>,
@@ -89,6 +95,7 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
     let target_generation = generation;
 
     cx.spawn(async move |this, cx| {
+        let started = std::time::Instant::now();
         let computed_streams = cx
             .background_executor()
             .spawn(async move {
@@ -99,6 +106,7 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
                     .unwrap_or_default()
             })
             .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
 
         let _ = cx.update(|cx| {
             context_handle.update(cx, |workspace, cx| {
@@ -122,6 +130,7 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
                     }
 
                     host.set_graph_engine_last_compiled_generation(target_generation);
+                    host.set_graph_engine_last_compile_ms(elapsed_ms);
                     host.apply_graph_engine_streams(computed_streams, cx);
 
                     if host.graph_engine_recompile_pending() {
@@ -215,6 +224,7 @@ fn is_schema_template_prim(path: &str) -> bool {
         path,
         "/FinancialAsset"
             | "/OtlOperator"
+            | "/OtlTaUberSignal"
             | "/PortfolioIntegrator"
             | "/Typed"
             | "/Plugins"
@@ -233,7 +243,9 @@ fn prim_type_name(opened: &openusd::Stage, path_str: &str) -> Option<String> {
 
 fn classify_type_name(type_name: &str) -> Option<String> {
     match type_name {
-        "FinancialAsset" | "OtlOperator" | "PortfolioIntegrator" => Some(type_name.to_string()),
+        "FinancialAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator" => {
+            Some(type_name.to_string())
+        }
         _ => None,
     }
 }
@@ -280,7 +292,7 @@ fn legacy_type_name_from_path(path_str: &str) -> Option<String> {
     if path_str.starts_with("/assets/") {
         Some("FinancialAsset".to_string())
     } else if path_str.starts_with("/analytics/") {
-        Some("OtlOperator".to_string())
+        Some("OtlTaUberSignal".to_string())
     } else if path_str.starts_with("/portfolios/") {
         Some("PortfolioIntegrator".to_string())
     } else {

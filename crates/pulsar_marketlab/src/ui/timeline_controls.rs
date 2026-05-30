@@ -6,7 +6,6 @@ use crate::graph_compiler::{upstream_price_source_node_id_parts, AssetSourceType
 use crate::ohlc_chart_pane::{
     OhlcChartPaneConfig, playhead_index_for_mouse_x, render_ohlc_candlestick_pane,
 };
-use pulsar_marketlab::technical_analysis::ta_indicator_label;
 use crate::workspace_state::TradingSystemWorkspace;
 
 impl TradingSystemWorkspace {
@@ -76,15 +75,29 @@ impl TradingSystemWorkspace {
                             .cloned()
                             .unwrap_or_default();
                     }
+                    NodeType::TaUberSignal { .. } => {
+                        if let Some(uber) = node.node_type.ta_uber_config() {
+                            config.apply_uber_signal_overlay(uber);
+                        }
+                        if let Some(asset_id) = upstream_price_source_node_id_parts(
+                            node_id,
+                            0,
+                            &self.nodes,
+                            &self.connections,
+                        ) {
+                            config.asset_name = self
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == asset_id)
+                                .map(|node| node.name.clone());
+                            config.bars = self
+                                .asset_ohlc_history
+                                .get(&asset_id)
+                                .cloned()
+                                .unwrap_or_default();
+                        }
+                    }
                     NodeType::OtlShader { .. } => {
-                        config.ta_indicator_id = node.ta_indicator_id.clone();
-                        config.ta_lookback_period = Some(node.ta_lookback_period);
-                        config.ta_indicator_label = node
-                            .ta_indicator_id
-                            .as_deref()
-                            .and_then(ta_indicator_label)
-                            .map(str::to_string)
-                            .or_else(|| Some(node.name.clone()));
                         if let Some(asset_id) = upstream_price_source_node_id_parts(
                             node_id,
                             0,

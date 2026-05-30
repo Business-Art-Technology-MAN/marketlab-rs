@@ -16,6 +16,7 @@ fn prim_type_class(path: &str, type_name: Option<&str>) -> &'static str {
         return match type_name {
             "FinancialAsset" => "Asset",
             "OtlOperator" => "OTL Shader",
+            "OtlTaUberSignal" => "TA Uber Signal",
             "PortfolioIntegrator" => "Integrator",
             "Scope" => "Scope",
             _ => "Prim",

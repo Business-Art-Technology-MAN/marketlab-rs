@@ -14,6 +14,11 @@ pub struct GlobalPipelineOverview {
     pub total_assets: usize,
     pub active_sinks: usize,
     pub compilation_status: String,
+    pub graph_revision: u64,
+    pub computed_stream_count: usize,
+    pub last_compile_ms: u64,
+    pub playhead_eval_status: String,
+    pub stage_overlay_kib: u64,
 }
 
 pub trait ParamInspectorPane: Sized {
@@ -119,9 +124,27 @@ fn render_global_pipeline_overview(overview: GlobalPipelineOverview) -> impl Int
                 .text_color(rgb(TEXT_MUTED))
                 .child("Global Performance"),
         )
-        .child(overview_row("Frame Budget", "—", 4))
-        .child(overview_row("GPU Occupancy", "—", 5))
-        .child(overview_row("Stage Memory", "—", 6))
+        .child(overview_row(
+            "Graph Revision",
+            overview.graph_revision.to_string(),
+            4,
+        ))
+        .child(overview_row(
+            "Computed Streams",
+            overview.computed_stream_count.to_string(),
+            5,
+        ))
+        .child(overview_row(
+            "Last Compile",
+            format!("{} ms", overview.last_compile_ms),
+            6,
+        ))
+        .child(overview_row("Playhead Eval", overview.playhead_eval_status, 7))
+        .child(overview_row(
+            "Stage Overlay",
+            format!("{} KiB", overview.stage_overlay_kib),
+            8,
+        ))
 }
 
 pub fn render_param_inspector<H: ParamInspectorPane + 'static>(

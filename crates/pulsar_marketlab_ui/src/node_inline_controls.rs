@@ -7,7 +7,7 @@ use gpui::{
 
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
-use gpui_component::{IconName, Sizable, Size, h_flex};
+use gpui_component::{Sizable, Size, h_flex};
 
 use crate::theme;
 
@@ -17,10 +17,6 @@ fn control_bg() -> gpui::Hsla {
 
 fn control_text() -> gpui::Hsla {
     theme::chrome_color(theme::CONTROL_TEXT)
-}
-
-fn control_focus() -> gpui::Hsla {
-    theme::chrome_color(theme::CONTROL_FOCUS)
 }
 
 fn control_caret() -> gpui::Hsla {
@@ -33,6 +29,10 @@ fn control_border() -> gpui::Hsla {
 
 fn control_hover() -> gpui::Hsla {
     theme::chrome_color(theme::CONTROL_HOVER)
+}
+
+fn control_focus() -> gpui::Hsla {
+    theme::chrome_color(theme::CONTROL_FOCUS)
 }
 
 fn recessed_button_variant(cx: &App) -> ButtonCustomVariant {
@@ -93,11 +93,31 @@ pub fn node_dropdown_trigger(
         )
 }
 
-fn step_input_value(state: &Entity<InputState>, delta: i32, window: &mut Window, cx: &mut App) {
+fn step_input_value(
+    state: &Entity<InputState>,
+    delta: f64,
+    integer: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     state.update(cx, |state, cx| {
-        let current = state.value().trim().parse::<i32>().unwrap_or(1);
-        let next = (current + delta).max(1);
-        state.set_value(next.to_string(), window, cx);
+        let current = state.value().trim().parse::<f64>().unwrap_or(1.0);
+        let next = if integer {
+            (current + delta).round().max(1.0)
+        } else {
+            (current + delta).max(0.0)
+        };
+        let text = if integer {
+            format!("{}", next as i64)
+        } else if (next.fract()).abs() < f64::EPSILON {
+            format!("{next:.0}")
+        } else {
+            format!("{next:.4}")
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        };
+        state.set_value(text, window, cx);
         state.focus(window, cx);
     });
 }
@@ -106,85 +126,96 @@ fn input_is_focused(state: &Entity<InputState>, window: &Window, cx: &App) -> bo
     state.read(cx).focus_handle(cx).is_focused(window)
 }
 
-/// DCC recessed number field with compact stepper buttons for node lookback inputs.
+/// DCC recessed number field with compact stepper buttons for node scalar uniforms.
 #[derive(Clone, IntoElement)]
 pub struct NodeNumberInput {
     state: Entity<InputState>,
+    integer: bool,
 }
 
 impl NodeNumberInput {
     pub fn new(state: &Entity<InputState>) -> Self {
         Self {
             state: state.clone(),
+            integer: true,
         }
+    }
+
+    pub fn integer(mut self, integer: bool) -> Self {
+        self.integer = integer;
+        self
     }
 }
 
 impl RenderOnce for NodeNumberInput {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        render_node_number_input_inner(&self.state, window, cx)
+        let state = self.state;
+        let integer = self.integer;
+        let step = if integer { 1.0 } else { 0.1 };
+        let entity_id = state.entity_id();
+        let decrement = state.clone();
+        let increment = state.clone();
+
+        let bg = control_bg();
+        let text = control_text();
+        let border = control_border();
+        let focus = control_focus();
+        let stepper = stepper_button_variant(cx);
+        let focused = input_is_focused(&state, window, cx);
+
+        h_flex()
+            .id(("node-number-input", entity_id))
+            .w_full()
+            .min_w(px(108.0))
+            .h_6()
+            .rounded(px(4.0))
+            .bg(bg)
+            .border_1()
+            .border_color(if focused { focus } else { border })
+            .overflow_hidden()
+            .child(
+                Button::new(("node-number-minus", entity_id))
+                    .custom(stepper.clone())
+                    .with_size(Size::Small)
+                    .compact()
+                    .tab_stop(false)
+                    .rounded_none()
+                    .label("−")
+                    .on_click({
+                        move |_, window, cx| {
+                            step_input_value(&decrement, -step, integer, window, cx);
+                        }
+                    }),
+            )
+            .child(
+                Input::new(&state)
+                    .appearance(false)
+                    .with_size(Size::Small)
+                    .bordered(false)
+                    .focus_bordered(false)
+                    .rounded_none()
+                    .flex_1()
+                    .min_w(px(36.0))
+                    .h_6()
+                    .px_1()
+                    .bg(bg)
+                    .text_color(text)
+                    .text_size(px(10.0))
+                    .text_align(gpui::TextAlign::Center),
+            )
+            .child(
+                Button::new(("node-number-plus", entity_id))
+                    .custom(stepper)
+                    .with_size(Size::Small)
+                    .compact()
+                    .tab_stop(false)
+                    .rounded_none()
+                    .label("+")
+                    .on_click({
+                        move |_, window, cx| {
+                            step_input_value(&increment, step, integer, window, cx);
+                        }
+                    }),
+            )
     }
-}
-
-fn render_node_number_input_inner(
-    state: &Entity<InputState>,
-    window: &mut Window,
-    cx: &mut App,
-) -> impl IntoElement {
-    let bg = control_bg();
-    let text = control_text();
-    let border = control_border();
-    let focus = control_focus();
-    let stepper = stepper_button_variant(cx);
-    let focused = input_is_focused(state, window, cx);
-    let entity_id = state.entity_id();
-
-    let decrement = state.clone();
-    let increment = state.clone();
-
-    h_flex()
-        .id(("node-number-input", entity_id))
-        .h_6()
-        .rounded(px(4.0))
-        .bg(bg)
-        .border_1()
-        .border_color(if focused { focus } else { border })
-        .overflow_hidden()
-        .child(
-            Button::new(("node-number-minus", entity_id))
-                .custom(stepper)
-                .with_size(Size::Small)
-                .icon(IconName::Minus)
-                .compact()
-                .tab_stop(false)
-                .rounded_none()
-                .on_click({
-                    move |_, window, cx| step_input_value(&decrement, -1, window, cx)
-                }),
-        )
-        .child(
-            Input::new(state)
-                .appearance(false)
-                .with_size(Size::Small)
-                .focus_bordered(false)
-                .bordered(false)
-                .flex_1()
-                .h_6()
-                .px_2()
-                .bg(bg)
-                .text_color(text)
-                .text_size(px(10.0)),
-        )
-        .child(
-            Button::new(("node-number-plus", entity_id))
-                .custom(stepper)
-                .with_size(Size::Small)
-                .icon(IconName::Plus)
-                .compact()
-                .tab_stop(false)
-                .rounded_none()
-                .on_click({
-                    move |_, window, cx| step_input_value(&increment, 1, window, cx)
-                }),
-        )
 }

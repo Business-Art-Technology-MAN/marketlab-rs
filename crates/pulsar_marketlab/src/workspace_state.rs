@@ -426,7 +426,7 @@ fn wired_ta_nodes_for_asset_port<'a>(
         let Some(ta_node) = graph.nodes.iter().find(|node| node.id == connection.to_node_id) else {
             continue;
         };
-        if !ta_node.node_type.is_otl_shader() {
+        if !ta_node.node_type.is_ta_uber_signal() {
             continue;
         }
         if wired.iter().any(|existing: &&VisualNode| existing.id == ta_node.id) {
@@ -541,7 +541,7 @@ impl TaExecutionBridge {
         }
         Self::record_market_price(&mut self.simulation_stage, asset_label, bar_time, price);
 
-        if node.ta_indicator_id.as_deref() == Some("rsi") {
+        if node.overlay_algorithm() == Some("rsi") {
             self.evaluate_rsi_crossing(
                 node.id,
                 bar_time,
@@ -776,7 +776,7 @@ pub fn ta_tick_messages_for_asset(
                     if portfolio_ta_filter.is_some_and(|allowed| !allowed.contains(&node.id)) {
                         continue;
                     }
-                    let Some(indicator_id) = node.ta_indicator_id.as_deref() else {
+                    let Some(indicator_id) = node.overlay_algorithm() else {
                         continue;
                     };
                     let label = ta_indicator_label(indicator_id).unwrap_or(indicator_id);
@@ -807,7 +807,7 @@ pub fn ta_tick_messages_for_asset(
                     if portfolio_ta_filter.is_some_and(|allowed| !allowed.contains(&node.id)) {
                         continue;
                     }
-                    let Some(indicator_id) = node.ta_indicator_id.as_deref() else {
+                    let Some(indicator_id) = node.overlay_algorithm() else {
                         continue;
                     };
                     let label = ta_indicator_label(indicator_id).unwrap_or(indicator_id);
@@ -990,7 +990,7 @@ fn evaluate_portfolio_at_playhead(
                         last_close = row.close;
                     }
                 }
-                NodeType::OtlShader { .. } => {
+                NodeType::TaUberSignal { .. } | NodeType::OtlShader { .. } => {
                     if !portfolio_ta_filter.contains(&node_id) {
                         continue;
                     }
@@ -1016,7 +1016,7 @@ fn evaluate_portfolio_at_playhead(
                         .find(|entry| entry.id == asset_id)
                         .map(|entry| entry.name.clone())
                         .unwrap_or_else(|| format!("asset {asset_id}"));
-                    let Some(indicator_id) = node.ta_indicator_id.as_deref() else {
+                    let Some(indicator_id) = node.overlay_algorithm() else {
                         continue;
                     };
                     let closure = build_ta_evaluation_closure(
@@ -1104,8 +1104,8 @@ pub fn preload_asset_ohlc_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, Vec
 }
 
 fn analytics_indicator_id(node: &VisualNode) -> String {
-    node.ta_indicator_id
-        .clone()
+    node.overlay_algorithm()
+        .map(str::to_string)
         .unwrap_or_else(|| format!("ta_{}", node.id))
 }
 
@@ -1138,7 +1138,7 @@ fn build_inspector_rows_at_playhead(
                     associated_node_id: Some(node.id),
                 });
             }
-            NodeType::OtlShader { .. } => {
+            NodeType::TaUberSignal { .. } | NodeType::OtlShader { .. } => {
                 let indicator_id = analytics_indicator_id(node);
                 let Ok(prim) = analytics_prim_path(&indicator_id) else {
                     continue;
@@ -1169,7 +1169,7 @@ fn refresh_ta_samples_at_playhead(
 ) {
     let portfolio_ta = portfolio_wired_ta_node_ids(graph);
     for node in nodes {
-        if !node.node_type.is_otl_shader() || !portfolio_ta.contains(&node.id) {
+        if !node.node_type.is_ta_uber_signal() || !portfolio_ta.contains(&node.id) {
             continue;
         }
         let Some(asset_id) = upstream_asset_for_ta_node(node.id, graph) else {
@@ -1178,7 +1178,7 @@ fn refresh_ta_samples_at_playhead(
         let Some(asset) = graph.nodes.iter().find(|entry| entry.id == asset_id) else {
             continue;
         };
-        let Some(indicator_id) = node.ta_indicator_id.as_deref() else {
+        let Some(indicator_id) = node.overlay_algorithm() else {
             continue;
         };
         let lookback = ta_lookback_for_node(node);
@@ -1337,6 +1337,13 @@ pub struct TradingSystemWorkspace {
     /// Lazily initialized OTL script editor bound to the selected shader node.
     pub(crate) otl_script_input: Option<Entity<InputState>>,
     pub(crate) otl_script_node_id: Option<usize>,
+    pub(crate) otl_shader_param_inputs: HashMap<(usize, String), Entity<InputState>>,
+    /// Dedicated OTL editor tab buffer (commits on compile, not per keystroke).
+    pub(crate) otl_editor_input: Option<Entity<InputState>>,
+    pub(crate) otl_editor_binding: Option<String>,
+    pub(crate) otl_compile_status: String,
+    pub(crate) otl_compile_inflight: bool,
+    pub(crate) active_workspace_tab: pulsar_marketlab_ui::workspace::WorkspaceTab,
     /// Bounds of the render-viewport playhead slider track.
     pub(crate) playhead_slider_bounds: Option<Bounds<Pixels>>,
     /// Persisted workstation splitter shares.
@@ -1351,6 +1358,7 @@ pub struct TradingSystemWorkspace {
     pub(crate) playhead_eval_inflight: bool,
     pub(crate) playhead_eval_pending: bool,
     pub(crate) graph_engine_last_compiled_generation: u64,
+    pub(crate) graph_engine_last_compile_ms: u64,
     pub(crate) graph_engine_recompile_inflight: bool,
     pub(crate) graph_engine_recompile_pending: bool,
     /// Suppresses reactive observers while the workspace entity is still being constructed.
@@ -1443,6 +1451,12 @@ impl TradingSystemWorkspace {
             workspace_context,
             otl_script_input: None,
             otl_script_node_id: None,
+            otl_editor_input: None,
+            otl_editor_binding: None,
+            otl_shader_param_inputs: HashMap::new(),
+            otl_compile_status: String::new(),
+            otl_compile_inflight: false,
+            active_workspace_tab: pulsar_marketlab_ui::workspace::WorkspaceTab::default(),
             playhead_slider_bounds: None,
             split_layout: pulsar_marketlab_ui::workspace::WorkstationSplitLayout::default(),
             split_container_bounds: None,
@@ -1454,6 +1468,7 @@ impl TradingSystemWorkspace {
             playhead_eval_inflight: false,
             playhead_eval_pending: false,
             graph_engine_last_compiled_generation: u64::MAX,
+            graph_engine_last_compile_ms: 0,
             graph_engine_recompile_inflight: false,
             graph_engine_recompile_pending: false,
             bootstrapping: true,
@@ -1659,55 +1674,15 @@ impl TradingSystemWorkspace {
         self.node_lookback_inputs_ready = true;
 
         for node in &self.nodes {
-            if !node.node_type.is_otl_shader() {
+            if !node.node_type.is_ta_uber_signal() {
                 continue;
             }
             if self.node_lookback_inputs.contains_key(&node.id) {
                 continue;
             }
-            let node_id = node.id;
-            let period = node.ta_lookback_period;
-            let prim_path = Self::stage_prim_path_for_node(node).unwrap_or_default();
-            let input = cx.new(|cx| {
-                let mut state = InputState::new(window, cx);
-                state.set_value(period.to_string(), window, cx);
-                state
-            });
-            let input_handle = input.clone();
-            cx.subscribe(
-                &input,
-                move |this, _, event: &gpui_component::input::InputEvent, cx| {
-                    match event {
-                        gpui_component::input::InputEvent::Blur
-                        | gpui_component::input::InputEvent::PressEnter { .. } => {
-                            let text = input_handle.read(cx).value().to_string();
-                            if let Ok(parsed) = text.trim().parse::<u32>() {
-                                if let Some(node) =
-                                    this.nodes.iter_mut().find(|node| node.id == node_id)
-                                {
-                                    node.ta_lookback_period = parsed;
-                                }
-                                if !prim_path.is_empty() {
-                                    this.workspace_context.update(cx, |ctx, cx| {
-                                        ctx.modify_attribute(
-                                            &prim_path,
-                                            "inputs:period",
-                                            Value::Float(parsed as f32),
-                                            cx,
-                                        );
-                                    });
-                                }
-                                this.sync_pipeline_graph(cx);
-                                this.invalidate_playhead_evaluation_cache();
-                                cx.notify();
-                            }
-                        }
-                        _ => {}
-                    }
-                },
-            )
-            .detach();
-            self.node_lookback_inputs.insert(node_id, input);
+            let _node_id = node.id;
+            let _period = node.overlay_period();
+            // Uber-signal hyperparameters are edited in the sidebar inspector only.
         }
     }
 
@@ -1812,6 +1787,7 @@ impl TradingSystemWorkspace {
             vec!["New document — empty canvas and blank USD stage.".to_string()];
         self.node_lookback_inputs.clear();
         self.node_lookback_inputs_ready = false;
+        self.otl_shader_param_inputs.clear();
         self.last_ui_selection_generation = 0;
 
         self.csv_path_registry.replace_from_nodes(&[]);
@@ -1835,6 +1811,9 @@ impl TradingSystemWorkspace {
 
         self.otl_script_input = None;
         self.otl_script_node_id = None;
+        self.reset_otl_editor_input();
+        self.otl_compile_status.clear();
+        self.otl_compile_inflight = false;
         self.sync_playhead_bounds();
         self.sync_pipeline_graph(cx);
         self.synchronize_inspector_view();
@@ -1849,8 +1828,44 @@ impl TradingSystemWorkspace {
         self.publish_canvas_to_usd_stage(cx);
     }
 
+    /// Update graph/playhead immediately; defer OpenUSD recompose (immutable TA ports).
+    pub(crate) fn commit_ta_uber_parameter_change(&mut self, cx: &mut Context<Self>) {
+        self.pipeline_graph
+            .replace(self.nodes.clone(), self.connections.clone());
+        self.invalidate_playhead_evaluation_cache();
+        self.recompute_playhead_diagnostics();
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.publish_canvas_to_usd_stage(cx);
+            });
+        });
+        cx.notify();
+    }
+
     /// Recompose the OpenUSD root layer from the current canvas graph and reload both stage handles.
     pub(crate) fn publish_canvas_to_usd_stage(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.pipeline_graph.snapshot();
+        if !snapshot.nodes.is_empty() && (!snapshot.wiring_valid || !snapshot.dag_valid) {
+            let mut reasons: Vec<String> = snapshot
+                .wiring_errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect();
+            if !snapshot.dag_valid {
+                reasons.push("dependency cycle detected in canvas graph".to_string());
+            }
+            self.push_status_log(format!(
+                "USD compose blocked — fix {} validation issue(s) before stage sync.",
+                reasons.len()
+            ));
+            for reason in reasons.iter().take(3) {
+                self.push_status_log(format!("  • {reason}"));
+            }
+            cx.notify();
+            return;
+        }
+
         let usda = if self.nodes.is_empty() {
             blank_stage_usda()
         } else {
@@ -1915,7 +1930,7 @@ impl TradingSystemWorkspace {
                         .cloned()
                         .unwrap_or_default();
                 }
-                NodeType::OtlShader { .. } => {
+                NodeType::TaUberSignal { .. } | NodeType::OtlShader { .. } => {
                     if let Some(asset_id) = upstream_price_source_node_id_parts(
                         node_id,
                         0,
@@ -2156,7 +2171,7 @@ impl TradingSystemWorkspace {
                                             .nodes
                                             .iter()
                                             .find(|node| node.id == node_id)
-                                            .filter(|node| node.node_type.is_otl_shader())
+                                            .filter(|node| node.node_type.is_ta_uber_signal())
                                             .cloned();
                                         if let Some(node) = ta_node {
                                             if let Some(value) =

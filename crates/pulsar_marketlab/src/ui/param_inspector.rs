@@ -1,4 +1,4 @@
-//! Param Inspector trait bindings: OTL script + AOV toggles.
+//! Param Inspector trait bindings: OTL script (generic shaders) vs TaUberSignal hyperparams.
 
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState};
@@ -20,16 +20,8 @@ fn layer_display_name(identifier: &str) -> String {
 }
 
 impl TradingSystemWorkspace {
-    fn selected_otl_node_id(&self) -> Option<usize> {
-        let selected_id = self.selected_node_id?;
-        self.nodes
-            .iter()
-            .find(|node| node.id == selected_id && node.node_type.is_otl_shader())
-            .map(|node| node.id)
-    }
-
     fn selected_otl_script_text(&self) -> String {
-        let Some(node_id) = self.selected_otl_node_id() else {
+        let Some(node_id) = self.selected_otl_shader_node_id() else {
             return String::new();
         };
         self.nodes
@@ -126,8 +118,22 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             "Compiling…".to_string()
         } else if workspace.is_engine_cache_dirty(self.graph_engine_last_compiled_generation) {
             "Pending recompile".to_string()
+        } else if self.graph_engine_last_compile_ms > 0 {
+            format!("Ready ({} ms)", self.graph_engine_last_compile_ms)
         } else {
             "Ready".to_string()
+        };
+
+        let playhead_eval_status = if self.playhead_eval_inflight {
+            if self.playhead_eval_pending {
+                "Running (queued)".to_string()
+            } else {
+                "Running".to_string()
+            }
+        } else if self.playhead_eval_pending {
+            "Queued".to_string()
+        } else {
+            "Idle".to_string()
         };
 
         Some(GlobalPipelineOverview {
@@ -135,6 +141,11 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             total_assets,
             active_sinks,
             compilation_status,
+            graph_revision: self.pipeline_graph.revision(),
+            computed_stream_count: workspace.computed_streams().len(),
+            last_compile_ms: self.graph_engine_last_compile_ms,
+            playhead_eval_status,
+            stage_overlay_kib: workspace.usd_stage().overlay_memory_kib(),
         })
     }
 
@@ -143,7 +154,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
-        let selected_id = self.selected_otl_node_id();
+        let selected_id = self.selected_otl_shader_node_id();
         if self.otl_script_input.is_some() && self.otl_script_node_id == selected_id {
             return self.otl_script_input.clone().expect("otl input present");
         }
@@ -176,11 +187,11 @@ impl ParamInspectorPane for TradingSystemWorkspace {
     }
 
     fn otl_editing_enabled(&self) -> bool {
-        self.selected_otl_node_id().is_some()
+        self.selected_otl_shader_node_id().is_some()
     }
 
     fn aov_channel_options(&self) -> Vec<(String, bool)> {
-        let Some(node_id) = self.selected_otl_node_id() else {
+        let Some(node_id) = self.selected_otl_shader_node_id() else {
             return Vec::new();
         };
         let Some(node) = self.nodes.iter().find(|node| node.id == node_id) else {
@@ -198,7 +209,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
     }
 
     fn toggle_aov_channel(&mut self, channel: &str, enabled: bool, cx: &mut Context<Self>) {
-        let Some(node_id) = self.selected_otl_node_id() else {
+        let Some(node_id) = self.selected_otl_shader_node_id() else {
             return;
         };
         let Some(node) = self.nodes.iter_mut().find(|node| node.id == node_id) else {
@@ -226,12 +237,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             return self.render_asset_path_config_row(cx).into_any_element();
         }
         if self.selected_technical_analysis_node().is_some() {
-            return div()
-                .flex_col()
-                .gap_3()
-                .child(self.render_ta_parameter_controls(cx))
-                .child(self.render_ta_indicator_picker(cx))
-                .into_any_element();
+            return self.render_ta_uber_inspector(cx).into_any_element();
         }
         if self.selected_portfolio_node().is_some() {
             return self.render_portfolio_analytics_panel().into_any_element();

@@ -19,11 +19,23 @@ pub struct OhlcBar {
 pub struct OhlcChartPaneConfig {
     pub asset_name: Option<String>,
     pub bars: Vec<OhlcBar>,
-    pub ta_indicator_id: Option<String>,
-    pub ta_indicator_label: Option<String>,
-    pub ta_lookback_period: Option<u32>,
+    /// Uber-signal algorithm id (`TaUberSignalConfig::algorithm`).
+    pub overlay_algorithm: Option<String>,
+    /// Display label for the active overlay algorithm.
+    pub overlay_algorithm_label: Option<String>,
+    /// Uber-signal period hyperparameter (`TaUberSignalConfig::period`).
+    pub overlay_period: Option<u32>,
     /// Global synchronized playhead bar index (0-based).
     pub playhead_index: Option<usize>,
+}
+
+impl OhlcChartPaneConfig {
+    pub fn apply_uber_signal_overlay(&mut self, config: &pulsar_marketlab_core::TaUberSignalConfig) {
+        use pulsar_marketlab_core::algorithm_display_label;
+        self.overlay_algorithm = Some(config.algorithm.clone());
+        self.overlay_period = Some(config.period);
+        self.overlay_algorithm_label = Some(algorithm_display_label(&config.algorithm));
+    }
 }
 
 #[derive(Clone)]
@@ -108,10 +120,10 @@ pub fn paint_playhead_line(
 }
 
 pub fn render_ohlc_candlestick_pane(config: OhlcChartPaneConfig) -> AnyElement {
-    let mut title = match (&config.asset_name, &config.ta_indicator_label) {
-        (Some(asset), Some(ta)) => format!("OHLC // {asset} + {ta}"),
+    let mut title = match (&config.asset_name, &config.overlay_algorithm_label) {
+        (Some(asset), Some(overlay)) => format!("OHLC // {asset} + {overlay}"),
         (Some(asset), None) => format!("OHLC // {asset}"),
-        (None, Some(ta)) => format!("OHLC // {ta}"),
+        (None, Some(overlay)) => format!("OHLC // {overlay}"),
         (None, None) => "OHLC Chart".to_string(),
     };
     if let Some(index) = config.playhead_index {
@@ -123,7 +135,7 @@ pub fn render_ohlc_candlestick_pane(config: OhlcChartPaneConfig) -> AnyElement {
     let header = chart_header(&title);
 
     if config.bars.len() < 2 {
-        let hint = match (&config.asset_name, config.ta_indicator_id.is_some()) {
+        let hint = match (&config.asset_name, config.overlay_algorithm.is_some()) {
             (Some(_), true) | (None, true) => {
                 "Wire this TA node to a CSV asset with OHLC data"
             }
@@ -151,13 +163,13 @@ fn render_ohlc_chart_body(
         &bars[..=playhead_end]
     };
     let ta_layers = config
-        .ta_indicator_id
+        .overlay_algorithm
         .as_deref()
-        .and_then(|indicator_id| {
+        .and_then(|algorithm_id| {
             build_ta_layers(
-                indicator_id,
+                algorithm_id,
                 bounded_bars,
-                config.ta_lookback_period.unwrap_or(14) as usize,
+                config.overlay_period.unwrap_or(14) as usize,
             )
         })
         .unwrap_or_default();

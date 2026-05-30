@@ -5,7 +5,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::graph_compiler::{AssetSourceType, NodeConnection, NodeType, VisualNode};
+use crate::graph_compiler::{
+    resolved_otl_script, validated_connections, AssetSourceType, NodeConnection, NodeType,
+    PipelineGraphSnapshot, VisualNode,
+};
+use pulsar_marketlab_core::compose_uber_script_src;
 use pulsar_marketlab::trading_stage::{
     analytics_prim_path, nested_prim_path, portfolio_prim_path, MARKETLAB_DEFAULT_PRIM,
     MARKETLAB_ROOT,
@@ -52,8 +56,17 @@ pub fn compose_pipeline_usda_with_options(
     connections: &[NodeConnection],
     options: ComposeOptions,
 ) -> String {
-    let paths = resolve_node_stage_paths(nodes, connections);
-    let relationships = collect_relationships(nodes, connections, &paths);
+    let snapshot = PipelineGraphSnapshot {
+        nodes: nodes.to_vec(),
+        connections: connections.to_vec(),
+        execution_order: Vec::new(),
+        dag_valid: true,
+        wiring_valid: true,
+        wiring_errors: Vec::new(),
+    };
+    let connections = validated_connections(&snapshot);
+    let paths = resolve_node_stage_paths(nodes, &connections);
+    let relationships = collect_relationships(nodes, &connections, &paths);
     let forest = build_nest_forest(nodes, &paths);
 
     let mut out = String::from("#usda 1.0\n(\n");
@@ -211,17 +224,12 @@ fn portfolio_leaf_name(label: &str) -> String {
 fn operational_leaf_name(node: &VisualNode) -> String {
     match &node.node_type {
         NodeType::AssetAdaptor { prim_path } => prim_leaf_name(prim_path).to_string(),
-        NodeType::OtlShader { .. } => ta_leaf_signature(node),
+        NodeType::TaUberSignal { config } => config.leaf_signature(),
+        NodeType::OtlShader { .. } => {
+            format!("otl_{}", node.id)
+        }
         NodeType::TerminalIntegrator { .. } => portfolio_leaf_name(&node.name),
     }
-}
-
-fn ta_leaf_signature(node: &VisualNode) -> String {
-    let indicator = node
-        .ta_indicator_id
-        .as_deref()
-        .unwrap_or("rsi");
-    format!("{indicator}_{}", node.ta_lookback_period)
 }
 
 fn disambiguate_leaf(base: &str, used: &mut HashSet<String>) -> String {
@@ -247,7 +255,7 @@ fn resolve_unique_operational_leaves(
 ) -> HashMap<usize, String> {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for node in nodes {
-        if !node.node_type.is_otl_shader() {
+        if !node.node_type.is_ta_uber_signal() {
             continue;
         }
         let parent = enclosing_portfolio_path(node.id, nodes_by_id, connections, portfolio_paths)
@@ -264,13 +272,20 @@ fn resolve_unique_operational_leaves(
                 .get(&node_id)
                 .copied()
                 .expect("otl node in scope");
-            let leaf = disambiguate_leaf(&ta_leaf_signature(node), &mut used);
+            let leaf = disambiguate_leaf(
+                &node
+                    .node_type
+                    .ta_uber_config()
+                    .map(|config| config.leaf_signature())
+                    .unwrap_or_else(|| operational_leaf_name(node)),
+                &mut used,
+            );
             leaves.insert(node_id, leaf);
         }
     }
 
     for node in nodes {
-        if node.node_type.is_otl_shader() {
+        if node.node_type.is_ta_uber_signal() {
             continue;
         }
         if !node.node_type.is_portfolio() {
@@ -388,10 +403,10 @@ pub use pulsar_marketlab_core::schema_sidecar_directory;
 pub(crate) fn stage_prim_path_for_node(node: &VisualNode) -> Option<String> {
     match &node.node_type {
         NodeType::AssetAdaptor { prim_path } => Some(prim_path.clone()),
-        NodeType::OtlShader { .. } => {
-            let indicator_id = node.ta_indicator_id.as_deref().unwrap_or("rsi");
-            analytics_prim_path(indicator_id).ok()
+        NodeType::TaUberSignal { config } => {
+            analytics_prim_path(&config.algorithm).ok()
         }
+        NodeType::OtlShader { .. } => analytics_prim_path("otl").ok(),
         NodeType::TerminalIntegrator { .. } => portfolio_prim_path(&node.name).ok(),
     }
 }
@@ -414,25 +429,14 @@ fn prim_leaf_name(path: &str) -> &str {
 fn schema_type_for_node(node: &VisualNode) -> &'static str {
     match &node.node_type {
         NodeType::AssetAdaptor { .. } => "FinancialAsset",
+        NodeType::TaUberSignal { .. } => "OtlTaUberSignal",
         NodeType::OtlShader { .. } => "OtlOperator",
         NodeType::TerminalIntegrator { .. } => "PortfolioIntegrator",
     }
 }
 
 fn otl_script_src(node: &VisualNode) -> String {
-    if let Some(formula) = node
-        .dsl_formula
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        return formula.to_string();
-    }
-    if let Some(script) = node.node_type.script().filter(|text| !text.is_empty()) {
-        return script.to_string();
-    }
-    let indicator_id = node.ta_indicator_id.as_deref().unwrap_or("rsi");
-    format!("{indicator_id}(period={})", node.ta_lookback_period)
+    resolved_otl_script(node)
 }
 
 fn collect_relationships(
@@ -458,14 +462,21 @@ fn collect_relationships(
             continue;
         };
         let relationship = match (&from_node.node_type, &to_node.node_type) {
-            (NodeType::AssetAdaptor { .. }, NodeType::OtlShader { .. }) => "inputs:underlying",
+            (NodeType::AssetAdaptor { .. }, NodeType::OtlShader { .. })
+            | (NodeType::AssetAdaptor { .. }, NodeType::TaUberSignal { .. }) => "inputs:underlying",
             (NodeType::AssetAdaptor { .. }, NodeType::TerminalIntegrator { .. })
                 if to_node.node_type.is_portfolio() =>
             {
                 "inputs:sources"
             }
-            (NodeType::OtlShader { .. }, NodeType::TerminalIntegrator { .. }) => "inputs:sources",
-            (NodeType::OtlShader { .. }, NodeType::OtlShader { .. }) => "inputs:underlying",
+            (NodeType::OtlShader { .. }, NodeType::TerminalIntegrator { .. })
+            | (NodeType::TaUberSignal { .. }, NodeType::TerminalIntegrator { .. }) => {
+                "inputs:sources"
+            }
+            (NodeType::OtlShader { .. }, NodeType::OtlShader { .. })
+            | (NodeType::OtlShader { .. }, NodeType::TaUberSignal { .. })
+            | (NodeType::TaUberSignal { .. }, NodeType::OtlShader { .. })
+            | (NodeType::TaUberSignal { .. }, NodeType::TaUberSignal { .. }) => "inputs:underlying",
             (NodeType::TerminalIntegrator { .. }, NodeType::TerminalIntegrator { .. })
                 if from_node.node_type.is_portfolio() && to_node.node_type.is_portfolio() =>
             {
@@ -509,10 +520,27 @@ fn write_prim(
                 write_token(out, &inner, "inputs:asset_class", "Equity");
             }
         }
-        NodeType::OtlShader { .. } => {
-            let indicator_id = node.ta_indicator_id.as_deref().unwrap_or("rsi");
-            write_token(out, &inner, "inputs:id", indicator_id);
+        NodeType::TaUberSignal { config } => {
+            write_token(out, &inner, "info:archetype", config.archetype.as_token());
+            write_token(out, &inner, "info:algorithm", &config.algorithm);
+            write_int(out, &inner, "inputs:period", config.period as i32);
+            write_int(out, &inner, "inputs:signal_period", config.signal_period as i32);
+            write_float(out, &inner, "inputs:multiplier", config.multiplier);
+            write_float(out, &inner, "inputs:annualization", config.annualization);
+            write_string(
+                out,
+                &inner,
+                "inputs:script_src",
+                &compose_uber_script_src(config),
+            );
+        }
+        NodeType::OtlShader {
+            compiled_path, ..
+        } => {
             write_string(out, &inner, "inputs:script_src", &otl_script_src(node));
+            if let Some(path) = compiled_path.as_deref().filter(|p| !p.is_empty()) {
+                write_string(out, &inner, "inputs:script_compiled_path", path);
+            }
         }
         NodeType::TerminalIntegrator { .. } if node.node_type.is_portfolio() => {
             let allocation = node
@@ -568,6 +596,14 @@ fn write_double(out: &mut String, indent: &str, name: &str, value: f64) {
     out.push_str(&format!("{indent}double {name} = {value}\n"));
 }
 
+fn write_int(out: &mut String, indent: &str, name: &str, value: i32) {
+    out.push_str(&format!("{indent}int {name} = {value}\n"));
+}
+
+fn write_float(out: &mut String, indent: &str, name: &str, value: f32) {
+    out.push_str(&format!("{indent}float {name} = {value}\n"));
+}
+
 fn write_relationship(out: &mut String, indent: &str, name: &str, targets: &[String]) {
     if targets.is_empty() {
         return;
@@ -586,9 +622,11 @@ fn write_relationship(out: &mut String, indent: &str, name: &str, targets: &[Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph_compiler::{connection_is_valid, NodeGradeType};
+    use crate::graph_compiler::{
+        apply_canonical_ta_ports, connection_is_valid, ta_uber_from_legacy_indicator,
+        NodeGradeType,
+    };
     use pulsar_marketlab::stage_bridge::UsdStageBridge;
-    use pulsar_marketlab::technical_analysis::DEFAULT_TA_INDICATOR_ID;
 
     fn sample_asset(id: usize) -> VisualNode {
         VisualNode {
@@ -596,8 +634,6 @@ mod tests {
             name: "GLD.csv".to_string(),
             node_type: NodeType::asset_adaptor("/MarketLab/GLD".to_string()),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: 14,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -613,13 +649,11 @@ mod tests {
     }
 
     fn sample_ta(id: usize) -> VisualNode {
-        VisualNode {
+        let mut node = VisualNode {
             id,
             name: "RSI".to_string(),
-            node_type: NodeType::otl_shader(String::new()),
+            node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("rsi", 14)),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
-            ta_lookback_period: 14,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -627,9 +661,11 @@ mod tests {
             x: 450.0,
             y: 320.0,
             collapsed: false,
-            inputs: vec!["Price In".to_string()],
-            outputs: vec!["TA Out".to_string()],
-        }
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        apply_canonical_ta_ports(&mut node);
+        node
     }
 
     #[test]
@@ -645,10 +681,11 @@ mod tests {
         let usda = compose_pipeline_usda(&nodes, &connections);
         assert!(usda.contains("def Scope \"MarketLab\""));
         assert!(usda.contains("def FinancialAsset \"GLD\""));
-        assert!(usda.contains("def OtlOperator \"rsi_14\""));
+        assert!(usda.contains("def OtlTaUberSignal \"oscillator_rsi_14\""));
         assert!(!usda.contains("def Xform"));
         assert!(usda.contains("token inputs:symbol = \"GLD\""));
-        assert!(usda.contains("string inputs:script_src = \"rsi(period=14)\""));
+        assert!(usda.contains("string inputs:script_src = \"ta::rsi(input, 14)\""));
+        assert!(usda.contains("token info:archetype = \"oscillator\""));
         assert!(usda.contains(&format!("rel inputs:underlying = <{}>", paths.get(&1).expect("asset"))));
         assert!(usda.contains("custom float2 ui:canvas:pos = (450, 320)"));
     }
@@ -666,7 +703,9 @@ mod tests {
         let bridge = UsdStageBridge::open_from_usda_text(&usda).expect("parse composed stage");
         let rows = bridge.stage_prim_rows().expect("list prims");
         assert!(rows.iter().any(|row| row.path.ends_with("/GLD") || row.path == "/MarketLab/GLD"));
-        assert!(rows.iter().any(|row| row.path.ends_with("/rsi_14") || row.path == "/MarketLab/rsi_14"));
+        assert!(rows.iter().any(|row| {
+            row.path.ends_with("/oscillator_rsi_14") || row.path == "/MarketLab/oscillator_rsi_14"
+        }));
         assert!(!rows.iter().any(|row| row.path == "/FinancialAsset"));
     }
 
@@ -717,8 +756,6 @@ mod tests {
             name: name.to_string(),
             node_type: NodeType::portfolio(),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: 14,
             portfolio_allocation_id: Some("Allocation::HierarchicalRiskParity".to_string()),
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -737,8 +774,6 @@ mod tests {
             name: format!("{symbol}.csv"),
             node_type: NodeType::asset_adaptor(format!("/MarketLab/{symbol}")),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: 14,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -752,13 +787,11 @@ mod tests {
     }
 
     fn sample_named_ta(id: usize, indicator: &str, lookback: u32) -> VisualNode {
-        VisualNode {
+        let mut node = VisualNode {
             id,
             name: indicator.to_string(),
-            node_type: NodeType::otl_shader(String::new()),
+            node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator(indicator, lookback)),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: Some(indicator.to_string()),
-            ta_lookback_period: lookback,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -766,9 +799,11 @@ mod tests {
             x: 450.0,
             y: 320.0,
             collapsed: false,
-            inputs: vec!["Price In".to_string()],
-            outputs: vec!["TA Out".to_string()],
-        }
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        apply_canonical_ta_ports(&mut node);
+        node
     }
 
     #[test]
@@ -836,8 +871,8 @@ mod tests {
         assert!(usda.contains("def PortfolioIntegrator \"Equity_Sub_Book\""));
         assert!(usda.contains("def FinancialAsset \"SPY\""));
         assert!(usda.contains("def FinancialAsset \"GLD\""));
-        assert!(usda.contains("def OtlOperator \"sma_14\""));
-        assert!(usda.contains("def OtlOperator \"rsi_14\""));
+        assert!(usda.contains("def OtlTaUberSignal \"trend_sma_14\""));
+        assert!(usda.contains("def OtlTaUberSignal \"oscillator_rsi_14\""));
 
         let master_pos = usda
             .find("def PortfolioIntegrator \"Master_Macro_Fund\"")
@@ -848,16 +883,16 @@ mod tests {
         let spy_pos = usda.find("def FinancialAsset \"SPY\"").expect("SPY prim");
         let gld_pos = usda.find("def FinancialAsset \"GLD\"").expect("GLD prim");
         let gld_rsi_pos = usda
-            .find("def OtlOperator \"rsi_14\"")
+            .find("def OtlTaUberSignal \"oscillator_rsi_14\"")
             .expect("rsi prim");
         assert!(master_pos < equity_pos);
         assert!(master_pos < spy_pos);
         assert!(equity_pos < gld_pos && gld_pos < gld_rsi_pos);
 
         assert!(usda.contains(
-            "rel inputs:sources = </MarketLab/Master_Macro_Fund/Equity_Sub_Book/rsi_14>"
+            "rel inputs:sources = </MarketLab/Master_Macro_Fund/Equity_Sub_Book/oscillator_rsi_14>"
         ));
-        assert!(usda.contains("</MarketLab/Master_Macro_Fund/sma_14>"));
+        assert!(usda.contains("</MarketLab/Master_Macro_Fund/trend_sma_14>"));
         assert!(usda.contains("</MarketLab/Master_Macro_Fund/Equity_Sub_Book>"));
     }
 
@@ -892,21 +927,21 @@ mod tests {
         let paths = resolve_node_stage_paths(&nodes, &connections);
         assert_eq!(
             paths.get(&2).map(String::as_str),
-            Some("/MarketLab/Alpha_Fund/sma_14")
+            Some("/MarketLab/Alpha_Fund/trend_sma_14")
         );
         assert_eq!(
             paths.get(&3).map(String::as_str),
-            Some("/MarketLab/Alpha_Fund/sma_20")
+            Some("/MarketLab/Alpha_Fund/trend_sma_20")
         );
         assert_eq!(
             paths.get(&4).map(String::as_str),
-            Some("/MarketLab/Alpha_Fund/sma_14_2")
+            Some("/MarketLab/Alpha_Fund/trend_sma_14_2")
         );
 
         let usda = compose_pipeline_usda(&nodes, &[]);
-        assert!(usda.contains("def OtlOperator \"sma_14\""));
-        assert!(usda.contains("def OtlOperator \"sma_20\""));
-        assert!(usda.contains("def OtlOperator \"sma_14_2\""));
+        assert!(usda.contains("def OtlTaUberSignal \"trend_sma_14\""));
+        assert!(usda.contains("def OtlTaUberSignal \"trend_sma_20\""));
+        assert!(usda.contains("def OtlTaUberSignal \"trend_sma_14_2\""));
     }
 
     #[test]

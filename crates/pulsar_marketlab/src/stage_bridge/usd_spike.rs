@@ -300,6 +300,7 @@ fn prim_def_type(path_str: &str, stage: &Stage) -> &'static str {
         return match type_name.as_str() {
             "FinancialAsset" => "FinancialAsset",
             "OtlOperator" => "OtlOperator",
+            "OtlTaUberSignal" => "OtlTaUberSignal",
             "PortfolioIntegrator" => "PortfolioIntegrator",
             "Scope" => "Scope",
             _ => "Scope",

@@ -1,16 +1,20 @@
 //! GPUI shell layout.
 
+mod otl_editor;
+mod otl_node_params;
 mod menu_bar;
 mod node_canvas;
 mod param_inspector;
 mod sidebar_inspector;
+mod ta_uber_inspector;
 mod split_layout;
 mod stage_composer;
 
 use gpui::*;
 
 use pulsar_marketlab_ui::workspace::{
-    render_workstation_layout, GraphEngineInvalidationHost, NodeCanvasPane, WorkstationLayoutHost,
+    render_workstation_layout, GraphEngineInvalidationHost, NodeCanvasPane, OtlEditorPane,
+    WorkstationLayoutHost,
 };
 
 use crate::workspace_state::{stage_time_for_bar_index, TradingSystemWorkspace};
@@ -145,6 +149,14 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
         self.graph_engine_recompile_pending = pending;
     }
 
+    fn graph_engine_last_compile_ms(&self) -> u64 {
+        self.graph_engine_last_compile_ms
+    }
+
+    fn set_graph_engine_last_compile_ms(&mut self, ms: u64) {
+        self.graph_engine_last_compile_ms = ms;
+    }
+
     fn apply_graph_engine_streams(
         &mut self,
         streams: Vec<pulsar_marketlab_core::ComputedAttributeStream>,
@@ -180,6 +192,7 @@ impl Render for TradingSystemWorkspace {
                 this.ensure_node_lookback_inputs(window, cx);
             });
         }
+        self.ensure_otl_shader_param_inputs(window, cx);
         render_workstation_layout(self, window, cx)
     }
 }

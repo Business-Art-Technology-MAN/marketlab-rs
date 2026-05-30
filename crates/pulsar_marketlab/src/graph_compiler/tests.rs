@@ -1,4 +1,4 @@
-use super::registry::{output_port_kind, PortWireKind};
+use super::registry::{apply_canonical_ta_ports, output_port_kind, sync_otl_shader_ports_from_script, ta_uber_from_legacy_indicator, PortWireKind};
 use super::*;
 
 fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
@@ -7,8 +7,6 @@ fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
         name: "SPY".into(),
         node_type: NodeType::asset_adaptor(prim_path),
         grade: NodeGradeType::Scalar,
-        ta_indicator_id: None,
-        ta_lookback_period: 14,
         portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
@@ -21,14 +19,32 @@ fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
     }
 }
 
-fn sample_shader_node(id: usize) -> VisualNode {
-    VisualNode {
+fn sample_ta_node(id: usize) -> VisualNode {
+    let mut node = VisualNode {
         id,
         name: "RSI".into(),
+        node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("rsi", 14)),
+        grade: NodeGradeType::Scalar,
+        portfolio_allocation_id: None,
+        dsl_formula: None,
+        aov_outputs: Vec::new(),
+        asset_source: None,
+        x: 0.0,
+        y: 0.0,
+        collapsed: false,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    };
+    apply_canonical_ta_ports(&mut node);
+    node
+}
+
+fn sample_otl_shader_node(id: usize) -> VisualNode {
+    VisualNode {
+        id,
+        name: "Formula".into(),
         node_type: NodeType::otl_shader(String::new()),
         grade: NodeGradeType::Scalar,
-        ta_indicator_id: Some("rsi".into()),
-        ta_lookback_period: 14,
         portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: vec!["confidence".into()],
@@ -36,8 +52,8 @@ fn sample_shader_node(id: usize) -> VisualNode {
         x: 0.0,
         y: 0.0,
         collapsed: false,
-        inputs: vec!["Timeline In".into(), "Mix In".into()],
-        outputs: vec!["Signal Out".into(), "AOV: confidence".into()],
+        inputs: vec!["source_stream".into()],
+        outputs: vec!["signal".into(), "AOV: confidence".into()],
     }
 }
 
@@ -47,8 +63,6 @@ fn sample_portfolio_node(id: usize) -> VisualNode {
         name: "Portfolio".into(),
         node_type: NodeType::portfolio(),
         grade: NodeGradeType::Scalar,
-        ta_indicator_id: None,
-        ta_lookback_period: 14,
         portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
@@ -65,10 +79,12 @@ fn sample_portfolio_node(id: usize) -> VisualNode {
 fn node_type_tiers_are_explicit() {
     let asset = NodeType::asset_adaptor("/assets/SPY");
     let shader = NodeType::otl_shader("close - sma(3)");
+    let ta = NodeType::ta_uber_signal_new(TaArchetype::Oscillator);
     let terminal = NodeType::terminal_integrator("vector_ta");
 
     assert!(asset.is_asset_adaptor());
     assert!(shader.is_otl_shader());
+    assert!(ta.is_ta_uber_signal());
     assert!(terminal.is_terminal_integrator());
     assert_eq!(asset.prim_path(), Some("/assets/SPY"));
     assert_eq!(shader.script(), Some("close - sma(3)"));
@@ -76,17 +92,20 @@ fn node_type_tiers_are_explicit() {
 }
 
 #[test]
-fn structural_path_wires_into_shader_timeline_port() {
+fn structural_path_wires_into_ta_source_stream() {
     let asset = sample_asset_node(1, "/assets/SPY");
-    let shader = sample_shader_node(2);
-    assert!(connection_is_valid(&asset, 0, &shader, 0));
+    let ta = sample_ta_node(2);
+    assert!(connection_is_valid(&asset, 0, &ta, 0));
 }
 
 #[test]
-fn structural_path_rejected_on_shader_numeric_port() {
-    let asset = sample_asset_node(1, "/assets/SPY");
-    let shader = sample_shader_node(2);
-    assert!(!connection_is_valid(&asset, 0, &shader, 1));
+fn ta_ports_remain_fixed_when_algorithm_changes() {
+    let mut node = sample_ta_node(1);
+    let inputs_before = node.inputs.clone();
+    let outputs_before = node.outputs.clone();
+    node.set_overlay_algorithm("macd");
+    assert_eq!(node.inputs, inputs_before);
+    assert_eq!(node.outputs, outputs_before);
 }
 
 #[test]
@@ -97,10 +116,10 @@ fn asset_to_portfolio_direct_wire_is_buy_and_hold() {
 }
 
 #[test]
-fn shader_numeric_output_wires_into_portfolio() {
-    let shader = sample_shader_node(2);
+fn ta_result_output_wires_into_portfolio() {
+    let ta = sample_ta_node(2);
     let portfolio = sample_portfolio_node(3);
-    assert!(connection_is_valid(&shader, 0, &portfolio, 0));
+    assert!(connection_is_valid(&ta, 0, &portfolio, 0));
 }
 
 #[test]
@@ -111,8 +130,32 @@ fn portfolio_output_wires_into_parent_portfolio() {
 }
 
 #[test]
-fn shader_aov_output_is_typed_as_aov() {
-    let shader = sample_shader_node(2);
+fn otl_shader_ports_resync_from_osl_signature() {
+    let mut node = sample_otl_shader_node(2);
+    let mut connections = vec![NodeConnection {
+        from_node_id: 1,
+        from_port_idx: 0,
+        to_node_id: 2,
+        to_port_idx: 3,
+    }];
+    let script = r#"
+        float source,
+        int lookback,
+        int threshold,
+        output float signal
+    {
+        signal = sma(source, 3);
+    }"#;
+    let errors = sync_otl_shader_ports_from_script(&mut node, script, &mut connections);
+    assert_eq!(node.inputs.len(), 3);
+    assert_eq!(node.outputs.first().map(String::as_str), Some("signal"));
+    assert!(connections.is_empty());
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn otl_shader_aov_output_is_typed_as_aov() {
+    let shader = sample_otl_shader_node(2);
     assert_eq!(output_port_kind(&shader, 0), Some(PortWireKind::NumericSignal));
     assert_eq!(output_port_kind(&shader, 1), Some(PortWireKind::Aov));
 }
@@ -139,14 +182,12 @@ fn validate_graph_wiring_reports_invalid_connections() {
 }
 
 #[test]
-fn ta_compute_prefers_dsl_formula_over_indicator_id() {
+fn ta_compute_prefers_dsl_formula_over_uber_compose() {
     let node = VisualNode {
         id: 2,
         name: "Custom".into(),
-        node_type: NodeType::otl_shader(String::new()),
+        node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("sma", 14)),
         grade: NodeGradeType::Scalar,
-        ta_indicator_id: Some("sma".into()),
-        ta_lookback_period: 14,
         portfolio_allocation_id: None,
         dsl_formula: Some("close - sma(3)".into()),
         aov_outputs: Vec::new(),
@@ -154,8 +195,8 @@ fn ta_compute_prefers_dsl_formula_over_indicator_id() {
         x: 0.0,
         y: 0.0,
         collapsed: false,
-        inputs: vec!["In".into()],
-        outputs: vec!["Out".into()],
+        inputs: vec!["source_stream".into()],
+        outputs: vec!["result".into()],
     };
     let mut window = MarketSeriesWindow::default();
     for close in [100.0, 102.0, 101.0, 105.0, 104.0] {
@@ -166,14 +207,12 @@ fn ta_compute_prefers_dsl_formula_over_indicator_id() {
 }
 
 #[test]
-fn ta_compute_uses_node_type_script_when_dsl_formula_missing() {
+fn ta_compute_uses_otl_shader_script_when_dsl_formula_missing() {
     let node = VisualNode {
         id: 2,
         name: "Custom".into(),
         node_type: NodeType::otl_shader("close"),
         grade: NodeGradeType::Scalar,
-        ta_indicator_id: Some("sma".into()),
-        ta_lookback_period: 14,
         portfolio_allocation_id: None,
         dsl_formula: None,
         aov_outputs: Vec::new(),
@@ -181,8 +220,8 @@ fn ta_compute_uses_node_type_script_when_dsl_formula_missing() {
         x: 0.0,
         y: 0.0,
         collapsed: false,
-        inputs: vec!["In".into()],
-        outputs: vec!["Out".into()],
+        inputs: vec!["source_stream".into()],
+        outputs: vec!["signal".into()],
     };
     let mut window = MarketSeriesWindow::default();
     window.push_close_only(104.0);

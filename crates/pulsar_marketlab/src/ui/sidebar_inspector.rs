@@ -7,8 +7,13 @@ use gpui_component::scroll::ScrollableElement;
 use crate::asset_path_input::render_asset_path_input;
 use crate::graph_compiler::{AssetSourceType, NodeType, VisualNode};
 use pulsar_marketlab::technical_analysis::{
-    category_display_label, ta_category_for_indicator, ta_indicator_catalog_hierarchy,
-    ta_indicator_label, TA_SIDEBAR_ALGORITHMS, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK, clamp_ta_lookback,
+    clamp_ta_lookback, DEFAULT_TA_LOOKBACK, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK,
+};
+use pulsar_marketlab_core::{algorithm_display_label, hyperparameter_visibility, TaArchetype};
+
+use crate::ui::ta_uber_inspector::{
+    adjust_period, adjust_signal_period, algorithm_picker_chip, archetype_summary,
+    hyperparam_stepper, ta_header_tint,
 };
 use std::path::PathBuf;
 use crate::asset_path_input::PathInputEvent;
@@ -23,7 +28,7 @@ impl TradingSystemWorkspace {
     pub(crate) fn selected_technical_analysis_node(&self) -> Option<&VisualNode> {
         let selected_id = self.selected_node_id?;
         self.nodes.iter().find(|node| {
-            node.id == selected_id && node.node_type.is_otl_shader()
+            node.id == selected_id && node.node_type.is_ta_uber_signal()
         })
     }
 
@@ -34,39 +39,8 @@ impl TradingSystemWorkspace {
         })
     }
 
-    pub(crate) fn set_ta_indicator(&mut self, node_id: usize, indicator_id: String, cx: &mut Context<Self>) {
-        let label = ta_indicator_label(&indicator_id)
-            .map(str::to_string)
-            .unwrap_or_else(|| indicator_id.clone());
-        if let Some(node) = self
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == node_id && node.node_type.is_otl_shader())
-        {
-            node.ta_indicator_id = Some(indicator_id.clone());
-            node.name = label;
-            self.ta_inspector_category = ta_category_for_indicator(&indicator_id);
-            self.sync_pipeline_graph(cx);
-            self.invalidate_playhead_evaluation_cache();
-            self.recompute_playhead_diagnostics();
-            cx.notify();
-        }
-    }
-
     pub(crate) fn commit_ta_parameter_change(&mut self, cx: &mut Context<Self>) {
-        self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
-        self.recompute_playhead_diagnostics();
-        cx.notify();
-    }
-
-    pub(crate) fn set_ta_lookback_period(&mut self, node_id: usize, period: u32) {
-        let period = clamp_ta_lookback(period as usize) as u32;
-        if let Some(node) = self.nodes.iter_mut().find(|node| {
-            node.id == node_id && node.node_type.is_otl_shader()
-        }) {
-            node.ta_lookback_period = period;
-        }
+        self.commit_ta_uber_parameter_change(cx);
     }
 
     pub(crate) fn lookback_from_slider_position(&self, mouse_x: f32, bounds: Bounds<Pixels>) -> u32 {
@@ -85,11 +59,11 @@ impl TradingSystemWorkspace {
             return;
         };
         self.ta_lookback_scrubbing = true;
-        self.set_ta_lookback_period(
+        self.set_ta_period_for_node(
             node_id,
             self.lookback_from_slider_position(mouse_x, bounds),
+            cx,
         );
-        cx.notify();
     }
 
     pub(crate) fn update_ta_lookback_scrub(&mut self, node_id: usize, mouse_x: f32, cx: &mut Context<Self>) {
@@ -104,38 +78,19 @@ impl TradingSystemWorkspace {
             .nodes
             .iter()
             .find(|node| node.id == node_id)
-            .map(|node| node.ta_lookback_period)
+            .map(|node| node.overlay_period().unwrap_or(14))
             .unwrap_or(DEFAULT_TA_LOOKBACK as u32);
         if next != current {
-            self.set_ta_lookback_period(node_id, next);
-            cx.notify();
+            self.set_ta_period_for_node(node_id, next, cx);
         }
     }
 
-    pub(crate) fn end_ta_lookback_scrub(&mut self, cx: &mut Context<Self>) {
-        if !self.ta_lookback_scrubbing {
-            return;
-        }
+    pub(crate) fn end_ta_lookback_scrub(&mut self, _cx: &mut Context<Self>) {
         self.ta_lookback_scrubbing = false;
-        self.commit_ta_parameter_change(cx);
     }
 
     pub(crate) fn adjust_ta_lookback_period(&mut self, node_id: usize, delta: i32, cx: &mut Context<Self>) {
-        let current = self
-            .nodes
-            .iter()
-            .find(|node| node.id == node_id)
-            .map(|node| node.ta_lookback_period)
-            .unwrap_or(DEFAULT_TA_LOOKBACK as u32);
-        let next = clamp_ta_lookback(current.saturating_add_signed(delta) as usize) as u32;
-        if next != current {
-            self.set_ta_lookback_period(node_id, next);
-            self.commit_ta_parameter_change(cx);
-        }
-    }
-
-    pub(crate) fn set_ta_sidebar_algorithm(&mut self, node_id: usize, algorithm_id: &str, cx: &mut Context<Self>) {
-        self.set_ta_indicator(node_id, algorithm_id.to_string(), cx);
+        crate::ui::ta_uber_inspector::adjust_period(self, node_id, delta, cx);
     }
 
     pub(crate) fn selected_asset_node(&self) -> Option<&VisualNode> {
@@ -147,29 +102,16 @@ impl TradingSystemWorkspace {
 
     pub(crate) fn sync_inspector_from_selection(&mut self, cx: &mut Context<Self>) {
         self.reset_otl_script_input();
+        self.reset_otl_editor_input();
         self.sync_asset_path_draft_from_selection(cx);
         self.sync_ta_inspector_category_from_selection();
     }
 
     pub(crate) fn sync_ta_inspector_category_from_selection(&mut self) {
-        if self.selected_technical_analysis_node().is_some() {
-            self.ta_inspector_category = self
-                .selected_technical_analysis_node()
-                .and_then(|node| node.ta_indicator_id.as_deref())
-                .and_then(ta_category_for_indicator)
-                .or_else(|| {
-                    ta_indicator_catalog_hierarchy()
-                        .first()
-                        .map(|category| category.id.clone())
-                });
-        } else {
-            self.ta_inspector_category = None;
-        }
-    }
-
-    fn set_ta_inspector_category(&mut self, category_id: String, cx: &mut Context<Self>) {
-        self.ta_inspector_category = Some(category_id);
-        cx.notify();
+        self.ta_inspector_category = self
+            .selected_technical_analysis_node()
+            .and_then(|node| node.node_type.ta_uber_config())
+            .map(|config| config.archetype.as_token().to_string());
     }
 
     pub(crate) fn sync_asset_path_draft_from_selection(&mut self, cx: &mut Context<Self>) {
@@ -453,10 +395,8 @@ impl TradingSystemWorkspace {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
-                    .flex_col()
-                    .child(self.render_ta_parameter_controls(cx))
-                    .child(self.render_ta_indicator_picker(cx)),
+                    .overflow_y_scrollbar()
+                    .child(self.render_ta_uber_inspector(cx)),
             );
         } else if show_portfolio_analytics {
             inspector = inspector.child(
@@ -823,451 +763,142 @@ impl TradingSystemWorkspace {
             )
     }
 
-    pub(crate) fn render_ta_parameter_controls(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_ta_uber_inspector(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(node) = self.selected_technical_analysis_node() else {
             return div().into_any_element();
         };
         let node_id = node.id;
-        let lookback = node.ta_lookback_period;
-        let active_algorithm = node
-            .ta_indicator_id
-            .as_deref()
-            .unwrap_or(DEFAULT_TA_INDICATOR_ID);
-        let lookback_span = (MAX_TA_LOOKBACK - MIN_TA_LOOKBACK) as f32;
-        let slider_fraction = if lookback_span <= f32::EPSILON {
-            0.0
-        } else {
-            (lookback as f32 - MIN_TA_LOOKBACK as f32) / lookback_span
-        };
-        let view = cx.entity().downgrade();
+        let config = node
+            .node_type
+            .ta_uber_config()
+            .expect("ta node has config")
+            .clone();
+        let accent = config.archetype.accent_rgb();
+        let active_algorithm = config.algorithm.as_str();
+        let visibility = hyperparameter_visibility(&config);
 
-        let mut algorithm_row = div().flex().flex_row().gap_1().mt_2();
-        for (algorithm_id, label) in TA_SIDEBAR_ALGORITHMS {
+        let mut algorithm_row = div().flex().flex_row().flex_wrap().gap_1().mt_2();
+        for algorithm_id in config.archetype.algorithms() {
+            let label = algorithm_display_label(algorithm_id);
             let is_active = active_algorithm.eq_ignore_ascii_case(algorithm_id);
-            algorithm_row = algorithm_row.child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(if is_active {
-                        rgb(0x2a1f3d)
-                    } else {
-                        rgb(0x141417)
-                    })
-                    .border_1()
-                    .border_color(if is_active {
-                        rgb(0xa855f7)
-                    } else {
-                        rgb(0x222227)
-                    })
-                    .text_size(px(9.0))
-                    .font_weight(if is_active {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .text_color(if is_active {
-                        rgb(0xe9d5ff)
-                    } else {
-                        rgb(0xa1a1aa)
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                            this.set_ta_sidebar_algorithm(node_id, algorithm_id, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(*label),
-            );
+            algorithm_row = algorithm_row.child(algorithm_picker_chip(
+                node_id,
+                algorithm_id,
+                label,
+                is_active,
+                accent,
+                cx,
+            ));
         }
 
-        div()
+        let mut panel = div()
             .flex_shrink_0()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .p_3()
-            .bg(rgb(0x111114))
+            .bg(rgb(ta_header_tint(config.archetype)))
             .border_1()
-            .border_color(rgb(0x222227))
+            .border_color(rgb(accent))
             .rounded_md()
             .child(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xc084fc))
-                    .child("TA Parameters"),
+                    .text_color(rgb(accent))
+                    .child(config.archetype.display_name()),
             )
-            .child(algorithm_row)
             .child(
                 div()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(0xa1a1aa))
-                                    .child("Lookback Period"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .font_family("monospace")
-                                    .text_color(rgb(0xe9d5ff))
-                                    .child(format!("{lookback} bars")),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .text_size(px(10.0))
-                                    .font_family("monospace")
-                                    .text_color(rgb(0xe9d5ff))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                                            this.adjust_ta_lookback_period(node_id, -1, cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child("−"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .font_family("monospace")
-                                    .text_color(rgb(0xe9d5ff))
-                                    .child(format!("{lookback} bars")),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .text_size(px(10.0))
-                                    .font_family("monospace")
-                                    .text_color(rgb(0xe9d5ff))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                                            this.adjust_ta_lookback_period(node_id, 1, cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child("+"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .h(px(16.0))
-                            .rounded_sm()
-                            .bg(rgb(0x18181b))
-                            .border_1()
-                            .border_color(rgb(0x27272a))
-                            .cursor(CursorStyle::PointingHand)
-                            .on_children_prepainted({
-                                move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                                    if let Some(track_bounds) = bounds.last() {
-                                        let _ = view.update(cx, |workspace, _cx| {
-                                            workspace.ta_lookback_slider_bounds = Some(*track_bounds);
-                                        });
-                                    }
-                                }
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(
-                                    move |this, event: &MouseDownEvent, _window, cx| {
-                                        this.begin_ta_lookback_scrub(node_id, event.position.x.into(), cx);
-                                        cx.stop_propagation();
-                                    },
-                                ),
-                            )
-                            .on_mouse_move(cx.listener(
-                                move |this, event: &MouseMoveEvent, _window, cx| {
-                                    this.update_ta_lookback_scrub(node_id, event.position.x.into(), cx);
-                                },
-                            ))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
-                                    this.end_ta_lookback_scrub(cx);
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                MouseButton::Left,
-                                cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
-                                    this.end_ta_lookback_scrub(cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .h_full()
-                                    .w(relative(slider_fraction.max(0.01)))
-                                    .bg(rgb(0x581c87)),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(-2.0))
-                                    .left(relative(slider_fraction.clamp(0.0, 1.0)))
-                                    .w(px(8.0))
-                                    .h(px(16.0))
-                                    .rounded_full()
-                                    .bg(rgb(0xa855f7)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(8.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child(format!("{MIN_TA_LOOKBACK}"))
-                            .child(format!("{MAX_TA_LOOKBACK}")),
-                    ),
+                    .text_size(px(9.0))
+                    .text_color(rgb(0xa1a1aa))
+                    .child(archetype_summary(&config)),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(0x71717a))
+                    .child("Ports are fixed for this archetype; adjust hyperparameters below."),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xd4d4d8))
+                    .child("Algorithm"),
+            )
+            .child(algorithm_row);
+
+        if visibility.period {
+            panel = panel.child(hyperparam_stepper(
+                "Period",
+                format!("{} bars", config.period),
+                node_id,
+                1,
+                adjust_period,
+                cx,
+            ));
+        }
+        if visibility.signal_period {
+            panel = panel.child(hyperparam_stepper(
+                "Signal period",
+                format!("{} bars", config.signal_period),
+                node_id,
+                1,
+                adjust_signal_period,
+                cx,
+            ));
+        }
+        if visibility.multiplier {
+            panel = panel.child(hyperparam_stepper(
+                "Multiplier",
+                format!("{:.2}", config.multiplier),
+                node_id,
+                1,
+                |this, id, delta, cx| {
+                    let current = this
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| n.node_type.ta_uber_config())
+                        .map(|c| c.multiplier)
+                        .unwrap_or(2.0);
+                    let next = (current + delta as f32 * 0.25).max(0.25);
+                    this.set_ta_multiplier_for_node(id, next, cx);
+                },
+                cx,
+            ));
+        }
+        if visibility.annualization {
+            panel = panel.child(hyperparam_stepper(
+                "Annualization",
+                format!("{:.0}", config.annualization),
+                node_id,
+                1,
+                |this, id, delta, cx| {
+                    let current = this
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == id)
+                        .and_then(|n| n.node_type.ta_uber_config())
+                        .map(|c| c.annualization)
+                        .unwrap_or(252.0);
+                    let next = (current + delta as f32 * 21.0).max(1.0);
+                    this.set_ta_annualization_for_node(id, next, cx);
+                },
+                cx,
+            ));
+        }
+
+        panel.into_any_element()
     }
 
-    pub(crate) fn render_ta_indicator_picker(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected_id = self.selected_node_id;
-        let selected_indicator = self
-            .selected_technical_analysis_node()
-            .and_then(|node| node.ta_indicator_id.clone());
-        let hierarchy = ta_indicator_catalog_hierarchy();
-        let catalog_len: usize = hierarchy.iter().map(|category| category.count()).sum();
+    #[allow(dead_code)]
+    pub(crate) fn render_ta_parameter_controls(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_ta_uber_inspector(cx)
+    }
 
-        let active_category = self
-            .ta_inspector_category
-            .clone()
-            .filter(|category_id| hierarchy.iter().any(|category| category.id == *category_id))
-            .or_else(|| hierarchy.first().map(|category| category.id.clone()))
-            .unwrap_or_default();
-
-        let active_category_label = hierarchy
-            .iter()
-            .find(|category| category.id == active_category)
-            .map(|category| category.label.clone())
-            .unwrap_or_else(|| category_display_label(&active_category));
-
-        let current_binding = selected_indicator.as_deref().and_then(|indicator_id| {
-            let label = ta_indicator_label(indicator_id).unwrap_or(indicator_id);
-            let category = ta_category_for_indicator(indicator_id)
-                .map(|id| category_display_label(&id))
-                .unwrap_or_default();
-            Some(format!("{label} · {category}"))
-        });
-
-        let mut shelf = div()
-            .w(px(108.0))
-            .flex_shrink_0()
-            .min_h_0()
-            .flex_col()
-            .gap_0p5()
-            .py_1()
-            .bg(rgb(0x111114))
-            .border_r_1()
-            .border_color(rgb(0x222227))
-            .overflow_y_scrollbar();
-
-        for category in &hierarchy {
-            let category_id = category.id.clone();
-            let is_active = category_id == active_category;
-            let shelf_bg = if is_active {
-                rgb(0x2a1f3d)
-            } else {
-                rgb(0x111114)
-            };
-            let accent = if is_active {
-                rgb(0xa855f7)
-            } else {
-                rgb(0x2d2d34)
-            };
-
-            shelf = shelf.child(
-                div()
-                    .px_1p5()
-                    .py_1()
-                    .bg(shelf_bg)
-                    .border_l_2()
-                    .border_color(accent)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x25252b)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                            this.set_ta_inspector_category(category_id.clone(), cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(8.0))
-                            .font_weight(if is_active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if is_active {
-                                rgb(0xe9d5ff)
-                            } else {
-                                rgb(0xa1a1aa)
-                            })
-                            .child(category.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(7.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child(format!("{}", category.count())),
-                    ),
-            );
-        }
-
-        let active_entries = hierarchy
-            .iter()
-            .find(|category| category.id == active_category)
-            .map(|category| category.entries.as_slice())
-            .unwrap_or(&[]);
-
-        let mut list = div()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .flex_col()
-            .gap_0p5()
-            .p_1()
-            .overflow_y_scrollbar();
-
-        for entry in active_entries {
-            let indicator_id = entry.id.clone();
-            let is_selected = selected_indicator.as_deref() == Some(indicator_id.as_str());
-            let row_bg = if is_selected {
-                rgb(0x2a1f3d)
-            } else {
-                rgb(0x141417)
-            };
-            list = list.child(
-                div()
-                    .p_1p5()
-                    .bg(row_bg)
-                    .border_1()
-                    .border_color(if is_selected {
-                        rgb(0xa855f7)
-                    } else {
-                        rgb(0x222227)
-                    })
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x25252b)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, _window, cx| {
-                            if let Some(node_id) = selected_id {
-                                this.set_ta_indicator(node_id, indicator_id.clone(), cx);
-                            }
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xe9d5ff))
-                            .child(entry.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(8.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child(entry.id.clone()),
-                    ),
-            );
-        }
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex_col()
-            .gap_2()
-            .mt_2()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xc084fc))
-                            .child(format!("VectorTA ({catalog_len})")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(8.0))
-                            .text_color(rgb(0x71717a))
-                            .child(format!(
-                                "Shelf: {active_category_label} · {} indicators",
-                                active_entries.len()
-                            )),
-                    )
-                    .when(current_binding.is_some(), |header| {
-                        header.child(
-                            div()
-                                .text_size(px(8.0))
-                                .font_family("monospace")
-                                .text_color(rgb(0x38bdf8))
-                                .child(format!(
-                                    "Bound: {}",
-                                    current_binding.clone().unwrap_or_default()
-                                )),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .flex()
-                    .flex_row()
-                    .border_1()
-                    .border_color(rgb(0x222227))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .child(shelf)
-                    .child(list),
-            )
+    #[allow(dead_code)]
+    pub(crate) fn render_ta_indicator_picker(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().into_any_element()
     }
 }

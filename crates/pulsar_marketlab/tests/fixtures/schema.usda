@@ -26,12 +26,35 @@ class "FinancialAsset" (
 
 class "OtlOperator" (
     inherits = </Typed>
-    doc = "An analytical operator node executing geometric algebra or OTL math scripts."
+    doc = "Generic OTL formula node (mix, clamp, custom expressions)."
 ) {
     token inputs:id = ""
     string inputs:script_src = ""
+    string inputs:script_compiled_path = ""
     rel inputs:underlying
     token outputs:signal
+}
+
+class "OtlTaUberSignal" (
+    inherits = </Typed>
+    doc = "Unified technical analysis node wrapping background VectorTA primitives."
+) {
+    uniform token info:archetype = "trend" (
+        allowedTokens = ["trend", "volatility", "oscillator", "channel"]
+    )
+    uniform token info:algorithm = "sma"
+    int inputs:period = 14
+    int inputs:signal_period = 9
+    float inputs:multiplier = 2.0
+    float inputs:annualization = 252.0
+    string inputs:script_src = ""
+    rel inputs:underlying
+    token outputs:result
+    token outputs:oscillator
+    token outputs:signal_line
+    token outputs:upper_band
+    token outputs:basis_line
+    token outputs:lower_band
 }
 
 class "PortfolioIntegrator" (

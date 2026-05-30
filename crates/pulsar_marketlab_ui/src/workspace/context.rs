@@ -25,6 +25,7 @@ pub enum PanelType {
     StageComposer,
     NodeCanvas,
     ParamInspector,
+    OtlEditor,
     RenderViewport,
 }
 
@@ -38,6 +39,7 @@ pub struct Point2D {
 /// Passive USD overlay key: property path + SDF field name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AttributeFieldKey {
+    edit_layer: Option<String>,
     property_path: String,
     field: String,
 }
@@ -141,6 +143,7 @@ impl ManagedUsdRelationship {
 #[derive(Clone, Debug)]
 pub struct ManagedUsdStage {
     root_layer_path: Arc<String>,
+    edit_target_layer: Arc<Mutex<Option<String>>>,
     active_overrides: Arc<Mutex<HashMap<String, bool>>>,
     attribute_overrides: Arc<Mutex<HashMap<AttributeFieldKey, Value>>>,
     relationship_overrides: Arc<Mutex<HashMap<RelationshipKey, Vec<String>>>>,
@@ -163,6 +166,7 @@ impl ManagedUsdStage {
         Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         Ok(Self {
             root_layer_path: Arc::new(path),
+            edit_target_layer: Arc::new(Mutex::new(None)),
             active_overrides: Arc::new(Mutex::new(HashMap::new())),
             attribute_overrides: Arc::new(Mutex::new(HashMap::new())),
             relationship_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -182,6 +186,40 @@ impl ManagedUsdStage {
     pub fn layer_identifiers(&self) -> Vec<String> {
         self.with_stage(|stage| Ok(stage.layer_identifiers()))
             .unwrap_or_else(|_| vec![self.root_layer_path.to_string()])
+    }
+
+    pub fn edit_target_layer(&self) -> Option<String> {
+        self.edit_target_layer
+            .lock()
+            .ok()
+            .and_then(|layer| layer.clone())
+    }
+
+    pub fn set_edit_target_layer(&self, layer: Option<String>) {
+        if let Ok(mut target) = self.edit_target_layer.lock() {
+            *target = layer;
+        }
+    }
+
+    /// Count of passive attribute field opinions held in memory overlays.
+    pub fn overlay_field_count(&self) -> usize {
+        self.attribute_overrides
+            .lock()
+            .ok()
+            .map(|overrides| overrides.len())
+            .unwrap_or(0)
+    }
+
+    /// Approximate in-memory overlay footprint for diagnostics (KiB).
+    pub fn overlay_memory_kib(&self) -> u64 {
+        let fields = self.overlay_field_count() as u64;
+        let relationships = self
+            .relationship_overrides
+            .lock()
+            .ok()
+            .map(|overrides| overrides.len() as u64)
+            .unwrap_or(0);
+        ((fields * 96) + (relationships * 128)).div_ceil(1024)
     }
 
     /// Run a callback against a freshly opened native [`Stage`].
@@ -248,6 +286,21 @@ impl ManagedUsdStage {
         .flatten()
     }
 
+    /// Read a composed string attribute default (e.g. `inputs:script_src`).
+    pub fn field_string(&self, prim_path: &str, attribute: &str) -> Option<String> {
+        let property_path = format!("{prim_path}.{attribute}");
+        if let Some(Value::String(text)) = self.field(&property_path, "default") {
+            return Some(text);
+        }
+        self.with_stage(|stage| {
+            Ok(stage
+                .field::<String>(property_path.as_str(), FieldKey::Default)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?)
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn has_relationship(&self, prim_path: &str, relationship: &str) -> bool {
         let key = RelationshipKey {
             prim_path: prim_path.to_string(),
@@ -309,11 +362,13 @@ impl ManagedUsdStage {
         }
     }
 
-    /// Write a field opinion into the passive USD memory overlay.
+    /// Write a field opinion into the passive USD memory overlay for the active edit target.
     pub fn set_field(&self, property_path: &str, field: &str, val: Value) {
+        let edit_layer = self.edit_target_layer();
         if let Ok(mut overrides) = self.attribute_overrides.lock() {
             overrides.insert(
                 AttributeFieldKey {
+                    edit_layer,
                     property_path: property_path.to_string(),
                     field: field.to_string(),
                 },
@@ -322,14 +377,24 @@ impl ManagedUsdStage {
         }
     }
 
-    /// Resolve a composed field, checking passive overlays before the on-disk stage.
+    /// Resolve a composed field, checking edit-target overlays before the on-disk stage.
     pub fn field(&self, property_path: &str, field: &str) -> Option<Value> {
-        let key = AttributeFieldKey {
-            property_path: property_path.to_string(),
-            field: field.to_string(),
-        };
+        let edit_layer = self.edit_target_layer();
         if let Ok(overrides) = self.attribute_overrides.lock() {
-            if let Some(val) = overrides.get(&key) {
+            let scoped = AttributeFieldKey {
+                edit_layer: edit_layer.clone(),
+                property_path: property_path.to_string(),
+                field: field.to_string(),
+            };
+            if let Some(val) = overrides.get(&scoped) {
+                return Some(val.clone());
+            }
+            let legacy = AttributeFieldKey {
+                edit_layer: None,
+                property_path: property_path.to_string(),
+                field: field.to_string(),
+            };
+            if let Some(val) = overrides.get(&legacy) {
                 return Some(val.clone());
             }
         }
@@ -373,6 +438,7 @@ impl WorkspaceContext {
     pub fn new(root_layer_path: impl AsRef<FsPath>) -> io::Result<Self> {
         let usd_stage = ManagedUsdStage::open(root_layer_path)?;
         let edit_target_layer = usd_stage.layer_identifiers().into_iter().next();
+        usd_stage.set_edit_target_layer(edit_target_layer.clone());
         Ok(Self {
             usd_stage,
             selected_path: None,
@@ -390,6 +456,7 @@ impl WorkspaceContext {
     pub fn from_usda_text(content: &str) -> io::Result<Self> {
         let usd_stage = ManagedUsdStage::open_from_usda_text(content)?;
         let edit_target_layer = usd_stage.layer_identifiers().into_iter().next();
+        usd_stage.set_edit_target_layer(edit_target_layer.clone());
         Ok(Self {
             usd_stage,
             selected_path: None,
@@ -424,7 +491,8 @@ impl WorkspaceContext {
         if self.edit_target_layer == layer {
             return;
         }
-        self.edit_target_layer = layer;
+        self.edit_target_layer = layer.clone();
+        self.usd_stage.set_edit_target_layer(layer);
         cx.notify();
     }
 
@@ -623,6 +691,7 @@ impl Default for WorkspaceContext {
         Self::from_usda_text("#usda 1.0\n").unwrap_or_else(|_| Self {
             usd_stage: ManagedUsdStage {
                 root_layer_path: Arc::new(String::new()),
+                edit_target_layer: Arc::new(Mutex::new(None)),
                 active_overrides: Arc::new(Mutex::new(HashMap::new())),
                 attribute_overrides: Arc::new(Mutex::new(HashMap::new())),
                 relationship_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -657,6 +726,7 @@ fn default_active_panels() -> Vec<PanelType> {
         PanelType::StageComposer,
         PanelType::NodeCanvas,
         PanelType::ParamInspector,
+        PanelType::OtlEditor,
         PanelType::RenderViewport,
     ]
 }

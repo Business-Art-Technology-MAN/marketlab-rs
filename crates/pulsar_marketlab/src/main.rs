@@ -8,6 +8,7 @@ use std::time::Duration;
 use gpui::*;
 
 use gpui_component::Root;
+use gpui_component::{Theme, ThemeMode};
 use pulsar_marketlab::fix_engine::{spawn_mock_fix_bridge, FixPlayheadClock};
 
 mod asset_path_input;
@@ -291,6 +292,7 @@ fn main() {
         };
 
         cx.open_window(options, move |window, cx| {
+            Theme::change(ThemeMode::Dark, Some(window), cx);
             let workspace = cx.new(|cx| {
                 TradingSystemWorkspace::new(
                     pipeline_rx,

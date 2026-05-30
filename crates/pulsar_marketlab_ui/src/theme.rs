@@ -33,12 +33,16 @@ pub const TEXT_SECONDARY: u32 = 0x8e8e93;
 
 // ── Recessed node-body controls ───────────────────────────────────────────────
 
-pub const CONTROL_BG: u32 = 0x1a1a1e;
-pub const CONTROL_TEXT: u32 = 0xe5e5ea;
+pub const CONTROL_BG: u32 = 0x32323a;
+pub const CONTROL_TEXT: u32 = 0xf2f2f7;
 pub const CONTROL_FOCUS: u32 = 0x3b82f6;
-pub const CONTROL_CARET: u32 = 0x8e8e93;
-pub const CONTROL_BORDER: u32 = 0x26262b;
-pub const CONTROL_HOVER: u32 = 0x222228;
+pub const CONTROL_CARET: u32 = 0xaeaeb2;
+pub const CONTROL_BORDER: u32 = 0x48484f;
+pub const CONTROL_HOVER: u32 = 0x3d3d44;
+
+/// Code editor surface (OTL Script Editor tab).
+pub const CODE_EDITOR_BG: u32 = 0x141417;
+pub const CODE_EDITOR_GUTTER: u32 = 0x111114;
 
 // ── Tabs & accents ────────────────────────────────────────────────────────────
 

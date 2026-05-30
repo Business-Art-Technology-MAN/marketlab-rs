@@ -14,7 +14,10 @@ use pulsar_marketlab::technical_analysis::{
 use pulsar_marketlab_ui::workspace::blender_slot_position;
 
 use crate::canvas_compose::{compose_pipeline_usda, resolve_node_stage_paths, stage_prim_path_for_node};
-use crate::graph_compiler::{NodeConnection, NodeGradeType, NodeType, VisualNode};
+use crate::graph_compiler::{
+    apply_canonical_ta_ports, ta_uber_from_legacy_indicator, NodeConnection, NodeGradeType,
+    NodeType, TaArchetype, TaUberSignalConfig, VisualNode,
+};
 
 const LINEAGE_RELATIONSHIPS: &[&str] = &["inputs:underlying", "inputs:sources"];
 
@@ -108,7 +111,7 @@ fn legacy_kind_from_path(path: &str) -> Option<ExecutablePrimKind> {
         }
         None
     } else if path.starts_with("/analytics/") {
-        Some(ExecutablePrimKind::OtlOperator)
+        Some(ExecutablePrimKind::OtlTaUberSignal)
     } else if path.starts_with("/portfolios/") {
         Some(ExecutablePrimKind::PortfolioIntegrator)
     } else {
@@ -119,7 +122,7 @@ fn legacy_kind_from_path(path: &str) -> Option<ExecutablePrimKind> {
 fn blender_tier_for_kind(kind: ExecutablePrimKind) -> u8 {
     match kind {
         ExecutablePrimKind::FinancialAsset => 0,
-        ExecutablePrimKind::OtlOperator => 1,
+        ExecutablePrimKind::OtlOperator | ExecutablePrimKind::OtlTaUberSignal => 1,
         ExecutablePrimKind::PortfolioIntegrator => 2,
     }
 }
@@ -142,8 +145,6 @@ fn build_visual_node(
                 name: format!("{symbol}.csv"),
                 node_type: NodeType::asset_adaptor(prim_path.to_string()),
                 grade: NodeGradeType::Scalar,
-                ta_indicator_id: None,
-                ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
                 portfolio_allocation_id: None,
                 dsl_formula: None,
                 aov_outputs: Vec::new(),
@@ -155,32 +156,55 @@ fn build_visual_node(
                 outputs: vec!["Close Out".to_string()],
             })
         }
+        ExecutablePrimKind::OtlTaUberSignal => {
+            let config = hydrate_ta_uber_config(prim_path, bridge);
+            let label = ta_indicator_label(&config.algorithm)
+                .unwrap_or(config.algorithm.as_str())
+                .to_string();
+            let mut node = VisualNode {
+                id,
+                name: label,
+                node_type: NodeType::ta_uber_signal(config),
+                grade: NodeGradeType::Scalar,
+                portfolio_allocation_id: None,
+                dsl_formula: None,
+                aov_outputs: Vec::new(),
+                asset_source: None,
+                x,
+                y,
+                collapsed: false,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            };
+            apply_canonical_ta_ports(&mut node);
+            Some(node)
+        }
         ExecutablePrimKind::OtlOperator => {
-            let indicator_id = bridge
-                .field_string(prim_path, "inputs:id")
-                .or_else(|| prim_path.rsplit('/').next().map(str::to_string))
-                .unwrap_or_else(|| DEFAULT_TA_INDICATOR_ID.to_string());
+            if bridge.field_string(prim_path, "info:archetype").is_some()
+                || bridge.field_string(prim_path, "inputs:id").is_some()
+            {
+                return build_visual_node(id, prim_path, ExecutablePrimKind::OtlTaUberSignal, (x, y), bridge);
+            }
             let script = bridge
                 .field_string(prim_path, "inputs:script_src")
                 .unwrap_or_default();
-            let lookback = parse_ta_lookback_period(&script);
-            let (dsl_formula, node_type) = if looks_like_indicator_call(&script, &indicator_id) {
-                (None, NodeType::otl_shader(String::new()))
-            } else if script.trim().is_empty() {
-                (None, NodeType::otl_shader(String::new()))
-            } else {
-                (Some(script.clone()), NodeType::otl_shader(script))
+            let compiled_path = bridge
+                .field_string(prim_path, "inputs:script_compiled_path")
+                .filter(|path| !path.trim().is_empty());
+            let node_type = NodeType::OtlShader {
+                script: script.clone(),
+                compiled_path: compiled_path.clone(),
             };
-            let label = ta_indicator_label(&indicator_id)
-                .unwrap_or(indicator_id.as_str())
-                .to_string();
-            Some(VisualNode {
+            let dsl_formula = if script.trim().is_empty() {
+                None
+            } else {
+                Some(script.clone())
+            };
+            let mut node = VisualNode {
                 id,
-                name: label,
+                name: "OTL Shader".to_string(),
                 node_type,
                 grade: NodeGradeType::Scalar,
-                ta_indicator_id: Some(indicator_id),
-                ta_lookback_period: lookback,
                 portfolio_allocation_id: None,
                 dsl_formula,
                 aov_outputs: Vec::new(),
@@ -188,9 +212,19 @@ fn build_visual_node(
                 x,
                 y,
                 collapsed: false,
-                inputs: vec!["Price In".to_string()],
-                outputs: vec!["TA Out".to_string()],
-            })
+                inputs: vec!["source_stream".to_string()],
+                outputs: vec!["signal".to_string()],
+            };
+            if let Some(path) = compiled_path.as_deref() {
+                if let Ok(asset) = pulsar_marketlab_core::load_compiled_asset_from_path(path) {
+                    let _ = crate::graph_compiler::apply_compiled_otc_asset_to_node(
+                        &mut node,
+                        &asset,
+                        &mut Vec::new(),
+                    );
+                }
+            }
+            Some(node)
         }
         ExecutablePrimKind::PortfolioIntegrator => {
             let leaf = prim_path.rsplit('/').next().unwrap_or("portfolio");
@@ -209,8 +243,6 @@ fn build_visual_node(
                 name: leaf.replace('_', " "),
                 node_type,
                 grade: NodeGradeType::Scalar,
-                ta_indicator_id: None,
-                ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
                 portfolio_allocation_id: allocation.filter(|id| id.starts_with("Allocation::")),
                 dsl_formula: None,
                 aov_outputs: Vec::new(),
@@ -225,11 +257,57 @@ fn build_visual_node(
     }
 }
 
-fn looks_like_indicator_call(script: &str, indicator_id: &str) -> bool {
-    let trimmed = script.trim();
-    trimmed.starts_with(indicator_id)
-        && trimmed.contains('(')
-        && trimmed.contains("period=")
+fn hydrate_ta_uber_config(prim_path: &str, bridge: &UsdStageBridge) -> TaUberSignalConfig {
+    if let Some(archetype_token) = bridge.field_string(prim_path, "info:archetype") {
+        let archetype = TaArchetype::from_token(&archetype_token)
+            .unwrap_or(TaArchetype::Oscillator);
+        let algorithm = bridge
+            .field_string(prim_path, "info:algorithm")
+            .unwrap_or_else(|| archetype.default_algorithm().to_string());
+        let period = field_u32_attr(bridge, prim_path, "inputs:period")
+            .unwrap_or_else(|| archetype.default_period())
+            .max(1);
+        let signal_period = field_u32_attr(bridge, prim_path, "inputs:signal_period")
+            .unwrap_or(9)
+            .max(1);
+        let multiplier = bridge
+            .field_f32(prim_path, "inputs:multiplier")
+            .unwrap_or(2.0);
+        let annualization = bridge
+            .field_f32(prim_path, "inputs:annualization")
+            .unwrap_or(252.0);
+        let mut config = TaUberSignalConfig {
+            archetype,
+            algorithm,
+            period,
+            multiplier,
+            annualization,
+            signal_period,
+        };
+        config.normalize_algorithm();
+        return config;
+    }
+
+    let indicator_id = bridge
+        .field_string(prim_path, "inputs:id")
+        .or_else(|| prim_path.rsplit('/').next().map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_TA_INDICATOR_ID.to_string());
+    let script = bridge
+        .field_string(prim_path, "inputs:script_src")
+        .unwrap_or_default();
+    let lookback = parse_ta_lookback_period(&script);
+    ta_uber_from_legacy_indicator(&indicator_id, lookback)
+}
+
+fn field_u32_attr(bridge: &UsdStageBridge, prim_path: &str, attribute: &str) -> Option<u32> {
+    bridge
+        .field_string(prim_path, attribute)
+        .and_then(|text| text.trim().parse().ok())
+        .or_else(|| {
+            bridge
+                .field_f32(prim_path, attribute)
+                .map(|value| value.max(0.0) as u32)
+        })
 }
 
 fn parse_ta_lookback_period(script: &str) -> u32 {
@@ -289,7 +367,7 @@ fn hydrate_connections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph_compiler::AssetSourceType;
+    use crate::graph_compiler::{apply_canonical_ta_ports, ta_uber_from_legacy_indicator, AssetSourceType};
     use pulsar_marketlab::stage_bridge::UsdStageBridge;
 
     fn sample_asset(id: usize) -> VisualNode {
@@ -298,8 +376,6 @@ mod tests {
             name: "GLD.csv".to_string(),
             node_type: NodeType::asset_adaptor("/MarketLab/GLD".to_string()),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: 14,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -315,13 +391,11 @@ mod tests {
     }
 
     fn sample_ta(id: usize) -> VisualNode {
-        VisualNode {
+        let mut node = VisualNode {
             id,
             name: "RSI".to_string(),
-            node_type: NodeType::otl_shader(String::new()),
+            node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("rsi", 14)),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
-            ta_lookback_period: 14,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -329,9 +403,11 @@ mod tests {
             x: 450.0,
             y: 320.0,
             collapsed: false,
-            inputs: vec!["Price In".to_string()],
-            outputs: vec!["TA Out".to_string()],
-        }
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        apply_canonical_ta_ports(&mut node);
+        node
     }
 
     #[test]

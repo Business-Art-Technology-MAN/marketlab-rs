@@ -11,12 +11,16 @@ use thiserror::Error;
 /// Thread-safe compiled signal transform closure.
 pub type SignalTransformFn = dyn Fn(&[f64]) -> Vec<f64> + Send + Sync;
 
+/// Thread-safe multi-AOV transform closure.
+pub type MultiSignalTransformFn = dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync;
+
 /// Thread-safe node execution payload (prim path keyed separately in the engine).
 pub enum ExecutionNode {
     DataInput { symbol: String },
     SignalTransform {
         expression: String,
         compiled_fn: Option<Box<SignalTransformFn>>,
+        compiled_multi: Option<(Box<MultiSignalTransformFn>, Vec<String>)>,
     },
     PortfolioSink {
         method: String,
@@ -123,7 +127,28 @@ impl MarketLabGraphEngine {
             toposort(&engine.graph, None).map_err(|_| GraphEngineError::CycleDetected)?;
         Ok(engine)
     }
+}
 
+fn resolve_prim_otl_expression(prim: &StageGraphPrim) -> String {
+    if let Some(path) = prim
+        .attributes
+        .get("inputs:script_compiled_path")
+        .map(|path| path.as_str().trim())
+        .filter(|path| !path.is_empty())
+    {
+        if let Ok(asset) = super::binary::load_compiled_asset_from_path(path) {
+            if let Ok(script) = asset.bytecode_as_script_source() {
+                return script.to_string();
+            }
+        }
+    }
+    prim.attributes
+        .get("inputs:script_src")
+        .cloned()
+        .unwrap_or_default()
+}
+
+impl MarketLabGraphEngine {
     pub fn compile_from_stage(snapshot: &StageGraphSnapshot) -> Result<Self, GraphEngineError> {
         let mut nodes = Vec::with_capacity(snapshot.prims.len());
         for prim in &snapshot.prims {
@@ -136,13 +161,10 @@ impl MarketLabGraphEngine {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| prim.path.clone()),
                 },
-                "OtlOperator" => ExecutionNode::SignalTransform {
-                    expression: prim
-                        .attributes
-                        .get("inputs:script_src")
-                        .cloned()
-                        .unwrap_or_default(),
+                "OtlOperator" | "OtlTaUberSignal" => ExecutionNode::SignalTransform {
+                    expression: resolve_prim_otl_expression(prim),
                     compiled_fn: None,
+                    compiled_multi: None,
                 },
                 "PortfolioIntegrator" => ExecutionNode::PortfolioSink {
                     method: prim
@@ -189,6 +211,7 @@ impl MarketLabGraphEngine {
             let ExecutionNode::SignalTransform {
                 expression,
                 compiled_fn,
+                compiled_multi,
             } = node
             else {
                 continue;
@@ -197,15 +220,25 @@ impl MarketLabGraphEngine {
             let source = expression.trim();
             if source.is_empty() {
                 *compiled_fn = Some(Box::new(|input| input.to_vec()));
+                *compiled_multi = None;
                 continue;
             }
 
-            *compiled_fn = Some(super::compiler::compile_script(source).map_err(|err| {
+            match super::script_resolve::compile_unified_script(source).map_err(|err| {
                 GraphEngineError::ScriptCompileError {
                     path: prim_path.clone(),
                     message: err.to_string(),
                 }
-            })?);
+            })? {
+                super::compiler::CompiledSeries::Single(closure) => {
+                    *compiled_fn = Some(closure);
+                    *compiled_multi = None;
+                }
+                super::compiler::CompiledSeries::Multi(closure, attributes) => {
+                    *compiled_fn = None;
+                    *compiled_multi = Some((closure, attributes));
+                }
+            }
         }
         Ok(self)
     }
@@ -241,8 +274,13 @@ impl MarketLabGraphEngine {
             .node_weight_mut(index)
             .ok_or_else(|| GraphEngineError::UnknownPrimPath(prim_path.to_string()))?;
         match node {
-            ExecutionNode::SignalTransform { compiled_fn, .. } => {
+            ExecutionNode::SignalTransform {
+                compiled_fn,
+                compiled_multi,
+                ..
+            } => {
                 *compiled_fn = Some(compiled);
+                *compiled_multi = None;
             }
             _ => {
                 return Err(GraphEngineError::UnsupportedPrimType {
@@ -312,23 +350,54 @@ impl MarketLabGraphEngine {
                 Some(ExecutionNode::SignalTransform {
                     expression,
                     compiled_fn,
+                    compiled_multi,
                 }) => {
-                    let values = if let Some(run) = compiled_fn.as_ref() {
-                        run(&upstream)
+                    if let Some((run, attributes)) = compiled_multi.as_ref() {
+                        let channels = run(&upstream);
+                        let primary = channels
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| passthrough_signal(&upstream, timeline_len, expression));
+                        for (index, values) in channels.into_iter().enumerate() {
+                            let attribute = attributes
+                                .get(index)
+                                .cloned()
+                                .unwrap_or_else(|| format!("outputs:channel_{index}"));
+                            let samples = values
+                                .iter()
+                                .enumerate()
+                                .map(|(bar, value)| (bar as f64, *value))
+                                .collect();
+                            streams.push(ComputedAttributeStream {
+                                prim_path: prim_path.clone(),
+                                attribute,
+                                samples,
+                            });
+                        }
+                        primary
                     } else {
-                        passthrough_signal(&upstream, timeline_len, expression)
-                    };
-                    let samples = values
-                        .iter()
-                        .enumerate()
-                        .map(|(bar, value)| (bar as f64, *value))
-                        .collect();
-                    streams.push(ComputedAttributeStream {
-                        prim_path: prim_path.clone(),
-                        attribute: "outputs:signal".to_string(),
-                        samples,
-                    });
-                    values
+                        let values = if let Some(run) = compiled_fn.as_ref() {
+                            run(&upstream)
+                        } else {
+                            passthrough_signal(&upstream, timeline_len, expression)
+                        };
+                        let attribute = if expression.contains("ta::") || expression.contains("input") {
+                            "outputs:result".to_string()
+                        } else {
+                            "outputs:signal".to_string()
+                        };
+                        let samples = values
+                            .iter()
+                            .enumerate()
+                            .map(|(bar, value)| (bar as f64, *value))
+                            .collect();
+                        streams.push(ComputedAttributeStream {
+                            prim_path: prim_path.clone(),
+                            attribute,
+                            samples,
+                        });
+                        values
+                    }
                 }
                 Some(ExecutionNode::PortfolioSink {
                     method,
@@ -365,10 +434,15 @@ impl fmt::Debug for ExecutionNode {
             Self::SignalTransform {
                 expression,
                 compiled_fn,
+                compiled_multi,
             } => f
                 .debug_struct("SignalTransform")
                 .field("expression", expression)
                 .field("compiled_fn", &compiled_fn.as_ref().map(|_| "<fn>"))
+                .field(
+                    "compiled_multi",
+                    &compiled_multi.as_ref().map(|_| "<multi-fn>"),
+                )
                 .finish(),
             Self::PortfolioSink {
                 method,
@@ -526,6 +600,7 @@ mod tests {
                     ExecutionNode::SignalTransform {
                         expression: String::new(),
                         compiled_fn: None,
+                        compiled_multi: None,
                     },
                 ),
                 (

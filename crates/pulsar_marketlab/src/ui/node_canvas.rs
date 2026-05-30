@@ -11,15 +11,16 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use openusd::sdf::Value;
 
 use crate::graph_compiler::{
-    input_port_kind, output_port_kind, portfolio_signal_port_label, NodeConnection,
-    portfolio_wired_source_count,
-    connection_is_valid, input_port_is_wired, input_port_world_center, node_shows_price_chart,
-    output_port_is_wired, output_port_world_center, portfolio_ensure_spare_input_port,
-    portfolio_resolve_input_port,
-    NodeGradeType, NodeType, PortWireKind, VisualNode, CONNECTION_STROKE_WIDTH, MAX_ZOOM, MIN_ZOOM,
-    NODE_CHART_HEIGHT, NODE_WIDTH,
-    WIRE_PORT_HIT_RADIUS, ZOOM_WHEEL_SENSITIVITY,
+    apply_canonical_ta_ports, effective_otl_script, input_port_kind, output_port_kind,
+    portfolio_signal_port_label, sync_otl_shader_ports_from_script, NodeConnection,
+    portfolio_wired_source_count, connection_is_valid, input_port_is_wired, input_port_world_center,
+    node_shows_price_chart, output_port_is_wired, output_port_world_center,
+    portfolio_ensure_spare_input_port, portfolio_resolve_input_port, NodeGradeType, NodeType,
+    OtlStdlibPreset, OTL_STDLIB_PRESETS, PortWireKind, VisualNode, CONNECTION_STROKE_WIDTH,
+    MAX_ZOOM, MIN_ZOOM, NODE_CHART_HEIGHT, NODE_WIDTH, WIRE_PORT_HIT_RADIUS, ZOOM_WHEEL_SENSITIVITY,
 };
+use crate::ui::ta_uber_inspector::{archetype_summary, ta_header_tint};
+use pulsar_marketlab_core::{node_display_name, parse_script_scalar_uniforms, TaArchetype, TaUberSignalConfig};
 use pulsar_marketlab_ui::workspace::{
     blender_slot_position, paint_dcc_canvas_grid, paint_socket_dot, socket_pin, NodeCanvasPane,
     SocketWireKind, DCC_BORDER, DCC_CANVAS_BACKPLATE, DCC_CAPSULE_HEIGHT,
@@ -27,9 +28,6 @@ use pulsar_marketlab_ui::workspace::{
     DCC_NODE_SELECTED, DCC_TEXT_PRIMARY, NODE_SELECTION_HALO,
 };
 use pulsar_marketlab_ui::{node_dropdown_trigger, NodeNumberInput};
-use pulsar_marketlab::technical_analysis::{
-    ta_indicator_label, TA_SIDEBAR_ALGORITHMS, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK,
-};
 use crate::workspace_state::{
     parse_chart_date_ordinal, ChartHistoryBuffer, CHART_Y_MIN_SPAN, CHART_Y_PADDING_RATIO,
     format_percent_signed, format_ratio,
@@ -287,7 +285,7 @@ impl TradingSystemWorkspace {
         self.nodes.iter().map(|node| node.id).max().unwrap_or(0) + 1
     }
 
-    fn spawn_technical_analysis_node(&mut self, cx: &mut Context<Self>) {
+    fn spawn_ta_uber_archetype(&mut self, archetype: TaArchetype, cx: &mut Context<Self>) {
         let Some(menu_pos) = self.context_menu_pos else {
             return;
         };
@@ -296,21 +294,20 @@ impl TradingSystemWorkspace {
         let ta_index = self
             .nodes
             .iter()
-            .filter(|node| node.node_type.is_otl_shader())
+            .filter(|node| node.node_type.is_ta_uber_signal())
             .count();
         let (column_x, _) = blender_slot_position(1, ta_index);
         let x = column_x;
         let y: f32 = menu_pos.y.into();
 
-        self.nodes.push(VisualNode {
+        let config = TaUberSignalConfig::new(archetype);
+        let name = node_display_name(&config);
+
+        let mut node = VisualNode {
             id: node_id,
-            name: ta_indicator_label(DEFAULT_TA_INDICATOR_ID)
-                .unwrap_or("RSI")
-                .to_string(),
-            node_type: NodeType::otl_shader(String::new()),
+            name,
+            node_type: NodeType::ta_uber_signal(config),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: Some(DEFAULT_TA_INDICATOR_ID.to_string()),
-            ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -318,11 +315,55 @@ impl TradingSystemWorkspace {
             x,
             y,
             collapsed: false,
-            inputs: vec!["Price In".to_string()],
-            outputs: vec!["TA Out".to_string()],
-        });
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        apply_canonical_ta_ports(&mut node);
+        self.nodes.push(node);
         self.selected_node_id = Some(node_id);
-        self.sync_ta_inspector_category_from_selection();
+        self.context_menu_pos = None;
+        self.sync_pipeline_graph(cx);
+        self.invalidate_playhead_evaluation_cache();
+        cx.notify();
+    }
+
+    fn spawn_otl_stdlib_preset(&mut self, preset: &OtlStdlibPreset, cx: &mut Context<Self>) {
+        let Some(menu_pos) = self.context_menu_pos else {
+            return;
+        };
+
+        let node_id = self.next_node_id();
+        let shader_index = self
+            .nodes
+            .iter()
+            .filter(|node| node.node_type.is_otl_shader())
+            .count();
+        let (column_x, _) = blender_slot_position(1, shader_index);
+        let x = column_x;
+        let y: f32 = menu_pos.y.into();
+
+        let mut node = VisualNode {
+            id: node_id,
+            name: preset.display_name.to_string(),
+            node_type: NodeType::otl_shader(preset.default_script),
+            grade: NodeGradeType::Scalar,
+            portfolio_allocation_id: None,
+            dsl_formula: None,
+            aov_outputs: Vec::new(),
+            asset_source: None,
+            x,
+            y,
+            collapsed: false,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        let _ = sync_otl_shader_ports_from_script(
+            &mut node,
+            preset.default_script,
+            &mut self.connections,
+        );
+        self.nodes.push(node);
+        self.selected_node_id = Some(node_id);
         self.context_menu_pos = None;
         self.sync_pipeline_graph(cx);
         self.invalidate_playhead_evaluation_cache();
@@ -349,8 +390,6 @@ impl TradingSystemWorkspace {
             name: "CSV Asset".to_string(),
             node_type: NodeType::asset_adaptor_from_label("CSV Asset"),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             portfolio_allocation_id: None,
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -391,8 +430,6 @@ impl TradingSystemWorkspace {
             name: format!("Sim Portfolio {}", portfolio_index + 1),
             node_type: NodeType::portfolio(),
             grade: NodeGradeType::Scalar,
-            ta_indicator_id: None,
-            ta_lookback_period: DEFAULT_TA_LOOKBACK as u32,
             portfolio_allocation_id: Some("Allocation::HierarchicalRiskParity".to_string()),
             dsl_formula: None,
             aov_outputs: Vec::new(),
@@ -468,7 +505,7 @@ impl TradingSystemWorkspace {
             .nodes
             .iter()
             .find(|node| node.id == from_node_id)
-            .is_some_and(|node| node.node_type.is_otl_shader());
+            .is_some_and(|node| node.node_type.is_ta_uber_signal());
 
         self.connections.retain(|connection| {
             !(connection.to_node_id == to_node_id && connection.to_port_idx == to_port_idx)
@@ -1127,9 +1164,14 @@ impl TradingSystemWorkspace {
                 .map(|path| selected_path.as_deref() == Some(path))
                 .unwrap_or_else(|| self.selected_node_id == Some(node.id));
             let tier_accent = match &node.node_type {
+                NodeType::TaUberSignal { config } => rgb(config.archetype.accent_rgb()),
                 NodeType::OtlShader { .. } => rgb(0x9b87f5),
                 NodeType::TerminalIntegrator { .. } => rgb(0x5eead4),
                 NodeType::AssetAdaptor { .. } => rgb(0xd4a054),
+            };
+            let header_bg = match &node.node_type {
+                NodeType::TaUberSignal { config } => rgb(ta_header_tint(config.archetype)),
+                _ => rgb(DCC_HEADER_ACTIVE),
             };
             let hull_color = rgb(DCC_NODE_HULL);
             let border_color = if is_selected {
@@ -1156,6 +1198,9 @@ impl TradingSystemWorkspace {
                         .when(is_selected, |this| this.border_2())
                         .when(!is_selected, |this| this.border_1())
                         .border_color(border_color)
+                        .when(node.node_type.is_ta_uber_signal(), |pill| {
+                            pill.border_l_2().border_color(tier_accent)
+                        })
                         .rounded_full()
                         .cursor_move()
                         .on_mouse_down(
@@ -1298,7 +1343,7 @@ impl TradingSystemWorkspace {
                 .child(
                     div()
                         .id(("node-header", node_id))
-                        .bg(rgb(DCC_HEADER_ACTIVE))
+                        .bg(header_bg)
                         .p_2()
                         .flex()
                         .items_center()
@@ -1337,89 +1382,76 @@ impl TradingSystemWorkspace {
                         .child(format!("Grade Space: {:?}", node.grade)),
                 );
 
-            if node.node_type.is_otl_shader() {
-                let indicator_id = node
-                    .ta_indicator_id
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_TA_INDICATOR_ID.to_string());
-                let indicator_label = ta_indicator_label(&indicator_id)
-                    .unwrap_or(indicator_id.as_str())
-                    .to_string();
-                let prim_path = node_prim_path.clone().unwrap_or_default();
-                let lookback_input = self
-                    .node_lookback_inputs
-                    .get(&node_id)
-                    .cloned();
-                let host_view = view.clone();
-                let mut inline_controls = div()
-                    .px_2()
-                    .pb_2()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(8.0))
-                            .text_color(rgb(0x8e8e93))
-                            .child("Indicator"),
-                    )
-                    .child(
-                        node_dropdown_trigger(("node-indicator", node_id), indicator_label, cx)
-                            .dropdown_menu(move |menu, _, _| {
-                                TA_SIDEBAR_ALGORITHMS.iter().fold(menu, |menu, (id, label)| {
-                                    let id = (*id).to_string();
-                                    let prim_path = prim_path.clone();
-                                    let view = host_view.clone();
-                                    menu.item(
-                                        PopupMenuItem::new(*label).on_click(move |_, _, cx| {
-                                            let id = id.clone();
-                                            let prim_path = prim_path.clone();
-                                            let view_for_defer = view.clone();
-                                            view.update(cx, |ws, cx| {
-                                                if let Some(node) =
-                                                    ws.nodes.iter_mut().find(|n| n.id == node_id)
-                                                {
-                                                    node.ta_indicator_id = Some(id.clone());
-                                                    node.name = ta_indicator_label(&id)
-                                                        .unwrap_or(&id)
-                                                        .to_string();
-                                                }
-                                                ws.invalidate_playhead_evaluation_cache();
-                                                let workspace_context =
-                                                    ws.workspace_context.clone();
-                                                cx.defer(move |cx| {
-                                                    if !prim_path.is_empty() {
-                                                        workspace_context.update(cx, |ctx, cx| {
-                                                            ctx.modify_attribute(
-                                                                &prim_path,
-                                                                "inputs:id",
-                                                                Value::String(id.clone()),
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                    view_for_defer.update(cx, |ws, cx| {
-                                                        ws.sync_pipeline_graph(cx);
-                                                        cx.notify();
-                                                    });
-                                                });
-                                                cx.notify();
-                                            });
-                                        }),
-                                    )
-                                })
-                            }),
-                    );
-                if let Some(input) = lookback_input {
-                    inline_controls = inline_controls
-                        .child(
+            if let Some(config) = node.node_type.ta_uber_config() {
+                node_card = node_card.child(
+                    div()
+                        .px_2()
+                        .pb_2()
+                        .text_size(px(8.0))
+                        .font_family("monospace")
+                        .text_color(rgb(0x8e8e93))
+                        .child(archetype_summary(config)),
+                );
+            } else if node.node_type.is_otl_shader() {
+                if let Some(script) = effective_otl_script(&node) {
+                    let uniforms = parse_script_scalar_uniforms(script);
+                    if !uniforms.is_empty() {
+                        let mut param_panel = div().px_2().pb_2().flex_col().gap_1();
+                        param_panel = param_panel.child(
                             div()
                                 .text_size(px(8.0))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(0x8e8e93))
-                                .child("Lookback"),
-                        )
-                        .child(NodeNumberInput::new(&input));
+                                .child("Parameters"),
+                        );
+                        for param in uniforms {
+                            let param_key = TradingSystemWorkspace::otl_shader_param_input_key(
+                                node_id, &param.name,
+                            );
+                            let ty_label = match param.ty {
+                                pulsar_marketlab_core::OslParamType::Int => "int",
+                                pulsar_marketlab_core::OslParamType::Float => "float",
+                                pulsar_marketlab_core::OslParamType::String => "string",
+                            };
+                            let mut row = div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_size(px(8.0))
+                                                .text_color(rgb(0xaeaeb2))
+                                                .child(param.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(7.0))
+                                                .text_color(rgb(0x636366))
+                                                .child(ty_label.to_string()),
+                                        ),
+                                );
+                            if let Some(input) = self.otl_shader_param_inputs.get(&param_key) {
+                                let integer = matches!(
+                                    param.ty,
+                                    pulsar_marketlab_core::OslParamType::Int
+                                );
+                                row = row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .w(px(112.0))
+                                        .child(NodeNumberInput::new(input).integer(integer)),
+                                );
+                            }
+                            param_panel = param_panel.child(row);
+                        }
+                        node_card = node_card.child(param_panel);
+                    }
                 }
-                node_card = node_card.child(inline_controls);
             }
 
             if node.node_type.is_portfolio() {
@@ -1652,7 +1684,7 @@ impl TradingSystemWorkspace {
             let view = view.clone();
             move |menu, _window, _cx| {
                 let view = view.clone();
-                menu
+                let mut menu = menu
                     .item(
                         PopupMenuItem::new("Spawn Asset Node").on_click({
                             let view = view.clone();
@@ -1663,16 +1695,64 @@ impl TradingSystemWorkspace {
                             }
                         }),
                     )
+                    .item(PopupMenuItem::separator())
                     .item(
-                        PopupMenuItem::new("Spawn TA Node").on_click({
+                        PopupMenuItem::new(TaArchetype::Trend.spawn_menu_label()).on_click({
                             let view = view.clone();
                             move |_, _, cx| {
                                 view.update(cx, |this, cx| {
-                                    this.spawn_technical_analysis_node(cx);
+                                    this.spawn_ta_uber_archetype(TaArchetype::Trend, cx);
                                 });
                             }
                         }),
                     )
+                    .item(
+                        PopupMenuItem::new(TaArchetype::Volatility.spawn_menu_label()).on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_ta_uber_archetype(TaArchetype::Volatility, cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(TaArchetype::Oscillator.spawn_menu_label()).on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_ta_uber_archetype(TaArchetype::Oscillator, cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(TaArchetype::Channel.spawn_menu_label()).on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_ta_uber_archetype(TaArchetype::Channel, cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(PopupMenuItem::separator());
+
+                for preset in OTL_STDLIB_PRESETS {
+                    let preset = *preset;
+                    menu = menu.item(
+                        PopupMenuItem::new(preset.menu_label).on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.spawn_otl_stdlib_preset(&preset, cx);
+                                });
+                            }
+                        }),
+                    );
+                }
+
+                menu.item(PopupMenuItem::separator())
                     .item(
                         PopupMenuItem::new("Spawn Portfolio Node").on_click({
                             let view = view.clone();

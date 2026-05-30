@@ -1,13 +1,22 @@
 //! Graph configuration, shared snapshots, and DAG compilation.
 
+mod otl_stdlib_catalog;
 mod registry;
 
 #[cfg(test)]
 mod tests;
 
+pub use otl_stdlib_catalog::{OtlStdlibPreset, OTL_STDLIB_PRESETS};
 pub use registry::{
-    connection_is_valid, effective_otl_script, input_port_kind, output_port_kind,
-    sync_otl_shader_aov_ports, validate_graph_wiring, NodeType, PortWireKind, WireValidationError,
+    apply_canonical_ta_ports, connection_is_valid, effective_otl_script, input_port_kind,
+    output_port_kind, otl_script_context, resolved_otl_script, sync_otl_shader_aov_ports,
+    apply_compiled_otc_asset_to_node, sync_otl_shader_ports_from_manifest,
+    sync_otl_shader_ports_from_script, ta_uber_from_legacy_indicator, validate_graph_wiring,
+    validated_connections, NodeType, PortWireKind, WireValidationError,
+};
+pub use pulsar_marketlab_core::{
+    algorithm_display_label, hyperparameter_visibility, node_display_name, TaArchetype,
+    TaHyperparamVisibility, TaUberSignalConfig,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use pulsar_marketlab::execution_engine::ExecutionGraph;
 use pulsar_marketlab::signal_dsl::evaluate_formula;
 use pulsar_marketlab::technical_analysis::{
-    clamp_ta_lookback, compute_ta_latest_with_params, MarketSeriesWindow,
+    clamp_ta_lookback, MarketSeriesWindow,
 };
 
 pub(crate) fn is_price_source_node(node: &VisualNode) -> bool {
@@ -78,7 +87,7 @@ pub fn portfolio_wired_ta_node_ids(graph: &PipelineGraphSnapshot) -> HashSet<usi
                 .nodes
                 .iter()
                 .find(|node| node.id == connection.from_node_id)?;
-            if from_node.node_type.is_otl_shader() {
+            if from_node.node_type.is_ta_uber_signal() {
                 Some(from_node.id)
             } else {
                 None
@@ -264,6 +273,8 @@ pub const NODE_CHART_HEIGHT: f32 = 52.0;
 pub(crate) const NODE_WIDTH: f32 = 220.0;
 pub(crate) const NODE_HEADER_HEIGHT: f32 = 36.0;
 const NODE_GRADE_HEIGHT: f32 = 32.0;
+const NODE_OTL_PARAM_ROW_HEIGHT: f32 = 26.0;
+const NODE_OTL_PARAM_HEADER_HEIGHT: f32 = 18.0;
 pub(crate) const NODE_TA_LABEL_HEIGHT: f32 = 20.0;
 pub(crate) const NODE_PORTFOLIO_METRICS_HEIGHT: f32 = 72.0;
 pub(crate) const NODE_PORTS_PADDING: f32 = 8.0;
@@ -294,10 +305,6 @@ pub struct VisualNode {
     pub name: String,
     pub node_type: NodeType,
     pub grade: NodeGradeType,
-    /// VectorTA indicator id from the registry (e.g. `rsi`, `macd`, `alma`).
-    pub ta_indicator_id: Option<String>,
-    /// Lookback period passed to VectorTA `period` param (sidebar slider).
-    pub ta_lookback_period: u32,
     /// Portfolio allocation strategy token (`inputs:id` on portfolio prims).
     pub portfolio_allocation_id: Option<String>,
     /// OSL-inspired formula evaluated against the upstream market window when set.
@@ -385,18 +392,48 @@ pub(crate) fn portfolio_wired_source_count(connections: &[NodeConnection], portf
 }
 
 pub(crate) fn ta_lookback_for_node(node: &VisualNode) -> usize {
-    clamp_ta_lookback(node.ta_lookback_period as usize)
+    let period = node
+        .overlay_period()
+        .unwrap_or(14) as usize;
+    clamp_ta_lookback(period)
 }
 
 pub fn ta_compute_for_node(node: &VisualNode, window: &MarketSeriesWindow) -> Option<f64> {
-    let lookback = ta_lookback_for_node(node);
-    if let Some(formula) = effective_otl_script(node) {
-        return evaluate_formula(formula, window, lookback)
-            .ok()
-            .map(f64::from);
+    if !node.node_type.is_executable_signal() {
+        return None;
     }
-    let indicator_id = node.ta_indicator_id.as_deref()?;
-    compute_ta_latest_with_params(indicator_id, window, lookback)
+    let lookback = ta_lookback_for_node(node);
+    let script = resolved_otl_script(node);
+    evaluate_formula(&script, window, lookback)
+        .ok()
+        .map(f64::from)
+}
+
+impl VisualNode {
+    /// Active algorithm id from `TaUberSignalConfig` (chart / engine overlay vocabulary).
+    pub fn overlay_algorithm(&self) -> Option<&str> {
+        self.node_type
+            .ta_uber_config()
+            .map(|config| config.algorithm.as_str())
+    }
+
+    /// Hyperparameter period from `TaUberSignalConfig`.
+    pub fn overlay_period(&self) -> Option<u32> {
+        self.node_type.ta_uber_config().map(|config| config.period)
+    }
+
+    pub fn set_overlay_algorithm(&mut self, algorithm: impl Into<String>) {
+        if let Some(config) = self.node_type.ta_uber_config_mut() {
+            config.algorithm = algorithm.into();
+            config.normalize_algorithm();
+        }
+    }
+
+    pub fn set_overlay_period(&mut self, period: u32) {
+        if let Some(config) = self.node_type.ta_uber_config_mut() {
+            config.period = period.max(1);
+        }
+    }
 }
 
 pub const NODE_SPAWN_STAGGER_X: f32 = 260.0;
@@ -408,8 +445,16 @@ pub(crate) fn node_shows_price_chart(node: &VisualNode) -> bool {
 
 pub(crate) fn node_body_height_world(node: &VisualNode, include_chart: bool) -> f32 {
     let mut height = NODE_HEADER_HEIGHT + NODE_GRADE_HEIGHT;
-    if node.node_type.is_otl_shader() {
+    if node.node_type.is_ta_uber_signal() {
         height += NODE_TA_LABEL_HEIGHT;
+    }
+    if node.node_type.is_otl_shader() {
+        if let Some(script) = effective_otl_script(node) {
+            let uniform_count = pulsar_marketlab_core::parse_script_scalar_uniforms(script).len();
+            if uniform_count > 0 {
+                height += NODE_OTL_PARAM_HEADER_HEIGHT + uniform_count as f32 * NODE_OTL_PARAM_ROW_HEIGHT;
+            }
+        }
     }
     if node.node_type.is_portfolio() {
         height += NODE_PORTFOLIO_METRICS_HEIGHT;

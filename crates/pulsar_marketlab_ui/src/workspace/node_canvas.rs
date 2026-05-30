@@ -307,7 +307,7 @@ pub fn compile_relationship_directive(
 /// Infer the execution slot from the downstream prim's composed schema type.
 pub fn execution_slot_for_target_type(type_name: &str) -> Option<ExecutionSlotKind> {
     match type_name {
-        "OtlOperator" => Some(ExecutionSlotKind::UnderlyingInput),
+        "OtlOperator" | "OtlTaUberSignal" => Some(ExecutionSlotKind::UnderlyingInput),
         "PortfolioIntegrator" => Some(ExecutionSlotKind::SignalInput),
         _ => None,
     }
