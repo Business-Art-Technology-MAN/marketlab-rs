@@ -1537,23 +1537,20 @@ impl TradingSystemWorkspace {
                             }),
                         ),
                 );
-                let node_metrics = self.portfolio_diagnostics_for_node(node_id);
+                let node_metrics = cx
+                    .global::<crate::ui::telemetry_bridge::MetricsTelemetryBridge>()
+                    .metrics_for_node(node_id)
+                    .cloned()
+                    .or_else(|| {
+                        self.portfolio_diagnostics_for_node(node_id)
+                            .map(crate::ui::telemetry_bridge::EvaluatedMetrics::from)
+                    });
                 if let Some(metrics) = node_metrics {
-                    let return_color = if metrics.total_return_pct >= 0.0 {
+                    let return_color = if metrics.total_return >= 0.0 {
                         rgb(0x10b981)
                     } else {
                         rgb(0xf87171)
                     };
-                    let alpha_color = metrics
-                        .excess_return_pct
-                        .map(|alpha| {
-                            if alpha >= 0.0 {
-                                rgb(0x10b981)
-                            } else {
-                                rgb(0xf87171)
-                            }
-                        })
-                        .unwrap_or(rgb(0x64748b));
                     node_card = node_card.child(
                         div()
                             .px_2()
@@ -1566,8 +1563,8 @@ impl TradingSystemWorkspace {
                                 div()
                                     .text_color(rgb(0x64748b))
                                     .child(format!(
-                                        "{wired_count} source(s) · {} trades · {} bars",
-                                        metrics.trade_count, metrics.bars_processed
+                                        "{wired_count} source(s) · {} trades · live GE",
+                                        metrics.trailing_trades_count
                                     )),
                             )
                             .child(
@@ -1575,27 +1572,24 @@ impl TradingSystemWorkspace {
                                     .text_color(return_color)
                                     .child(format!(
                                         "R_total {}",
-                                        format_percent_signed(metrics.total_return_pct)
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(alpha_color)
-                                    .child(format!(
-                                        "α vs B&H {}",
-                                        metrics
-                                            .excess_return_pct
-                                            .map(format_percent_signed)
-                                            .unwrap_or_else(|| "—".to_string())
+                                        format_percent_signed(metrics.total_return)
                                     )),
                             )
                             .child(
                                 div()
                                     .text_color(rgb(0x94a3b8))
                                     .child(format!(
-                                        "Exp {:.0}% · Sharpe {}",
-                                        metrics.avg_exposure_pct * 100.0,
-                                        format_ratio(metrics.sharpe_ratio)
+                                        "Exp {:.0}% · Conv {:.2}",
+                                        metrics.net_exposure * 100.0,
+                                        metrics.current_conviction
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!(
+                                        "MDD {}",
+                                        format_percent_signed(-metrics.rolling_drawdown)
                                     )),
                             ),
                     );

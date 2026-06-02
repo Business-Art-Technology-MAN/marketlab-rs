@@ -428,6 +428,10 @@ impl TradingSystemWorkspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let bridge_metrics = cx
+            .global::<crate::ui::telemetry_bridge::MetricsTelemetryBridge>()
+            .global_metrics
+            .clone();
         let metrics = self
             .portfolio_diagnostics_for_selection()
             .or(self.portfolio_diagnostics.as_ref());
@@ -449,6 +453,27 @@ impl TradingSystemWorkspace {
                     .text_color(rgb(0x71717a))
                     .child(graph_status),
             )
+            .when(self.graph_engine_analytics_active(), |panel| {
+                panel.child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(0x101014))
+                        .border_1()
+                        .border_color(rgb(0x222227))
+                        .text_size(px(10.0))
+                        .font_family("monospace")
+                        .text_color(rgb(0xcbd5e1))
+                        .child(format!(
+                            "Live GraphEngine · R {} · MDD {} · Exp {:.0}% · {} trades · conv {:.2}",
+                            format_percent_signed(bridge_metrics.total_return),
+                            format_percent_signed(-bridge_metrics.rolling_drawdown),
+                            bridge_metrics.net_exposure * 100.0,
+                            bridge_metrics.trailing_trades_count,
+                            bridge_metrics.current_conviction,
+                        )),
+                )
+            })
             .when(!wired_sources.is_empty(), |panel| {
                 panel.child(
                     div()

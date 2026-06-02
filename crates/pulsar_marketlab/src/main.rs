@@ -11,6 +11,8 @@ use gpui_component::Root;
 use gpui_component::{Theme, ThemeMode};
 use pulsar_marketlab::fix_engine::{spawn_mock_fix_bridge, FixPlayheadClock};
 
+use ui::telemetry_bridge::MetricsTelemetryBridge;
+
 mod asset_path_input;
 mod canvas_compose;
 mod canvas_hydrate;
@@ -281,6 +283,7 @@ fn main() {
 
     Application::new().with_assets(NoAssets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        MetricsTelemetryBridge::set_global(cx, MetricsTelemetryBridge::default());
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {

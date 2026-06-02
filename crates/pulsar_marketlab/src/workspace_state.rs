@@ -1422,6 +1422,8 @@ pub struct TradingSystemWorkspace {
     pub(crate) session_autosave: SessionAutosaveHandle,
     /// Monotonic revision bumped on graph mutations for autosave coalescing.
     pub(crate) session_autosave_revision: u64,
+    /// Graph-engine metrics cache needs publishing to [`MetricsTelemetryBridge`].
+    pub(crate) metrics_telemetry_dirty: bool,
 }
 
 fn blank_usd_stage_bridge() -> UsdStageBridge {
@@ -1551,6 +1553,7 @@ impl TradingSystemWorkspace {
             portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles::with_defaults(),
             session_autosave: SessionAutosaveHandle::new(),
             session_autosave_revision: 0,
+            metrics_telemetry_dirty: false,
         };
 
         workspace.sync_playhead_bounds();
@@ -1883,6 +1886,41 @@ impl TradingSystemWorkspace {
             );
             self.portfolio_diagnostics_cache
                 .insert(prim_path.clone(), snapshot);
+        }
+        self.metrics_telemetry_dirty = true;
+    }
+
+    pub(crate) fn publish_metrics_telemetry_bridge(&mut self, cx: &mut Context<Self>) {
+        use crate::ui::telemetry_bridge::{publish_metrics_telemetry, MetricsTelemetryBridge};
+
+        if !self.graph_engine_analytics_active() {
+            MetricsTelemetryBridge::update_global(cx, |bridge, _| bridge.reset());
+            self.metrics_telemetry_dirty = false;
+            return;
+        }
+
+        let playhead = self
+            .playhead_current
+            .min(self.playhead_total_bars.saturating_sub(1));
+        let nodes = self.nodes.clone();
+        let portfolio_results = self.graph_engine_portfolio_results.clone();
+        let diagnostics = self.portfolio_diagnostics_cache.clone();
+        let selected_node_id = self.selected_node_id;
+        publish_metrics_telemetry(
+            cx,
+            &nodes,
+            &portfolio_results,
+            &diagnostics,
+            playhead,
+            |node| self.stage_prim_path_for_node_in_graph(node),
+            selected_node_id,
+        );
+        self.metrics_telemetry_dirty = false;
+    }
+
+    pub(crate) fn flush_metrics_telemetry_if_dirty(&mut self, cx: &mut Context<Self>) {
+        if self.metrics_telemetry_dirty {
+            self.publish_metrics_telemetry_bridge(cx);
         }
     }
 
@@ -2499,6 +2537,7 @@ impl TradingSystemWorkspace {
                         .cloned()
                 });
             self.last_calculated_state = (self.playhead_time, graph_revision);
+            self.metrics_telemetry_dirty = true;
             return;
         }
 
@@ -2574,6 +2613,7 @@ impl TradingSystemWorkspace {
                                         .next()
                                         .cloned()
                                 });
+                            workspace.metrics_telemetry_dirty = true;
                         } else {
                             workspace.portfolio_diagnostics = evaluated.2;
                         }

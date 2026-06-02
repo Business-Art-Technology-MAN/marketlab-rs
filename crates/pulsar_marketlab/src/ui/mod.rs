@@ -9,6 +9,7 @@ mod sidebar_inspector;
 mod ta_uber_inspector;
 mod split_layout;
 mod stage_composer;
+pub mod telemetry_bridge;
 
 use gpui::*;
 
@@ -208,6 +209,7 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
 
         self.refresh_portfolio_wealth_chart_cache(&result);
         self.refresh_portfolio_diagnostics_cache();
+        self.publish_metrics_telemetry_bridge(cx);
         self.synchronize_inspector_view();
         self.invalidate_playhead_evaluation_cache();
         self.spawn_playhead_evaluation_async(cx);
@@ -216,6 +218,7 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
 
 impl Render for TradingSystemWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flush_metrics_telemetry_if_dirty(cx);
         if !self.node_lookback_inputs_ready {
             cx.defer_in(window, |this, window, cx| {
                 this.ensure_node_lookback_inputs(window, cx);

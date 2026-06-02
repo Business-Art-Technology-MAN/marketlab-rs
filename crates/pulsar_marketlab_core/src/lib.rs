@@ -22,7 +22,7 @@ pub use orchestration::{
     OslParameter, ScriptCompileContext, ScriptSignature, GraphCompileWire, GraphEngineError,
     MultiSeriesClosure, OtlScriptContext, MarketLabGraphEngine, PortfolioIntegrationResult,
     PortfolioTrackingFrame, SeriesClosure, SignalTransformFn, StageGraphPrim, StageGraphSnapshot,
-    SymbolicOtlClosure, TimelineExecutionResult, Token,
+    SymbolicOtlClosure, TimelineExecutionResult, Token, ClosureLegKind, DirectionalDistribution,
 };
 pub use ta_uber_signal::{
     algorithm_display_label, compose_uber_script_src, hyperparameter_visibility,
