@@ -19,6 +19,7 @@ mod ohlc_chart_pane;
 mod portfolio_analytics;
 mod portfolio_integrator_ledger;
 mod portfolio_wealth_chart;
+mod session_autosave;
 mod ui;
 mod workspace_state;
 

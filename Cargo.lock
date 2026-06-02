@@ -4493,6 +4493,7 @@ name = "pulsar_marketlab_core"
 version = "0.1.0"
 dependencies = [
  "petgraph",
+ "serde",
  "thiserror 1.0.69",
 ]
 

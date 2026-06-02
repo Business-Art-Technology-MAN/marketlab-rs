@@ -54,6 +54,7 @@ impl TradingSystemWorkspace {
             }
         }
         cx.notify();
+        self.schedule_session_autosave();
     }
 
     pub(crate) fn load_usd_document(
@@ -101,6 +102,7 @@ impl TradingSystemWorkspace {
         self.invalidate_playhead_evaluation_cache();
         self.spawn_playhead_evaluation_async(cx);
         cx.notify();
+        self.schedule_session_autosave();
     }
 }
 

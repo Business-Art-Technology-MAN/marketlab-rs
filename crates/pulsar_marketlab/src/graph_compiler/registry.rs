@@ -1,5 +1,7 @@
 //! Three-tiered node registry taxonomy and port wiring validation.
 
+use serde::{Deserialize, Serialize};
+
 use pulsar_marketlab_core::{
     display_name_for_script, infer_archetype_from_algorithm, load_compiled_asset_from_path,
     parse_script_signature, resolve_otl_script_src, ScriptSignature, TaArchetype,
@@ -9,7 +11,7 @@ use pulsar_marketlab_core::{
 use super::{NodeConnection, PipelineGraphSnapshot, VisualNode};
 
 /// Explicit architectural tier for each canvas node.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeType {
     /// Tier 1: non-executable OpenUSD structural adaptor (prim or layer path).
     AssetAdaptor { prim_path: String },

@@ -28,6 +28,9 @@ use pulsar_marketlab::trading_stage::{
 };
 use pulsar_marketlab::stage_bridge::usd_spike::UsdStageBridge;
 use crate::canvas_compose::{blank_stage_usda, compose_pipeline_usda};
+use crate::session_autosave::{
+    compose_session_usda, load_session_snapshot, SessionAutosaveHandle, SessionSnapshot,
+};
 use pulsar_marketlab::technical_analysis::{
     build_ta_evaluation_closure, compute_ta_at_playhead_from_stage, ta_indicator_label,
     MarketSeriesWindow,
@@ -1415,10 +1418,30 @@ pub struct TradingSystemWorkspace {
     pub(crate) portfolio_ledger_filter: crate::portfolio_integrator_ledger::IntegratorLedgerFilter,
     /// Overlay toggles for the portfolio analytics wealth chart.
     pub(crate) portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles,
+    /// Debounced background session autosave writer.
+    pub(crate) session_autosave: SessionAutosaveHandle,
+    /// Monotonic revision bumped on graph mutations for autosave coalescing.
+    pub(crate) session_autosave_revision: u64,
 }
 
 fn blank_usd_stage_bridge() -> UsdStageBridge {
     UsdStageBridge::open_from_usda_text(&blank_stage_usda()).expect("blank stage USDA must parse")
+}
+
+fn workspace_tab_token(tab: pulsar_marketlab_ui::workspace::WorkspaceTab) -> String {
+    match tab {
+        pulsar_marketlab_ui::workspace::WorkspaceTab::ParamInspector => {
+            "param_inspector".to_string()
+        }
+        pulsar_marketlab_ui::workspace::WorkspaceTab::OtlEditor => "otl_editor".to_string(),
+    }
+}
+
+fn workspace_tab_from_token(token: &str) -> pulsar_marketlab_ui::workspace::WorkspaceTab {
+    match token {
+        "otl_editor" => pulsar_marketlab_ui::workspace::WorkspaceTab::OtlEditor,
+        _ => pulsar_marketlab_ui::workspace::WorkspaceTab::ParamInspector,
+    }
 }
 
 fn blank_workspace_context() -> pulsar_marketlab_ui::workspace::WorkspaceContext {
@@ -1526,6 +1549,8 @@ impl TradingSystemWorkspace {
             portfolio_ledger_cache: HashMap::new(),
             portfolio_ledger_filter: crate::portfolio_integrator_ledger::IntegratorLedgerFilter::default(),
             portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles::with_defaults(),
+            session_autosave: SessionAutosaveHandle::new(),
+            session_autosave_revision: 0,
         };
 
         workspace.sync_playhead_bounds();
@@ -1575,7 +1600,104 @@ impl TradingSystemWorkspace {
         .detach();
         workspace.sync_workspace_ledger(cx);
         workspace.bootstrapping = false;
+        workspace.restore_session_from_autosave_if_present(cx);
+        cx.on_app_quit(|workspace, cx| {
+            workspace.flush_session_autosave_sync();
+            cx.notify();
+            async {}
+        })
+        .detach();
         workspace
+    }
+
+    pub(crate) fn build_session_snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot::new(
+            self.usd_document_path.clone(),
+            self.nodes.clone(),
+            self.connections.clone(),
+            self.selected_node_id,
+            self.playhead_current,
+            [f32::from(self.pan_offset.x), f32::from(self.pan_offset.y)],
+            self.zoom_scale,
+            self.split_layout.stage_share,
+            self.split_layout.inspector_share,
+            workspace_tab_token(self.active_workspace_tab),
+        )
+    }
+
+    pub(crate) fn schedule_session_autosave(&mut self) {
+        if self.bootstrapping || cfg!(test) {
+            return;
+        }
+        self.session_autosave_revision = self.session_autosave_revision.saturating_add(1);
+        let revision = self.session_autosave_revision;
+        let snapshot = self.build_session_snapshot();
+        let usda = compose_session_usda(&snapshot.nodes, &snapshot.connections);
+        self.session_autosave.schedule(revision, snapshot, usda);
+    }
+
+    pub(crate) fn flush_session_autosave_sync(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        let snapshot = self.build_session_snapshot();
+        let usda = compose_session_usda(&snapshot.nodes, &snapshot.connections);
+        if let Err(error) = self.session_autosave.flush_sync(snapshot, &usda) {
+            self.push_status_log(format!(
+                "Session autosave flush failed ({}): {error}",
+                self.session_autosave.dir().display()
+            ));
+        }
+    }
+
+    pub(crate) fn restore_session_from_autosave_if_present(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let dir = self.session_autosave.dir().to_path_buf();
+        let Ok(Some(snapshot)) = load_session_snapshot(&dir) else {
+            return;
+        };
+        if snapshot.nodes.is_empty() && snapshot.connections.is_empty() {
+            return;
+        }
+
+        self.bootstrapping = true;
+        self.nodes = snapshot.nodes;
+        self.connections = snapshot.connections;
+        self.selected_node_id = snapshot.selected_node_id;
+        self.playhead_current = snapshot.playhead_current;
+        self.pan_offset = point(px(snapshot.pan_offset[0]), px(snapshot.pan_offset[1]));
+        self.zoom_scale = snapshot.zoom_scale;
+        self.split_layout = pulsar_marketlab_ui::workspace::WorkstationSplitLayout {
+            stage_share: snapshot.stage_share,
+            inspector_share: snapshot.inspector_share,
+        }
+        .clamp();
+        self.active_workspace_tab = workspace_tab_from_token(&snapshot.active_workspace_tab);
+        self.usd_document_path = snapshot
+            .usd_document_path
+            .map(PathBuf::from);
+
+        self.node_lookback_inputs.clear();
+        self.node_lookback_inputs_ready = false;
+        self.csv_path_registry.replace_from_nodes(&self.nodes);
+        self.pipeline_status_log.push(format!(
+            "Restored autosaved session from `{}` ({} nodes, {} wires)",
+            dir.display(),
+            self.nodes.len(),
+            self.connections.len()
+        ));
+
+        self.sync_playhead_bounds();
+        self.sync_playhead_time_from_index();
+        self.sync_pipeline_graph(cx);
+        self.synchronize_inspector_view();
+        self.recompute_playhead_diagnostics();
+        self.invalidate_playhead_evaluation_cache();
+        self.spawn_playhead_evaluation_async(cx);
+        self.bootstrapping = false;
+        cx.notify();
     }
 
     pub(crate) fn sync_usd_bridge_from_workspace_context(&mut self, cx: &mut Context<Self>) {
@@ -2030,6 +2152,7 @@ impl TradingSystemWorkspace {
         self.recompute_playhead_diagnostics();
         self.invalidate_playhead_evaluation_cache();
         cx.notify();
+        self.schedule_session_autosave();
     }
 
     pub(crate) fn sync_pipeline_graph(&mut self, cx: &mut Context<Self>) {
@@ -2136,6 +2259,7 @@ impl TradingSystemWorkspace {
         self.sync_workspace_ledger(cx);
         let entity = cx.entity();
         pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+        self.schedule_session_autosave();
     }
 
     /// Re-run the background timeline sweep after asset OHLC data changes without a full USD recompose.

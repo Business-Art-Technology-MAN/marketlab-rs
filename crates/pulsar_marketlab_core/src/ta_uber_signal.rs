@@ -1,7 +1,9 @@
 //! OTL Uber Signal archetypes: fixed port topology and script composition.
 
+use serde::{Deserialize, Serialize};
+
 /// High-level TA node family (immutable port signatures per variant).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaArchetype {
     Trend,
     Volatility,
@@ -157,7 +159,7 @@ pub fn algorithm_display_label(algorithm: &str) -> String {
 }
 
 /// Typed TA configuration stored on canvas nodes and serialized to USD.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaUberSignalConfig {
     pub archetype: TaArchetype,
     pub algorithm: String,

@@ -27,6 +27,8 @@ pub use pulsar_marketlab_core::{
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use pulsar_marketlab::execution_engine::ExecutionGraph;
 use pulsar_marketlab::signal_dsl::evaluate_formula;
 use pulsar_marketlab::technical_analysis::{
@@ -324,7 +326,7 @@ pub(crate) const MIN_ZOOM: f32 = 0.15;
 pub(crate) const MAX_ZOOM: f32 = 3.0;
 pub(crate) const ZOOM_WHEEL_SENSITIVITY: f32 = 0.002;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub enum NodeGradeType {
     Scalar,
@@ -333,12 +335,12 @@ pub enum NodeGradeType {
 }
 
 /// Polymorphic asset ingestion source bound to a visual pipeline node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AssetSourceType {
     Csv { path: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualNode {
     pub id: usize,
     pub name: String,
@@ -360,7 +362,7 @@ pub struct VisualNode {
     pub outputs: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConnection {
     pub from_node_id: usize,
     pub from_port_idx: usize,
