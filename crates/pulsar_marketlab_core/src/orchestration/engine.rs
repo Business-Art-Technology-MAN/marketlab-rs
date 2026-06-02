@@ -14,6 +14,9 @@ use super::portfolio::{
     PortfolioIntegratorConfig, PortfolioIntegrationResult, PortfolioOtlTransformFn,
     PortfolioTrackingFrame, SymbolicOtlClosure,
 };
+use crate::frontend::{
+    apply_alpha_conviction, conviction_scale_from_signal_series, resolve_runtime_script_source,
+};
 use crate::OtlObjectKind;
 
 /// Thread-safe compiled signal transform closure.
@@ -108,10 +111,11 @@ pub enum GraphEngineError {
     },
 }
 
-/// Symbolic closure extraction context (bar-independent compile phase).
+/// Symbolic closure extraction context (requires asset vectors for live evaluation).
 #[derive(Clone, Debug, Default)]
 pub struct EvaluationContext {
     pub timeline_len: usize,
+    pub asset_vectors: HashMap<String, Vec<f64>>,
 }
 
 /// Compiled USD stage graph with deterministic topological execution order.
@@ -244,36 +248,62 @@ impl MarketLabGraphEngine {
             let Some(node) = self.graph.node_weight_mut(index) else {
                 continue;
             };
-            let ExecutionNode::SignalTransform {
-                expression,
-                compiled_fn,
-                compiled_multi,
-            } = node
-            else {
-                continue;
-            };
 
-            let source = expression.trim();
-            if source.is_empty() {
-                *compiled_fn = Some(Box::new(|input| input.to_vec()));
-                *compiled_multi = None;
-                continue;
-            }
+            match node {
+                ExecutionNode::SignalTransform {
+                    expression,
+                    compiled_fn,
+                    compiled_multi,
+                } => {
+                    let source = expression.trim();
+                    if source.is_empty() {
+                        *compiled_fn = Some(Box::new(|input| input.to_vec()));
+                        *compiled_multi = None;
+                        continue;
+                    }
 
-            match super::script_resolve::compile_unified_script(source).map_err(|err| {
-                GraphEngineError::ScriptCompileError {
-                    path: prim_path.clone(),
-                    message: err.to_string(),
+                    let resolved = resolve_runtime_script_source(source).map_err(|err| {
+                        GraphEngineError::ScriptCompileError {
+                            path: prim_path.clone(),
+                            message: err.to_string(),
+                        }
+                    })?;
+                    let script = resolved.runtime_script.trim();
+                    if script.is_empty() {
+                        *compiled_fn = Some(Box::new(|input| input.to_vec()));
+                        *compiled_multi = None;
+                        continue;
+                    }
+
+                    match super::script_resolve::compile_unified_script(script).map_err(|err| {
+                        GraphEngineError::ScriptCompileError {
+                            path: prim_path.clone(),
+                            message: err.to_string(),
+                        }
+                    })? {
+                        super::compiler::CompiledSeries::Single(closure) => {
+                            *compiled_fn = Some(closure);
+                            *compiled_multi = None;
+                        }
+                        super::compiler::CompiledSeries::Multi(closure, attributes) => {
+                            *compiled_fn = None;
+                            *compiled_multi = Some((closure, attributes));
+                        }
+                    }
                 }
-            })? {
-                super::compiler::CompiledSeries::Single(closure) => {
-                    *compiled_fn = Some(closure);
-                    *compiled_multi = None;
+                ExecutionNode::PortfolioSink { otl_script, .. } => {
+                    if otl_script.trim().is_empty() {
+                        continue;
+                    }
+                    let resolved = resolve_runtime_script_source(otl_script).map_err(|err| {
+                        GraphEngineError::ScriptCompileError {
+                            path: prim_path.clone(),
+                            message: err.to_string(),
+                        }
+                    })?;
+                    *otl_script = resolved.runtime_script;
                 }
-                super::compiler::CompiledSeries::Multi(closure, attributes) => {
-                    *compiled_fn = None;
-                    *compiled_multi = Some((closure, attributes));
-                }
+                _ => {}
             }
         }
         Ok(self)
@@ -346,6 +376,10 @@ impl MarketLabGraphEngine {
         object_kind: OtlObjectKind,
         ctx: &EvaluationContext,
     ) -> Result<Vec<SymbolicOtlClosure>, GraphEngineError> {
+        if ctx.timeline_len == 0 {
+            return Ok(Vec::new());
+        }
+
         let index = self
             .prim_to_index
             .get(prim_path)
@@ -357,18 +391,135 @@ impl MarketLabGraphEngine {
             .node_weight(index)
             .ok_or_else(|| GraphEngineError::UnknownPrimPath(prim_path.to_string()))?;
 
-        let _timeline_len = ctx.timeline_len;
+        let node_outputs = self.simulate_node_outputs(&ctx.asset_vectors, ctx.timeline_len, index)?;
+        let index_to_path: HashMap<NodeIndex, String> = self
+            .prim_to_index
+            .iter()
+            .map(|(path, idx)| (*idx, path.clone()))
+            .collect();
+
         match (object_kind, node) {
-            (OtlObjectKind::Portfolio, ExecutionNode::PortfolioSink { .. }) => Ok(vec![]),
-            (OtlObjectKind::Signal | OtlObjectKind::LegacyShader, ExecutionNode::SignalTransform { .. }) => {
-                Ok(vec![])
+            (OtlObjectKind::Signal | OtlObjectKind::LegacyShader, ExecutionNode::SignalTransform {
+                expression,
+                ..
+            }) => {
+                let output = node_outputs.get(&index).ok_or_else(|| {
+                    GraphEngineError::UnknownPrimPath(prim_path.to_string())
+                })?;
+                let asset_id = infer_upstream_asset_symbol(&self.graph, index, &node_outputs)
+                    .map(|symbol| normalize_asset_quote_key(&symbol))
+                    .unwrap_or_else(|| normalize_asset_quote_key(prim_path));
+                let scale = conviction_scale_from_signal_series(&output.scalar);
+                let weight = apply_alpha_conviction(1.0, expression, scale);
+                Ok(vec![SymbolicOtlClosure {
+                    asset_id,
+                    direction: super::portfolio::DirectionalDistribution::MarketLong,
+                    closure_raw_weight: weight,
+                    signal_series: output.scalar.clone(),
+                    leg_kind: ClosureLegKind::Asset,
+                }])
             }
-            (OtlObjectKind::Allocator, ExecutionNode::PortfolioSink { .. }) => Ok(vec![]),
+            (
+                OtlObjectKind::Portfolio | OtlObjectKind::Allocator,
+                ExecutionNode::PortfolioSink { method, otl_script, .. },
+            ) => {
+                let legs = collect_upstream_legs(&self.graph, index, &node_outputs, &index_to_path);
+                let mut closures = closures_from_upstream_legs(&legs, method);
+                for closure in &mut closures {
+                    let scale = conviction_scale_from_signal_series(&closure.signal_series);
+                    closure.closure_raw_weight =
+                        apply_alpha_conviction(closure.closure_raw_weight, otl_script, scale);
+                }
+                Ok(closures)
+            }
             (kind, _) => Err(GraphEngineError::ObjectKindMismatch {
                 prim_path: prim_path.to_string(),
                 object_kind: kind,
             }),
         }
+    }
+
+    fn simulate_node_outputs(
+        &self,
+        asset_vectors: &HashMap<String, Vec<f64>>,
+        timeline_len: usize,
+        through_index: NodeIndex,
+    ) -> Result<HashMap<NodeIndex, NodeRuntimeOutput>, GraphEngineError> {
+        let index_to_path: HashMap<NodeIndex, String> = self
+            .prim_to_index
+            .iter()
+            .map(|(path, index)| (*index, path.clone()))
+            .collect();
+        let mut node_outputs: HashMap<NodeIndex, NodeRuntimeOutput> = HashMap::new();
+
+        for index in &self.execution_order {
+            let prim_path = index_to_path
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| format!("node_{index:?}"));
+
+            let runtime = match self.graph.node_weight(*index) {
+                Some(ExecutionNode::DataInput { symbol }) => {
+                    let scalar = asset_vectors
+                        .get(symbol)
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; timeline_len])
+                        .into_iter()
+                        .take(timeline_len)
+                        .collect::<Vec<_>>();
+                    NodeRuntimeOutput {
+                        scalar: pad_or_trim(scalar, timeline_len),
+                        asset_symbol: Some(symbol.clone()),
+                    }
+                }
+                Some(ExecutionNode::SignalTransform {
+                    expression,
+                    compiled_fn,
+                    compiled_multi,
+                }) => {
+                    let upstream: Vec<f64> = self
+                        .graph
+                        .neighbors_directed(*index, Direction::Incoming)
+                        .flat_map(|upstream_index| {
+                            node_outputs
+                                .get(&upstream_index)
+                                .map(|output| output.scalar.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let scalar = if let Some((run, _attributes)) = compiled_multi.as_ref() {
+                        run(&upstream)
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| passthrough_signal(&upstream, timeline_len, expression))
+                    } else if let Some(run) = compiled_fn.as_ref() {
+                        run(&upstream)
+                    } else {
+                        passthrough_signal(&upstream, timeline_len, expression)
+                    };
+                    let asset_symbol = infer_upstream_asset_symbol(&self.graph, *index, &node_outputs);
+                    NodeRuntimeOutput {
+                        scalar: pad_or_trim(scalar, timeline_len),
+                        asset_symbol,
+                    }
+                }
+                Some(ExecutionNode::PortfolioSink { .. }) => NodeRuntimeOutput {
+                    scalar: vec![0.0; timeline_len],
+                    asset_symbol: None,
+                },
+                None => NodeRuntimeOutput {
+                    scalar: vec![0.0; timeline_len],
+                    asset_symbol: None,
+                },
+            };
+
+            node_outputs.insert(*index, runtime);
+            if *index == through_index {
+                break;
+            }
+        }
+
+        Ok(node_outputs)
     }
 
     /// Execute compiled closures across `timeline_len` bars using fresh asset vectors.
@@ -507,8 +658,16 @@ impl MarketLabGraphEngine {
                         &node_outputs,
                         &index_to_path,
                     );
-                    let closures =
+                    let mut closures =
                         closures_from_upstream_legs(&legs, method);
+                    for closure in &mut closures {
+                        let scale = conviction_scale_from_signal_series(&closure.signal_series);
+                        closure.closure_raw_weight = apply_alpha_conviction(
+                            closure.closure_raw_weight,
+                            otl_script,
+                            scale,
+                        );
+                    }
                     let config = PortfolioIntegratorConfig {
                         allocation_method: method.clone(),
                         initial_capital: *initial_capital,
@@ -947,5 +1106,30 @@ mod tests {
             .expect("signal stream");
         assert_eq!(signal.samples.len(), 3);
         assert_eq!(signal.samples[1].1, 20.0);
+    }
+
+    #[test]
+    fn evaluate_node_closures_extracts_live_signal_closure() {
+        let mut engine =
+            MarketLabGraphEngine::compile_from_stage(&stage_snapshot()).expect("compile");
+        engine
+            .set_signal_compiled_fn("/analytics/rsi", Box::new(|input| input.to_vec()))
+            .expect("attach closure");
+
+        let ctx = EvaluationContext {
+            timeline_len: 3,
+            asset_vectors: HashMap::from([("SPY".to_string(), vec![10.0, 20.0, 30.0])]),
+        };
+        let closures = engine
+            .evaluate_node_closures(
+                "/analytics/rsi",
+                OtlObjectKind::LegacyShader,
+                &ctx,
+            )
+            .expect("closures");
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].asset_id, "SPY");
+        assert!(closures[0].closure_raw_weight > 0.0);
+        assert_eq!(closures[0].signal_series.len(), 3);
     }
 }

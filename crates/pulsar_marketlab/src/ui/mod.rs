@@ -207,6 +207,7 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
         }
 
         self.refresh_portfolio_wealth_chart_cache(&result);
+        self.refresh_portfolio_diagnostics_cache();
         self.synchronize_inspector_view();
         self.invalidate_playhead_evaluation_cache();
         self.spawn_playhead_evaluation_async(cx);

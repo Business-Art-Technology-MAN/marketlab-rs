@@ -83,4 +83,8 @@ impl OtlProgram {
             .iter()
             .find(|object| object.name.eq_ignore_ascii_case(name))
     }
+
+    pub fn primary_object(&self) -> Option<&OtlObjectDeclaration> {
+        self.objects.first()
+    }
 }

@@ -1,5 +1,6 @@
 //! OTL three-tier object frontend (`signal`, `allocator`, `portfolio`).
 
+mod codegen;
 mod ast;
 mod lexer;
 mod parser;
@@ -8,6 +9,10 @@ mod validate;
 pub use ast::{
     OtlObjectDeclaration, OtlObjectKind, OtlProgram, OtlType, PortDirection, PropertyDeclaration,
     Statement,
+};
+pub use codegen::{
+    apply_alpha_conviction, conviction_scale_from_signal_series, resolve_runtime_script_source,
+    ResolvedOtlSource,
 };
 pub use lexer::{object_kind_from_token, tokenize as tokenize_object_declarations, Token};
 pub use parser::{parse_program, ParseError};

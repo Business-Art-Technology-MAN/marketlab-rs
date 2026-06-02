@@ -1537,7 +1537,8 @@ impl TradingSystemWorkspace {
                             }),
                         ),
                 );
-                if let Some(metrics) = &self.portfolio_diagnostics {
+                let node_metrics = self.portfolio_diagnostics_for_node(node_id);
+                if let Some(metrics) = node_metrics {
                     let return_color = if metrics.total_return_pct >= 0.0 {
                         rgb(0x10b981)
                     } else {

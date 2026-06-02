@@ -16,6 +16,7 @@ mod canvas_compose;
 mod canvas_hydrate;
 mod graph_compiler;
 mod ohlc_chart_pane;
+mod portfolio_analytics;
 mod portfolio_integrator_ledger;
 mod portfolio_wealth_chart;
 mod ui;

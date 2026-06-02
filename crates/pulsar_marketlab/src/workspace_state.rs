@@ -907,6 +907,7 @@ pub fn yahoo_rows_from_ohlc_bars(bars: &[OhlcBar]) -> Vec<YahooCsvRow> {
         .collect()
 }
 /// Replay simulation from bar 0 through `playhead` using the compiled DAG execution order.
+/// Legacy CSV TA bridge — superseded by [`TradingSystemWorkspace::graph_engine_analytics_active`].
 fn evaluate_portfolio_at_playhead(
     ohlc_by_asset: &HashMap<usize, Vec<OhlcBar>>,
     playhead: usize,
@@ -1403,6 +1404,11 @@ pub struct TradingSystemWorkspace {
     pub(crate) node_lookback_inputs_ready: bool,
     /// Pre-computed portfolio wealth timelines keyed by USD prim path.
     pub(crate) portfolio_timeline_cache: HashMap<String, crate::portfolio_wealth_chart::PortfolioWealthChartSeries>,
+    /// Graph-engine portfolio integration keyed by stage prim path.
+    pub(crate) graph_engine_portfolio_results:
+        HashMap<String, pulsar_marketlab_core::PortfolioIntegrationResult>,
+    /// Per-portfolio diagnostics derived from graph-engine sweeps.
+    pub(crate) portfolio_diagnostics_cache: HashMap<String, PortfolioDiagnosticsSnapshot>,
     /// Integrator tracking matrix rows keyed by portfolio prim path.
     pub(crate) portfolio_ledger_cache: HashMap<String, Arc<crate::portfolio_integrator_ledger::PortfolioIntegratorLedger>>,
     /// Active quick-filter for the integrator ledger spreadsheet.
@@ -1515,6 +1521,8 @@ impl TradingSystemWorkspace {
             node_lookback_inputs: HashMap::new(),
             node_lookback_inputs_ready: false,
             portfolio_timeline_cache: HashMap::new(),
+            graph_engine_portfolio_results: HashMap::new(),
+            portfolio_diagnostics_cache: HashMap::new(),
             portfolio_ledger_cache: HashMap::new(),
             portfolio_ledger_filter: crate::portfolio_integrator_ledger::IntegratorLedgerFilter::default(),
             portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles::with_defaults(),
@@ -1683,6 +1691,8 @@ impl TradingSystemWorkspace {
         let bar_labels = self.timeline_bar_labels();
         self.portfolio_timeline_cache.clear();
         self.portfolio_ledger_cache.clear();
+        self.graph_engine_portfolio_results = result.portfolio_results.clone();
+        self.refresh_portfolio_diagnostics_cache();
 
         for (prim_path, integration) in &result.portfolio_results {
             self.portfolio_timeline_cache.insert(
@@ -1724,6 +1734,61 @@ impl TradingSystemWorkspace {
                 }
             }
         }
+    }
+
+    pub(crate) fn graph_engine_analytics_active(&self) -> bool {
+        !self.graph_engine_portfolio_results.is_empty()
+    }
+
+    pub(crate) fn refresh_portfolio_diagnostics_cache(&mut self) {
+        use crate::portfolio_analytics::build_portfolio_diagnostics_from_integration;
+
+        self.portfolio_diagnostics_cache.clear();
+        let playhead = self
+            .playhead_current
+            .min(self.playhead_total_bars.saturating_sub(1));
+        let tick_label = self.playhead_tick_label();
+        let benchmark = self.primary_asset_benchmark_prices();
+
+        for (prim_path, integration) in &self.graph_engine_portfolio_results {
+            let snapshot = build_portfolio_diagnostics_from_integration(
+                integration,
+                playhead,
+                SIM_INITIAL_CASH,
+                self.portfolio_metrics_epoch,
+                Some(tick_label.clone()),
+                benchmark.as_deref(),
+            );
+            self.portfolio_diagnostics_cache
+                .insert(prim_path.clone(), snapshot);
+        }
+    }
+
+    fn primary_asset_benchmark_prices(&self) -> Option<Vec<f64>> {
+        let primary = self
+            .nodes
+            .iter()
+            .find(|node| node.node_type.is_asset_adaptor())?;
+        let bars = self.asset_ohlc_history.get(&primary.id)?;
+        Some(bars.iter().map(|bar| bar.close).collect())
+    }
+
+    pub(crate) fn portfolio_diagnostics_for_node(
+        &self,
+        node_id: usize,
+    ) -> Option<&PortfolioDiagnosticsSnapshot> {
+        let node = self.nodes.iter().find(|node| node.id == node_id)?;
+        if !node.node_type.is_portfolio() {
+            return None;
+        }
+        let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
+        self.portfolio_diagnostics_cache.get(&prim_path)
+    }
+
+    pub(crate) fn portfolio_diagnostics_for_selection(&self) -> Option<&PortfolioDiagnosticsSnapshot> {
+        let node = self.selected_portfolio_node()?;
+        let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
+        self.portfolio_diagnostics_cache.get(&prim_path)
     }
 
     pub(crate) fn portfolio_wealth_chart_for_selection(
@@ -1922,6 +1987,8 @@ impl TradingSystemWorkspace {
         self.portfolio_diagnostics = None;
         self.portfolio_timeline_cache.clear();
         self.portfolio_ledger_cache.clear();
+        self.graph_engine_portfolio_results.clear();
+        self.portfolio_diagnostics_cache.clear();
         self.playhead_current = 0;
         self.playhead_time = 0.0;
         self.playhead_scrubbing = false;
@@ -2295,6 +2362,22 @@ impl TradingSystemWorkspace {
         }
         self.sync_playhead_time_from_index();
         self.synchronize_inspector_view();
+
+        if self.graph_engine_analytics_active() {
+            self.refresh_portfolio_diagnostics_cache();
+            self.portfolio_diagnostics = self
+                .portfolio_diagnostics_for_selection()
+                .cloned()
+                .or_else(|| {
+                    self.portfolio_diagnostics_cache
+                        .values()
+                        .next()
+                        .cloned()
+                });
+            self.last_calculated_state = (self.playhead_time, graph_revision);
+            return;
+        }
+
         let graph = self.pipeline_graph.snapshot();
         self.portfolio_diagnostics = evaluate_portfolio_at_playhead(
             &self.asset_ohlc_history,
@@ -2355,7 +2438,21 @@ impl TradingSystemWorkspace {
                         if !evaluated.1.is_empty() {
                             workspace.inspector_data = evaluated.1;
                         }
-                        workspace.portfolio_diagnostics = evaluated.2;
+                        if workspace.graph_engine_analytics_active() {
+                            workspace.refresh_portfolio_diagnostics_cache();
+                            workspace.portfolio_diagnostics = workspace
+                                .portfolio_diagnostics_for_selection()
+                                .cloned()
+                                .or_else(|| {
+                                    workspace
+                                        .portfolio_diagnostics_cache
+                                        .values()
+                                        .next()
+                                        .cloned()
+                                });
+                        } else {
+                            workspace.portfolio_diagnostics = evaluated.2;
+                        }
                         workspace.last_calculated_state = (evaluated.3, evaluated.4);
                         workspace.playhead_eval_inflight = false;
                         if workspace.playhead_eval_pending {

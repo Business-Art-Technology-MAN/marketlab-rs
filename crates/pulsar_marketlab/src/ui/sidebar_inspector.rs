@@ -428,7 +428,9 @@ impl TradingSystemWorkspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let metrics = self.portfolio_diagnostics.as_ref();
+        let metrics = self
+            .portfolio_diagnostics_for_selection()
+            .or(self.portfolio_diagnostics.as_ref());
         let graph_status = self.portfolio_graph_engine_status_label(cx);
         let wired_sources = self
             .selected_node_id

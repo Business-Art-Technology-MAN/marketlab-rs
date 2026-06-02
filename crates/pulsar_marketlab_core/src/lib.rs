@@ -37,6 +37,7 @@ pub use schema_sidecar::{
 };
 pub use frontend::{
     compile_object_program, object_kind_from_token, parse_program as parse_object_program,
+    resolve_runtime_script_source, ResolvedOtlSource,
     tokenize_object_declarations, validate_object, validate_program, FrontendError,
     OtlObjectDeclaration, OtlObjectKind, OtlProgram, OtlType, ParseError as OtlParseError,
     PortDirection, PropertyDeclaration, Statement, ValidationError,
