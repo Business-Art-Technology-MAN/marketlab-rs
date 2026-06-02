@@ -8,6 +8,14 @@ use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::Direction;
 use thiserror::Error;
 
+use super::portfolio::{
+    closures_from_upstream_legs, integrate_portfolio, normalize_asset_quote_key, AssetQuote,
+    ClosureLegKind,
+    PortfolioIntegratorConfig, PortfolioIntegrationResult, PortfolioOtlTransformFn,
+    PortfolioTrackingFrame, SymbolicOtlClosure,
+};
+use crate::OtlObjectKind;
+
 /// Thread-safe compiled signal transform closure.
 pub type SignalTransformFn = dyn Fn(&[f64]) -> Vec<f64> + Send + Sync;
 
@@ -25,6 +33,8 @@ pub enum ExecutionNode {
     PortfolioSink {
         method: String,
         initial_capital: f64,
+        otl_script: String,
+        otl_hook: Option<Box<PortfolioOtlTransformFn>>,
     },
 }
 
@@ -66,6 +76,19 @@ pub struct ComputedAttributeStream {
     pub samples: Vec<(f64, f64)>,
 }
 
+/// Timeline sweep output including optional portfolio tracking matrices keyed by prim path.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TimelineExecutionResult {
+    pub streams: Vec<ComputedAttributeStream>,
+    pub portfolio_results: HashMap<String, PortfolioIntegrationResult>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeRuntimeOutput {
+    scalar: Vec<f64>,
+    asset_symbol: Option<String>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum GraphEngineError {
     #[error("graph compile spec has no nodes")]
@@ -78,6 +101,17 @@ pub enum GraphEngineError {
     UnsupportedPrimType { type_name: String, path: String },
     #[error("OTL script compile failed for `{path}`: {message}")]
     ScriptCompileError { path: String, message: String },
+    #[error("OTL object kind `{object_kind:?}` incompatible with prim `{prim_path}`")]
+    ObjectKindMismatch {
+        prim_path: String,
+        object_kind: OtlObjectKind,
+    },
+}
+
+/// Symbolic closure extraction context (bar-independent compile phase).
+#[derive(Clone, Debug, Default)]
+pub struct EvaluationContext {
+    pub timeline_len: usize,
 }
 
 /// Compiled USD stage graph with deterministic topological execution order.
@@ -177,6 +211,8 @@ impl MarketLabGraphEngine {
                         .get("inputs:initial_capital")
                         .and_then(|value| value.parse::<f64>().ok())
                         .unwrap_or(10_000_000.0),
+                    otl_script: resolve_prim_otl_expression(prim),
+                    otl_hook: None,
                 },
                 other => {
                     return Err(GraphEngineError::UnsupportedPrimType {
@@ -303,14 +339,46 @@ impl MarketLabGraphEngine {
             .collect()
     }
 
+    /// Extract symbolic OTL closures for a prim using the declared three-tier object kind.
+    pub fn evaluate_node_closures(
+        &self,
+        prim_path: &str,
+        object_kind: OtlObjectKind,
+        ctx: &EvaluationContext,
+    ) -> Result<Vec<SymbolicOtlClosure>, GraphEngineError> {
+        let index = self
+            .prim_to_index
+            .get(prim_path)
+            .copied()
+            .ok_or_else(|| GraphEngineError::UnknownPrimPath(prim_path.to_string()))?;
+
+        let node = self
+            .graph
+            .node_weight(index)
+            .ok_or_else(|| GraphEngineError::UnknownPrimPath(prim_path.to_string()))?;
+
+        let _timeline_len = ctx.timeline_len;
+        match (object_kind, node) {
+            (OtlObjectKind::Portfolio, ExecutionNode::PortfolioSink { .. }) => Ok(vec![]),
+            (OtlObjectKind::Signal | OtlObjectKind::LegacyShader, ExecutionNode::SignalTransform { .. }) => {
+                Ok(vec![])
+            }
+            (OtlObjectKind::Allocator, ExecutionNode::PortfolioSink { .. }) => Ok(vec![]),
+            (kind, _) => Err(GraphEngineError::ObjectKindMismatch {
+                prim_path: prim_path.to_string(),
+                object_kind: kind,
+            }),
+        }
+    }
+
     /// Execute compiled closures across `timeline_len` bars using fresh asset vectors.
     pub fn execute_timeline(
         &self,
         asset_vectors: &HashMap<String, Vec<f64>>,
         timeline_len: usize,
-    ) -> Vec<ComputedAttributeStream> {
+    ) -> TimelineExecutionResult {
         if timeline_len == 0 || self.execution_order.is_empty() {
-            return Vec::new();
+            return TimelineExecutionResult::default();
         }
 
         let index_to_path: HashMap<NodeIndex, String> = self
@@ -319,8 +387,10 @@ impl MarketLabGraphEngine {
             .map(|(path, index)| (*index, path.clone()))
             .collect();
 
-        let mut node_outputs: HashMap<NodeIndex, Vec<f64>> = HashMap::new();
+        let mut node_outputs: HashMap<NodeIndex, NodeRuntimeOutput> = HashMap::new();
         let mut streams: Vec<ComputedAttributeStream> = Vec::new();
+        let mut portfolio_results: HashMap<String, PortfolioIntegrationResult> = HashMap::new();
+        let quotes = build_asset_quotes(asset_vectors, timeline_len);
 
         for index in &self.execution_order {
             let prim_path = index_to_path
@@ -328,41 +398,56 @@ impl MarketLabGraphEngine {
                 .cloned()
                 .unwrap_or_else(|| format!("node_{index:?}"));
 
-            let upstream: Vec<f64> = self
-                .graph
-                .neighbors_directed(*index, Direction::Incoming)
-                .flat_map(|upstream_index| {
-                    node_outputs
-                        .get(&upstream_index)
+            let runtime = match self.graph.node_weight(*index) {
+                Some(ExecutionNode::DataInput { symbol }) => {
+                    let scalar = asset_vectors
+                        .get(symbol)
                         .cloned()
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            let output = match self.graph.node_weight(*index) {
-                Some(ExecutionNode::DataInput { symbol }) => asset_vectors
-                    .get(symbol)
-                    .cloned()
-                    .unwrap_or_else(|| vec![0.0; timeline_len])
-                    .into_iter()
-                    .take(timeline_len)
-                    .collect(),
+                        .unwrap_or_else(|| vec![0.0; timeline_len])
+                        .into_iter()
+                        .take(timeline_len)
+                        .collect::<Vec<_>>();
+                    let samples = scalar
+                        .iter()
+                        .enumerate()
+                        .map(|(bar, value)| (bar as f64, *value))
+                        .collect();
+                    streams.push(ComputedAttributeStream {
+                        prim_path: prim_path.clone(),
+                        attribute: "outputs:price".to_string(),
+                        samples,
+                    });
+                    NodeRuntimeOutput {
+                        scalar: pad_or_trim(scalar, timeline_len),
+                        asset_symbol: Some(symbol.clone()),
+                    }
+                }
                 Some(ExecutionNode::SignalTransform {
                     expression,
                     compiled_fn,
                     compiled_multi,
                 }) => {
-                    if let Some((run, attributes)) = compiled_multi.as_ref() {
+                    let upstream: Vec<f64> = self
+                        .graph
+                        .neighbors_directed(*index, Direction::Incoming)
+                        .flat_map(|upstream_index| {
+                            node_outputs
+                                .get(&upstream_index)
+                                .map(|output| output.scalar.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
+                    let scalar = if let Some((run, attributes)) = compiled_multi.as_ref() {
                         let channels = run(&upstream);
-                        let primary = channels
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| passthrough_signal(&upstream, timeline_len, expression));
-                        for (index, values) in channels.into_iter().enumerate() {
+                        let primary = channels.first().cloned().unwrap_or_else(|| {
+                            passthrough_signal(&upstream, timeline_len, expression)
+                        });
+                        for (channel_index, values) in channels.into_iter().enumerate() {
                             let attribute = attributes
-                                .get(index)
+                                .get(channel_index)
                                 .cloned()
-                                .unwrap_or_else(|| format!("outputs:channel_{index}"));
+                                .unwrap_or_else(|| format!("outputs:channel_{channel_index}"));
                             let samples = values
                                 .iter()
                                 .enumerate()
@@ -381,7 +466,8 @@ impl MarketLabGraphEngine {
                         } else {
                             passthrough_signal(&upstream, timeline_len, expression)
                         };
-                        let attribute = if expression.contains("ta::") || expression.contains("input") {
+                        let attribute = if expression.contains("ta::") || expression.contains("input")
+                        {
                             "outputs:result".to_string()
                         } else {
                             "outputs:signal".to_string()
@@ -397,15 +483,51 @@ impl MarketLabGraphEngine {
                             samples,
                         });
                         values
+                    };
+
+                    let asset_symbol = infer_upstream_asset_symbol(
+                        &self.graph,
+                        *index,
+                        &node_outputs,
+                    );
+                    NodeRuntimeOutput {
+                        scalar: pad_or_trim(scalar, timeline_len),
+                        asset_symbol,
                     }
                 }
                 Some(ExecutionNode::PortfolioSink {
                     method,
                     initial_capital,
+                    otl_script,
+                    otl_hook,
                 }) => {
-                    let values =
-                        integrate_portfolio(&upstream, timeline_len, *initial_capital, method);
-                    let samples = values
+                    let legs = collect_upstream_legs(
+                        &self.graph,
+                        *index,
+                        &node_outputs,
+                        &index_to_path,
+                    );
+                    let closures =
+                        closures_from_upstream_legs(&legs, method);
+                    let config = PortfolioIntegratorConfig {
+                        allocation_method: method.clone(),
+                        initial_capital: *initial_capital,
+                        otl_script: otl_script.clone(),
+                    };
+                    let integration = integrate_portfolio(
+                        &closures,
+                        &quotes,
+                        timeline_len,
+                        &config,
+                        otl_hook.as_deref(),
+                    );
+                    append_portfolio_tracking_streams(
+                        &prim_path,
+                        &integration.tracking_matrix,
+                        &mut streams,
+                    );
+                    let samples = integration
+                        .wealth_series
                         .iter()
                         .enumerate()
                         .map(|(bar, value)| (bar as f64, *value))
@@ -415,15 +537,25 @@ impl MarketLabGraphEngine {
                         attribute: "outputs:portfolio_wealth".to_string(),
                         samples,
                     });
-                    values
+                    portfolio_results.insert(prim_path.clone(), integration.clone());
+                    NodeRuntimeOutput {
+                        scalar: pad_or_trim(integration.wealth_series, timeline_len),
+                        asset_symbol: None,
+                    }
                 }
-                None => Vec::new(),
+                None => NodeRuntimeOutput {
+                    scalar: vec![0.0; timeline_len],
+                    asset_symbol: None,
+                },
             };
 
-            node_outputs.insert(*index, pad_or_trim(output, timeline_len));
+            node_outputs.insert(*index, runtime);
         }
 
-        streams
+        TimelineExecutionResult {
+            streams,
+            portfolio_results,
+        }
     }
 }
 
@@ -447,10 +579,14 @@ impl fmt::Debug for ExecutionNode {
             Self::PortfolioSink {
                 method,
                 initial_capital,
+                otl_script,
+                otl_hook,
             } => f
                 .debug_struct("PortfolioSink")
                 .field("method", method)
                 .field("initial_capital", initial_capital)
+                .field("otl_script", otl_script)
+                .field("otl_hook", &otl_hook.as_ref().map(|_| "<fn>"))
                 .finish(),
         }
     }
@@ -488,27 +624,133 @@ fn passthrough_signal(upstream: &[f64], timeline_len: usize, expression: &str) -
     vec![0.0; timeline_len]
 }
 
-fn integrate_portfolio(
-    upstream: &[f64],
+fn build_asset_quotes(
+    asset_vectors: &HashMap<String, Vec<f64>>,
     timeline_len: usize,
-    initial_capital: f64,
-    method: &str,
-) -> Vec<f64> {
-    let signal = pad_or_trim(upstream.to_vec(), timeline_len);
-    let mut wealth = initial_capital;
-    let mut out = Vec::with_capacity(timeline_len);
-    for value in signal {
-        let delta = if method.contains("EqualWeight") {
-            value * 0.01
-        } else if method.contains("HierarchicalRiskParity") {
-            value * 0.0085
-        } else {
-            value * 0.005
-        };
-        wealth += delta;
-        out.push(wealth);
+) -> HashMap<String, AssetQuote> {
+    asset_vectors
+        .iter()
+        .map(|(symbol, prices)| {
+            (
+                symbol.clone(),
+                AssetQuote {
+                    price_series: pad_or_trim(prices.clone(), timeline_len),
+                    contract_multiplier: 1.0,
+                },
+            )
+        })
+        .collect()
+}
+
+fn collect_upstream_legs(
+    graph: &StableGraph<ExecutionNode, ()>,
+    index: NodeIndex,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+    index_to_path: &HashMap<NodeIndex, String>,
+) -> Vec<(String, Vec<f64>, ClosureLegKind)> {
+    graph
+        .neighbors_directed(index, Direction::Incoming)
+        .map(|upstream_index| {
+            let leg_kind = graph
+                .node_weight(upstream_index)
+                .map(|node| match node {
+                    ExecutionNode::PortfolioSink { .. } => ClosureLegKind::SubPortfolio,
+                    _ => ClosureLegKind::Asset,
+                })
+                .unwrap_or(ClosureLegKind::Asset);
+            let output = node_outputs.get(&upstream_index);
+            let asset_id = normalize_asset_quote_key(
+                &output
+                    .and_then(|o| o.asset_symbol.clone())
+                    .or_else(|| {
+                        graph.node_weight(upstream_index).and_then(|node| match node {
+                            ExecutionNode::DataInput { symbol } => Some(symbol.clone()),
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        index_to_path
+                            .get(&upstream_index)
+                            .cloned()
+                            .unwrap_or_else(|| format!("leg_{upstream_index:?}"))
+                    }),
+            );
+            let series = output.map(|o| o.scalar.clone()).unwrap_or_default();
+            (asset_id, series, leg_kind)
+        })
+        .collect()
+}
+
+fn infer_upstream_asset_symbol(
+    graph: &StableGraph<ExecutionNode, ()>,
+    index: NodeIndex,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+) -> Option<String> {
+    let mut stack: Vec<NodeIndex> = graph.neighbors_directed(index, Direction::Incoming).collect();
+    while let Some(upstream_index) = stack.pop() {
+        if let Some(symbol) = node_outputs
+            .get(&upstream_index)
+            .and_then(|output| output.asset_symbol.clone())
+        {
+            return Some(symbol);
+        }
+        if let Some(ExecutionNode::DataInput { symbol }) = graph.node_weight(upstream_index) {
+            return Some(symbol.clone());
+        }
+        stack.extend(
+            graph
+                .neighbors_directed(upstream_index, Direction::Incoming),
+        );
     }
-    out
+    None
+}
+
+fn append_portfolio_tracking_streams(
+    prim_path: &str,
+    matrix: &[PortfolioTrackingFrame],
+    streams: &mut Vec<ComputedAttributeStream>,
+) {
+    let mut altered_weights: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let mut calculated_units: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let mut investment_returns: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+
+    for frame in matrix {
+        let ts = frame.timestamp as f64;
+        altered_weights
+            .entry(frame.asset_id.clone())
+            .or_default()
+            .push((ts, frame.altered_portfolio_weight));
+        calculated_units
+            .entry(frame.asset_id.clone())
+            .or_default()
+            .push((ts, frame.calculated_units));
+        investment_returns
+            .entry(frame.asset_id.clone())
+            .or_default()
+            .push((ts, frame.investment_return));
+    }
+
+    for (asset_id, samples) in altered_weights {
+        streams.push(ComputedAttributeStream {
+            prim_path: prim_path.to_string(),
+            attribute: format!("outputs:tracking:altered_weight:{asset_id}"),
+            samples,
+        });
+    }
+    for (asset_id, samples) in calculated_units {
+        streams.push(ComputedAttributeStream {
+            prim_path: prim_path.to_string(),
+            attribute: format!("outputs:tracking:calculated_units:{asset_id}"),
+            samples,
+        });
+    }
+    for (asset_id, samples) in investment_returns {
+        streams.push(ComputedAttributeStream {
+            prim_path: prim_path.to_string(),
+            attribute: format!("outputs:tracking:investment_return:{asset_id}"),
+            samples,
+        });
+    }
 }
 
 impl fmt::Debug for MarketLabGraphEngine {
@@ -608,6 +850,8 @@ mod tests {
                     ExecutionNode::PortfolioSink {
                         method: "Allocation::EqualWeight".to_string(),
                         initial_capital: 1_000_000.0,
+                        otl_script: String::new(),
+                        otl_hook: None,
                     },
                 ),
             ],
@@ -617,13 +861,18 @@ mod tests {
         let engine = MarketLabGraphEngine::compile(spec).expect("valid dag");
         let mut assets = HashMap::new();
         assets.insert("SPY".to_string(), vec![100.0, 101.0, 102.0]);
-        let streams = engine.execute_timeline(&assets, 3);
+        let result = engine.execute_timeline(&assets, 3);
+        let streams = result.streams;
         assert!(streams
             .iter()
             .any(|stream| stream.attribute == "outputs:signal"));
         assert!(streams
             .iter()
             .any(|stream| stream.attribute == "outputs:portfolio_wealth"));
+        assert!(result
+            .portfolio_results
+            .get("/portfolios/main")
+            .is_some_and(|integration| !integration.tracking_matrix.is_empty()));
     }
 
     #[test]
@@ -671,8 +920,9 @@ mod tests {
         let engine =
             MarketLabGraphEngine::compile_from_stage(&snapshot).expect("compile with otl");
         let assets = HashMap::from([("SPY".to_string(), vec![1.0, 2.0, 3.0, 4.0, 5.0])]);
-        let streams = engine.execute_timeline(&assets, 5);
-        let signal = streams
+        let result = engine.execute_timeline(&assets, 5);
+        let signal = result
+            .streams
             .iter()
             .find(|stream| stream.prim_path == "/analytics/rsi")
             .expect("signal stream");
@@ -689,8 +939,9 @@ mod tests {
             .expect("attach closure");
 
         let assets = HashMap::from([("SPY".to_string(), vec![10.0, 20.0, 30.0])]);
-        let streams = engine.execute_timeline(&assets, 3);
-        let signal = streams
+        let result = engine.execute_timeline(&assets, 3);
+        let signal = result
+            .streams
             .iter()
             .find(|stream| stream.prim_path == "/analytics/rsi")
             .expect("signal stream");

@@ -109,7 +109,8 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
                 continue;
             }
             if let Some(bars) = self.asset_ohlc_history.get(&node.id) {
-                vectors.insert(node.name.clone(), bars.iter().map(|bar| bar.close).collect());
+                let symbol = self.asset_quote_symbol_for_node(node);
+                vectors.insert(symbol, bars.iter().map(|bar| bar.close).collect());
             }
         }
         vectors
@@ -157,12 +158,38 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
         self.graph_engine_last_compile_ms = ms;
     }
 
-    fn apply_graph_engine_streams(
+    fn graph_engine_asset_data_epoch(&self) -> u64 {
+        self.graph_engine_asset_data_epoch
+    }
+
+    fn graph_engine_last_swept_asset_epoch(&self) -> u64 {
+        self.graph_engine_last_swept_asset_epoch
+    }
+
+    fn set_graph_engine_last_swept_asset_epoch(&mut self, epoch: u64) {
+        self.graph_engine_last_swept_asset_epoch = epoch;
+    }
+
+    fn graph_engine_compile_error(&self) -> Option<String> {
+        self.graph_engine_compile_error.clone()
+    }
+
+    fn set_graph_engine_compile_error(&mut self, error: Option<String>) {
+        self.graph_engine_compile_error = error;
+    }
+
+    fn on_graph_engine_compile_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.push_status_log(format!("Graph engine compile failed: {error}"));
+        cx.notify();
+    }
+
+    fn apply_graph_engine_timeline_result(
         &mut self,
-        streams: Vec<pulsar_marketlab_core::ComputedAttributeStream>,
+        result: pulsar_marketlab_core::TimelineExecutionResult,
         cx: &mut Context<Self>,
     ) {
-        for stream in &streams {
+        self.graph_engine_compile_error = None;
+        for stream in &result.streams {
             for (bar_index, value) in &stream.samples {
                 let bar_idx = *bar_index as usize;
                 let time = self
@@ -179,6 +206,7 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
             }
         }
 
+        self.refresh_portfolio_wealth_chart_cache(&result);
         self.synchronize_inspector_view();
         self.invalidate_playhead_evaluation_cache();
         self.spawn_playhead_evaluation_async(cx);

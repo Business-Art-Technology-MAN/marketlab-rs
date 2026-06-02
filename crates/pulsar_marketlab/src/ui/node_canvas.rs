@@ -30,7 +30,7 @@ use pulsar_marketlab_ui::workspace::{
 use pulsar_marketlab_ui::{node_dropdown_trigger, NodeNumberInput};
 use crate::workspace_state::{
     parse_chart_date_ordinal, ChartHistoryBuffer, CHART_Y_MIN_SPAN, CHART_Y_PADDING_RATIO,
-    format_percent_signed, format_ratio,
+    format_currency, format_percent_signed, format_ratio,
     TaExecutionBridge, TradingSystemWorkspace, CHART_STROKE_WIDTH,
 };
 
@@ -1598,6 +1598,53 @@ impl TradingSystemWorkspace {
                                     )),
                             ),
                     );
+                } else if node_prim_path
+                    .as_ref()
+                    .and_then(|path| self.portfolio_timeline_cache.get(path))
+                    .is_some_and(|series| !series.wealth.is_empty())
+                {
+                    let series = self
+                        .portfolio_timeline_cache
+                        .get(node_prim_path.as_ref().expect("prim path"))
+                        .expect("series present");
+                    let last_nav = series.wealth.last().copied().unwrap_or(0.0);
+                    let base = series.wealth.first().copied().unwrap_or(last_nav);
+                    let return_pct = if base.abs() > f64::EPSILON {
+                        (last_nav / base - 1.0) * 100.0
+                    } else {
+                        0.0
+                    };
+                    let return_color = if return_pct >= 0.0 {
+                        rgb(0x10b981)
+                    } else {
+                        rgb(0xf87171)
+                    };
+                    node_card = node_card.child(
+                        div()
+                            .px_2()
+                            .pb_1()
+                            .flex_col()
+                            .gap_0p5()
+                            .font_family("monospace")
+                            .text_size(px(8.0))
+                            .child(
+                                div()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!(
+                                        "{wired_count} source(s) · graph sweep · {} bars",
+                                        series.wealth.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_color(return_color)
+                                    .child(format!(
+                                        "NAV {} · R {}",
+                                        format_currency(last_nav),
+                                        format_percent_signed(return_pct)
+                                    )),
+                            ),
+                    );
                 } else {
                     node_card = node_card.child(
                         div()
@@ -1609,7 +1656,7 @@ impl TradingSystemWorkspace {
                             .font_family("monospace")
                             .text_color(rgb(0x64748b))
                             .child(format!("{wired_count} execution source(s) wired"))
-                            .child("Awaiting ledger sync…"),
+                            .child(self.portfolio_graph_engine_status_label(cx)),
                     );
                 }
             }

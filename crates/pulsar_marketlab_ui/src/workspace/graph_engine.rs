@@ -6,8 +6,8 @@ use gpui::*;
 use openusd::sdf::schema::FieldKey;
 use openusd::sdf::Path;
 use pulsar_marketlab_core::{
-    ComputedAttributeStream, GraphCompileWire, MarketLabGraphEngine, StageGraphPrim,
-    StageGraphSnapshot,
+    GraphCompileWire, MarketLabGraphEngine, StageGraphPrim, StageGraphSnapshot,
+    TimelineExecutionResult,
 };
 
 use super::context::{ManagedUsdStage, WorkspaceContext};
@@ -49,9 +49,27 @@ pub trait GraphEngineInvalidationHost: Sized + 'static {
 
     fn set_graph_engine_last_compile_ms(&mut self, _ms: u64) {}
 
-    fn apply_graph_engine_streams(
+    fn graph_engine_asset_data_epoch(&self) -> u64 {
+        0
+    }
+
+    fn graph_engine_last_swept_asset_epoch(&self) -> u64 {
+        0
+    }
+
+    fn set_graph_engine_last_swept_asset_epoch(&mut self, _epoch: u64) {}
+
+    fn graph_engine_compile_error(&self) -> Option<String> {
+        None
+    }
+
+    fn set_graph_engine_compile_error(&mut self, _error: Option<String>) {}
+
+    fn on_graph_engine_compile_failed(&mut self, _error: String, _cx: &mut Context<Self>) {}
+
+    fn apply_graph_engine_timeline_result(
         &mut self,
-        streams: Vec<ComputedAttributeStream>,
+        result: TimelineExecutionResult,
         cx: &mut Context<Self>,
     );
 
@@ -66,8 +84,10 @@ pub fn spawn_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
     cx: &mut Context<H>,
 ) {
     let entity = view.clone();
-    view.update(cx, |host, cx| {
-        begin_graph_engine_timeline_sweep(host, entity, cx);
+    cx.defer(move |cx| {
+        entity.update(cx, |host, cx| {
+            begin_graph_engine_timeline_sweep(host, entity.clone(), cx);
+        });
     });
 }
 
@@ -80,7 +100,10 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
     let _ = view;
     let context_handle = host.workspace_context().clone();
     let generation = context_handle.read(cx).engine_cache_generation();
-    if generation == host.graph_engine_last_compiled_generation() {
+    let asset_epoch = host.graph_engine_asset_data_epoch();
+    if generation == host.graph_engine_last_compiled_generation()
+        && asset_epoch == host.graph_engine_last_swept_asset_epoch()
+    {
         return;
     }
     if host.graph_engine_recompile_inflight() {
@@ -93,24 +116,28 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
     let timeline_len = host.graph_engine_timeline_len();
     let stage = context_handle.read(cx).usd_stage().clone();
     let target_generation = generation;
+    let target_asset_epoch = asset_epoch;
 
     cx.spawn(async move |this, cx| {
         let started = std::time::Instant::now();
-        let computed_streams = cx
+        let (timeline_result, compile_error) = cx
             .background_executor()
             .spawn(async move {
                 let snapshot = build_stage_graph_snapshot(&stage);
-                MarketLabGraphEngine::compile_from_stage(&snapshot)
-                    .ok()
-                    .map(|engine| engine.execute_timeline(&asset_vectors, timeline_len))
-                    .unwrap_or_default()
+                match MarketLabGraphEngine::compile_from_stage(&snapshot) {
+                    Ok(engine) => (
+                        engine.execute_timeline(&asset_vectors, timeline_len),
+                        None,
+                    ),
+                    Err(error) => (TimelineExecutionResult::default(), Some(error.to_string())),
+                }
             })
             .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         let _ = cx.update(|cx| {
             context_handle.update(cx, |workspace, cx| {
-                workspace.replace_computed_streams(computed_streams.clone());
+                workspace.replace_computed_streams(timeline_result.streams.clone());
                 cx.notify();
             });
 
@@ -130,8 +157,14 @@ pub fn begin_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
                     }
 
                     host.set_graph_engine_last_compiled_generation(target_generation);
+                    host.set_graph_engine_last_swept_asset_epoch(target_asset_epoch);
                     host.set_graph_engine_last_compile_ms(elapsed_ms);
-                    host.apply_graph_engine_streams(computed_streams, cx);
+                    host.set_graph_engine_compile_error(compile_error.clone());
+                    if let Some(error) = compile_error {
+                        host.on_graph_engine_compile_failed(error, cx);
+                    } else {
+                        host.apply_graph_engine_timeline_result(timeline_result, cx);
+                    }
 
                     if host.graph_engine_recompile_pending() {
                         host.set_graph_engine_recompile_pending(false);

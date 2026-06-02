@@ -15,9 +15,55 @@ use pulsar_marketlab::trading_stage::{
     MARKETLAB_ROOT,
 };
 use pulsar_marketlab_core::{
-    embed_schema_inline_in_layer, initial_stage_usda, schema_sidecar_usda,
+    compile_object_program, embed_schema_inline_in_layer, initial_stage_usda,
+    schema_sidecar_usda, OtlObjectDeclaration, OtlObjectKind, FrontendError,
     SCHEMA_SIDECAR_FILENAME, SCHEMA_SUBLAYER_REF,
 };
+
+/// OTL canvas hydration error when script tier does not match node intent.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum HydrationError {
+    #[error("expected OTL tier {expected:?}, source declares {actual:?}")]
+    TierMismatch {
+        expected: OtlObjectKind,
+        actual: OtlObjectKind,
+    },
+    #[error("OTL source produced no object declaration")]
+    EmptyProgram,
+    #[error(transparent)]
+    Frontend(#[from] FrontendError),
+}
+
+/// Hydrated canvas node bound to a parsed OTL object declaration.
+#[derive(Debug, Clone)]
+pub struct CanvasNodeHydration {
+    pub prim_path: String,
+    pub object: OtlObjectDeclaration,
+}
+
+/// Validate and parse OTL source for a canvas prim at the expected three-tier object kind.
+pub fn hydrate_canvas_node(
+    prim_path: &str,
+    script_src: &str,
+    expected_tier: OtlObjectKind,
+) -> Result<CanvasNodeHydration, HydrationError> {
+    let program = compile_object_program(script_src)?;
+    let object = program
+        .objects
+        .into_iter()
+        .next()
+        .ok_or(HydrationError::EmptyProgram)?;
+    if object.kind != expected_tier {
+        return Err(HydrationError::TierMismatch {
+            expected: expected_tier,
+            actual: object.kind,
+        });
+    }
+    Ok(CanvasNodeHydration {
+        prim_path: prim_path.to_string(),
+        object,
+    })
+}
 
 /// Controls whether composed USDA references a schema sublayer on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,7 +594,7 @@ fn write_prim(
                 .as_deref()
                 .unwrap_or("Allocation::HierarchicalRiskParity");
             write_token(out, &inner, "inputs:id", allocation);
-            write_double(out, &inner, "inputs:initial_capital", 10_000_000.0);
+            write_double(out, &inner, "inputs:initial_capital", crate::workspace_state::SIM_INITIAL_CASH);
             write_token(out, &inner, "inputs:rebalance_frequency", "monthly");
         }
         NodeType::TerminalIntegrator { engine_target } => {
@@ -966,5 +1012,172 @@ mod tests {
         assert!(usda.contains(
             "rel inputs:sources = </MarketLab/Buy_Hold_Fund/SPY>"
         ));
+    }
+
+    #[test]
+    fn graph_engine_executes_nested_portfolio_chain() {
+        use pulsar_marketlab_core::MarketLabGraphEngine;
+        use pulsar_marketlab_ui::workspace::{build_stage_graph_snapshot, WorkspaceContext};
+
+        let nodes = vec![
+            sample_portfolio(1, "Sim Portfolio 1"),
+            sample_named_asset(2, "SPY"),
+            sample_named_ta(3, "sma", 10),
+        ];
+        let connections = vec![
+            NodeConnection {
+                from_node_id: 2,
+                from_port_idx: 0,
+                to_node_id: 3,
+                to_port_idx: 0,
+            },
+            NodeConnection {
+                from_node_id: 3,
+                from_port_idx: 0,
+                to_node_id: 1,
+                to_port_idx: 0,
+            },
+        ];
+        let paths = resolve_node_stage_paths(&nodes, &connections);
+        let portfolio_path = paths.get(&1).expect("portfolio path");
+        let usda = compose_pipeline_usda(&nodes, &connections);
+        let context =
+            WorkspaceContext::from_usda_text(&usda).expect("workspace context from composed usda");
+        let snapshot = build_stage_graph_snapshot(context.usd_stage());
+        let engine =
+            MarketLabGraphEngine::compile_from_stage(&snapshot).expect("graph engine compile");
+        let prices: Vec<f64> = (0..22).map(|i| 300.0 + i as f64).collect();
+        let asset_vectors = std::collections::HashMap::from([("SPY".to_string(), prices)]);
+        let result = engine.execute_timeline(&asset_vectors, 22);
+        assert!(
+            result
+                .streams
+                .iter()
+                .any(|stream| {
+                    stream.prim_path == *portfolio_path
+                        && stream.attribute == "outputs:portfolio_wealth"
+                }),
+            "expected portfolio wealth stream at {portfolio_path}, got streams: {:?}",
+            result.streams.iter().map(|s| (&s.prim_path, &s.attribute)).collect::<Vec<_>>()
+        );
+        assert!(
+            result.portfolio_results.contains_key(portfolio_path),
+            "expected portfolio_results for {portfolio_path}"
+        );
+    }
+
+    /// Regression for `marketlab_stage_portfolio_nodes.usda`: three nested portfolio tiers
+    /// must compile, execute, and produce rising NAV when underlying assets trend up.
+    #[test]
+    fn graph_engine_executes_manual_nested_portfolio_stage() {
+        use pulsar_marketlab_core::MarketLabGraphEngine;
+        use pulsar_marketlab_ui::workspace::{build_stage_graph_snapshot, WorkspaceContext};
+
+        const STAGE: &str = r#"#usda 1.0
+(
+    defaultPrim = "MarketLab"
+)
+
+def Scope "MarketLab"
+{
+    def PortfolioIntegrator "Sim_Portfolio_3"
+    {
+        token inputs:id = "Allocation::HierarchicalRiskParity"
+        double inputs:initial_capital = 10000
+        rel inputs:sources = [
+            </MarketLab/Sim_Portfolio_3/Sim_Portfolio_2>,
+            </MarketLab/Sim_Portfolio_3/Sim_Portfolio_1>,
+        ]
+        def PortfolioIntegrator "Sim_Portfolio_1"
+        {
+            token inputs:id = "Allocation::HierarchicalRiskParity"
+            double inputs:initial_capital = 10000
+            rel inputs:sources = [
+                </MarketLab/Sim_Portfolio_3/Sim_Portfolio_1/QQQ>,
+                </MarketLab/Sim_Portfolio_3/Sim_Portfolio_1/SPY>,
+            ]
+            def FinancialAsset "QQQ"
+            {
+                token inputs:symbol = "QQQ"
+            }
+            def FinancialAsset "SPY"
+            {
+                token inputs:symbol = "SPY"
+            }
+        }
+        def PortfolioIntegrator "Sim_Portfolio_2"
+        {
+            token inputs:id = "Allocation::MeanVariance"
+            double inputs:initial_capital = 10000
+            rel inputs:sources = [
+                </MarketLab/Sim_Portfolio_3/Sim_Portfolio_2/AGG>,
+                </MarketLab/Sim_Portfolio_3/Sim_Portfolio_2/TMF>,
+            ]
+            def FinancialAsset "AGG"
+            {
+                token inputs:symbol = "AGG"
+            }
+            def FinancialAsset "TMF"
+            {
+                token inputs:symbol = "TMF"
+            }
+        }
+    }
+}
+"#;
+
+        let context =
+            WorkspaceContext::from_usda_text(STAGE).expect("workspace context from manual stage");
+        let snapshot = build_stage_graph_snapshot(context.usd_stage());
+        let engine =
+            MarketLabGraphEngine::compile_from_stage(&snapshot).expect("graph engine compile");
+
+        let bars = 22;
+        let trend = |base: f64| -> Vec<f64> {
+            (0..bars).map(|i| base + i as f64 * 0.5).collect()
+        };
+        let asset_vectors = std::collections::HashMap::from([
+            ("QQQ".to_string(), trend(400.0)),
+            ("SPY".to_string(), trend(500.0)),
+            ("AGG".to_string(), trend(90.0)),
+            ("TMF".to_string(), trend(15.0)),
+        ]);
+
+        let result = engine.execute_timeline(&asset_vectors, bars);
+
+        let book_one = "/MarketLab/Sim_Portfolio_3/Sim_Portfolio_1";
+        let book_two = "/MarketLab/Sim_Portfolio_3/Sim_Portfolio_2";
+        let master = "/MarketLab/Sim_Portfolio_3";
+
+        for path in [book_one, book_two, master] {
+            let integration = result
+                .portfolio_results
+                .get(path)
+                .unwrap_or_else(|| panic!("missing portfolio_results for {path}"));
+            assert_eq!(
+                integration.wealth_series.len(),
+                bars,
+                "wealth series length for {path}"
+            );
+            let first = integration.wealth_series.first().copied().unwrap_or(0.0);
+            let last = integration.wealth_series.last().copied().unwrap_or(0.0);
+            assert!(
+                last > first + 1.0,
+                "expected rising NAV at {path}, got first={first} last={last}"
+            );
+            assert!(
+                !integration.tracking_matrix.is_empty(),
+                "expected tracking rows for {path}"
+            );
+        }
+
+        let master_last = result.portfolio_results[master].wealth_series.last().copied().unwrap();
+        let blend = result.portfolio_results[book_one].wealth_series.last().copied().unwrap()
+            * 0.5
+            + result.portfolio_results[book_two].wealth_series.last().copied().unwrap() * 0.5;
+        assert!(
+            (master_last - blend).abs() < 50.0,
+            "master NAV should approximate 50/50 child blend: master={master_last} blend={blend}"
+        );
     }
 }

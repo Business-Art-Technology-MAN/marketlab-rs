@@ -240,7 +240,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             return self.render_ta_uber_inspector(cx).into_any_element();
         }
         if self.selected_portfolio_node().is_some() {
-            return self.render_portfolio_analytics_panel().into_any_element();
+            return self.render_portfolio_analytics_panel(cx).into_any_element();
         }
         div().into_any_element()
     }

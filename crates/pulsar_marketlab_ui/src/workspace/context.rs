@@ -681,7 +681,7 @@ impl WorkspaceContext {
         cx.notify();
     }
 
-    pub(crate) fn invalidate_engine_cache(&mut self, _cx: &mut ModelContext<Self>) {
+    pub fn invalidate_engine_cache(&mut self, _cx: &mut ModelContext<Self>) {
         self.engine_cache_generation = self.engine_cache_generation.wrapping_add(1);
     }
 }

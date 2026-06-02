@@ -23,6 +23,13 @@ use crate::workspace_state::{
     format_percent_signed, format_ratio, format_tick_label, MatrixDataRow, TradingSystemWorkspace,
     SIM_INITIAL_CASH,
 };
+use crate::portfolio_integrator_ledger::{
+    render_integrator_ledger_spreadsheet, IntegratorLedgerFilter, IntegratorLedgerHost,
+};
+use crate::portfolio_wealth_chart::{
+    build_portfolio_wealth_chart_from_streams, render_portfolio_wealth_chart,
+    PortfolioChartHost, PortfolioChartOverlayKey,
+};
 
 impl TradingSystemWorkspace {
     pub(crate) fn selected_technical_analysis_node(&self) -> Option<&VisualNode> {
@@ -126,7 +133,12 @@ impl TradingSystemWorkspace {
             input.set_content(path, cx);
         });
     }
-    pub(crate) fn reload_asset_chart_from_path(&mut self, node_id: usize, path: &str) {
+    pub(crate) fn reload_asset_chart_from_path(
+        &mut self,
+        node_id: usize,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) {
         match load_yahoo_finance_csv(path) {
             Ok((_, rows)) => {
                 self.asset_chart_history
@@ -145,9 +157,10 @@ impl TradingSystemWorkspace {
                         );
                     }
                 }
-                self.sync_playhead_bounds();
-                self.sync_playhead_time_from_index();
+                self.snap_playhead_to_last_bar();
                 self.synchronize_inspector_view();
+                self.recompute_playhead_diagnostics();
+                self.request_graph_engine_timeline_refresh(cx);
             }
             Err(error) => {
                 self.push_status_log(format!("Chart reload failed for `{path}`: {error}"));
@@ -172,7 +185,7 @@ impl TradingSystemWorkspace {
             });
             node.name = csv_node_label_from_path(&path);
             self.csv_path_registry.set_path(node_id, path.clone());
-            self.reload_asset_chart_from_path(node_id, &path);
+            self.reload_asset_chart_from_path(node_id, &path, cx);
             self.sync_pipeline_graph(cx);
         }
     }
@@ -404,92 +417,35 @@ impl TradingSystemWorkspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .child(self.render_portfolio_analytics_panel()),
+                    .child(self.render_portfolio_analytics_panel(cx)),
             );
         }
 
         inspector
     }
 
-    pub(crate) fn render_portfolio_analytics_panel(&self) -> impl IntoElement {
-        let Some(metrics) = &self.portfolio_diagnostics else {
-            return div()
-                .mt_3()
-                .p_3()
-                .rounded_md()
-                .bg(rgb(0x141417))
-                .border_1()
-                .border_color(rgb(0x222227))
-                .text_size(px(10.0))
-                .font_family("monospace")
-                .text_color(rgb(0x71717a))
-                .child("Simulation ledger warming up — metrics appear after the first CSV tick.");
-        };
-
-        let tick_label = metrics
-            .tick_label
-            .clone()
-            .unwrap_or_else(|| format_tick_label(metrics.tick_index));
-        let return_color = if metrics.total_return_pct >= 0.0 {
-            rgb(0x10b981)
-        } else {
-            rgb(0xf87171)
-        };
-        let alpha_color = metrics
-            .excess_return_pct
-            .map(|alpha| {
-                if alpha >= 0.0 {
-                    rgb(0x10b981)
-                } else {
-                    rgb(0xf87171)
-                }
-            })
-            .unwrap_or(rgb(0x64748b));
+    pub(crate) fn render_portfolio_analytics_panel(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let metrics = self.portfolio_diagnostics.as_ref();
+        let graph_status = self.portfolio_graph_engine_status_label(cx);
         let wired_sources = self
             .selected_node_id
             .map(|portfolio_id| self.portfolio_wired_sources(portfolio_id))
             .unwrap_or_default();
-        let activity_summary = if metrics.trade_count == 0 {
-            format!(
-                "{} bars · 0 trades · sat in cash (avg exposure {:.0}%)",
-                metrics.bars_processed,
-                metrics.avg_exposure_pct * 100.0
-            )
-        } else {
-            format!(
-                "{} bars · {} trades · avg exposure {:.0}%",
-                metrics.bars_processed,
-                metrics.trade_count,
-                metrics.avg_exposure_pct * 100.0
-            )
-        };
 
-        div()
+        let mut panel = div()
             .mt_3()
             .flex_col()
             .gap_3()
+            .child(self.render_portfolio_diagnostics_summary_section(metrics))
             .child(
                 div()
                     .text_size(px(9.0))
                     .font_family("monospace")
                     .text_color(rgb(0x71717a))
-                    .child(format!(
-                        "Layer 2 ledger · epoch {} · {tick_label} · base {}",
-                        metrics.simulation_epoch,
-                        format_currency(SIM_INITIAL_CASH)
-                    )),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(0x111114))
-                    .border_1()
-                    .border_color(rgb(0x222227))
-                    .text_size(px(9.0))
-                    .font_family("monospace")
-                    .text_color(rgb(0x94a3b8))
-                    .child(activity_summary),
+                    .child(graph_status),
             )
             .when(!wired_sources.is_empty(), |panel| {
                 panel.child(
@@ -522,10 +478,228 @@ impl TradingSystemWorkspace {
             })
             .child(
                 div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x141417))
+                    .border_1()
+                    .border_color(rgb(0x222227))
                     .flex_col()
                     .gap_2()
                     .child(
                         div()
+                            .text_size(px(9.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_family("monospace")
+                            .text_color(rgb(0x94a3b8))
+                            .child("Wealth Timeline"),
+                    )
+                    .child(self.render_portfolio_wealth_chart_section(cx)),
+            );
+
+        if self.portfolio_integrator_ledger_for_selection().is_some() {
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x141417))
+                    .border_1()
+                    .border_color(rgb(0x222227))
+                    .child({
+                        let ledger = self
+                            .portfolio_integrator_ledger_for_selection()
+                            .expect("ledger present");
+                        render_integrator_ledger_spreadsheet(
+                            ledger,
+                            self.portfolio_ledger_filter.clone(),
+                            cx.entity(),
+                        )
+                    }),
+            );
+        }
+
+        panel
+    }
+
+    fn render_portfolio_diagnostics_summary_section(
+        &self,
+        metrics: Option<&crate::workspace_state::PortfolioDiagnosticsSnapshot>,
+    ) -> impl IntoElement {
+        let Some(metrics) = metrics else {
+            return div()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x111114))
+                .border_1()
+                .border_color(rgb(0x222227))
+                .text_size(px(10.0))
+                .font_family("monospace")
+                .text_color(rgb(0x71717a))
+                .child(
+                    "Portfolio metrics appear after the first asset tick. \
+                     Graph-engine wealth and integrator rows below use the compiled portfolio sweep.",
+                );
+        };
+
+        let tick_label = metrics
+            .tick_label
+            .clone()
+            .unwrap_or_else(|| format_tick_label(metrics.tick_index));
+        let return_color = if metrics.total_return_pct >= 0.0 {
+            rgb(0x10b981)
+        } else {
+            rgb(0xf87171)
+        };
+        let alpha_color = metrics
+            .excess_return_pct
+            .map(|alpha| {
+                if alpha >= 0.0 {
+                    rgb(0x10b981)
+                } else {
+                    rgb(0xf87171)
+                }
+            })
+            .unwrap_or(rgb(0x64748b));
+        let activity_summary = if metrics.trade_count == 0 {
+            format!(
+                "{} bars · 0 trades · sat in cash (avg exposure {:.0}%)",
+                metrics.bars_processed,
+                metrics.avg_exposure_pct * 100.0
+            )
+        } else {
+            format!(
+                "{} bars · {} trades · avg exposure {:.0}%",
+                metrics.bars_processed,
+                metrics.trade_count,
+                metrics.avg_exposure_pct * 100.0
+            )
+        };
+
+        div()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x111114))
+                    .border_1()
+                    .border_color(rgb(0x222227))
+                    .text_size(px(9.0))
+                    .font_family("monospace")
+                    .text_color(rgb(0x94a3b8))
+                    .child(activity_summary),
+            )
+            .child(self.render_portfolio_metrics_cards(metrics, return_color, alpha_color))
+            .child(self.render_portfolio_position_ledger(metrics))
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_family("monospace")
+                    .text_color(rgb(0x71717a))
+                    .child(format!(
+                        "CSV simulation ledger · epoch {} · {tick_label} · base {}",
+                        metrics.simulation_epoch,
+                        format_currency(SIM_INITIAL_CASH)
+                    )),
+            )
+    }
+
+    fn render_portfolio_wealth_chart_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(series) = self.portfolio_wealth_chart_for_selection() {
+            return render_portfolio_wealth_chart(
+                series,
+                self.portfolio_chart_overlays,
+                self.playhead_current,
+                cx.entity(),
+            );
+        }
+        if let Some(node) = self.selected_portfolio_node() {
+            let prim_path = self
+                .stage_prim_path_for_node_in_graph(node)
+                .unwrap_or_default();
+            let streams = self.workspace_context.read(cx).computed_streams();
+            if let Some(series) = build_portfolio_wealth_chart_from_streams(
+                streams,
+                &prim_path,
+                self.timeline_bar_labels(),
+            ) {
+                return render_portfolio_wealth_chart(
+                    &series,
+                    self.portfolio_chart_overlays,
+                    self.playhead_current,
+                    cx.entity(),
+                );
+            }
+            return div()
+                .text_size(px(10.0))
+                .font_family("monospace")
+                .text_color(rgb(0x71717a))
+                .child(format!(
+                    "Awaiting graph-engine sweep for `{prim_path}`. \
+                     Wire asset → signal → portfolio and load CSV data."
+                ))
+                .into_any_element();
+        }
+        div()
+            .text_size(px(10.0))
+            .font_family("monospace")
+            .text_color(rgb(0x71717a))
+            .child("Select a portfolio integrator node.")
+            .into_any_element()
+    }
+
+    fn render_portfolio_metrics_cards(
+        &self,
+        metrics: &crate::workspace_state::PortfolioDiagnosticsSnapshot,
+        return_color: gpui::Rgba,
+        alpha_color: gpui::Rgba,
+    ) -> impl IntoElement {
+        div()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(0x141417))
+                    .border_1()
+                    .border_color(rgb(0x222227))
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .font_family("monospace")
+                            .text_color(rgb(0x71717a))
+                            .child("Total Return (R_total)"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::BOLD)
+                            .font_family("monospace")
+                            .text_color(return_color)
+                            .child(format_percent_signed(metrics.total_return_pct)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .font_family("monospace")
+                            .text_color(rgb(0x52525b))
+                            .child(format!(
+                                "NAV {} vs base {}",
+                                format_currency(metrics.nav),
+                                format_currency(SIM_INITIAL_CASH)
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
                             .p_3()
                             .rounded_md()
                             .bg(rgb(0x141417))
@@ -538,227 +712,187 @@ impl TradingSystemWorkspace {
                                     .text_size(px(9.0))
                                     .font_family("monospace")
                                     .text_color(rgb(0x71717a))
-                                    .child("Total Return (R_total)"),
+                                    .child("Buy & Hold Benchmark"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(18.0))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .font_family("monospace")
-                                    .text_color(return_color)
-                                    .child(format_percent_signed(metrics.total_return_pct)),
+                                    .text_color(rgb(0xe2e8f0))
+                                    .child(
+                                        metrics
+                                            .benchmark_return_pct
+                                            .map(format_percent_signed)
+                                            .unwrap_or_else(|| "—".to_string()),
+                                    ),
                             )
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
                                     .text_color(rgb(0x52525b))
-                                    .child(format!(
-                                        "NAV {} vs base {}",
-                                        format_currency(metrics.nav),
-                                        format_currency(SIM_INITIAL_CASH)
-                                    )),
+                                    .child("Same-window asset return"),
                             ),
                     )
                     .child(
                         div()
-                            .flex()
-                            .gap_2()
+                            .flex_1()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x141417))
+                            .border_1()
+                            .border_color(rgb(0x222227))
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .flex_col()
-                                    .gap_1()
+                                    .text_size(px(9.0))
+                                    .font_family("monospace")
+                                    .text_color(rgb(0x71717a))
+                                    .child("Alpha (vs B&H)"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_family("monospace")
+                                    .text_color(alpha_color)
                                     .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x71717a))
-                                            .child("Buy & Hold Benchmark"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .font_family("monospace")
-                                            .text_color(rgb(0xe2e8f0))
-                                            .child(
-                                                metrics
-                                                    .benchmark_return_pct
-                                                    .map(format_percent_signed)
-                                                    .unwrap_or_else(|| "—".to_string()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x52525b))
-                                            .child("Same-window asset return"),
+                                        metrics
+                                            .excess_return_pct
+                                            .map(format_percent_signed)
+                                            .unwrap_or_else(|| "—".to_string()),
                                     ),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x71717a))
-                                            .child("Alpha (vs B&H)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .font_family("monospace")
-                                            .text_color(alpha_color)
-                                            .child(
-                                                metrics
-                                                    .excess_return_pct
-                                                    .map(format_percent_signed)
-                                                    .unwrap_or_else(|| "—".to_string()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x52525b))
-                                            .child("Strategy return minus benchmark"),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x71717a))
-                                            .child("Max Drawdown (MDD)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .font_family("monospace")
-                                            .text_color(rgb(0xf59e0b))
-                                            .child(format_percent_magnitude(
-                                                metrics.max_drawdown_pct,
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .p_3()
-                                    .rounded_md()
-                                    .bg(rgb(0x141417))
-                                    .border_1()
-                                    .border_color(rgb(0x222227))
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x71717a))
-                                            .child("Sharpe Ratio (S)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(16.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .font_family("monospace")
-                                            .text_color(rgb(0x38bdf8))
-                                            .child(format_ratio(metrics.sharpe_ratio)),
-                                    ),
+                                    .text_size(px(9.0))
+                                    .font_family("monospace")
+                                    .text_color(rgb(0x52525b))
+                                    .child("Strategy return minus benchmark"),
                             ),
                     ),
             )
             .child(
                 div()
-                    .p_3()
-                    .rounded_md()
-                    .bg(rgb(0x111114))
-                    .border_1()
-                    .border_color(rgb(0x222227))
-                    .flex_col()
-                    .gap_1()
+                    .flex()
+                    .gap_2()
                     .child(
                         div()
-                            .text_size(px(9.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .font_family("monospace")
-                            .text_color(rgb(0x94a3b8))
-                            .child("Position Ledger"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child("Cash")
+                            .flex_1()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x141417))
+                            .border_1()
+                            .border_color(rgb(0x222227))
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .text_color(rgb(0xe4e4e7))
-                                    .child(format_currency(metrics.cash)),
+                                    .text_size(px(9.0))
+                                    .font_family("monospace")
+                                    .text_color(rgb(0x71717a))
+                                    .child("Max Drawdown (MDD)"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_family("monospace")
+                                    .text_color(rgb(0xf59e0b))
+                                    .child(format_percent_magnitude(metrics.max_drawdown_pct)),
                             ),
                     )
                     .child(
                         div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child("Active Positions")
+                            .flex_1()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x141417))
+                            .border_1()
+                            .border_color(rgb(0x222227))
+                            .flex_col()
+                            .gap_1()
                             .child(
                                 div()
-                                    .text_color(rgb(0xe4e4e7))
-                                    .child(format!("{:.4}", metrics.position_qty)),
+                                    .text_size(px(9.0))
+                                    .font_family("monospace")
+                                    .text_color(rgb(0x71717a))
+                                    .child("Sharpe Ratio (S)"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_family("monospace")
+                                    .text_color(rgb(0x38bdf8))
+                                    .child(format_ratio(metrics.sharpe_ratio)),
                             ),
-                    )
+                    ),
+            )
+    }
+
+    fn render_portfolio_position_ledger(
+        &self,
+        metrics: &crate::workspace_state::PortfolioDiagnosticsSnapshot,
+    ) -> impl IntoElement {
+        div()
+            .p_3()
+            .rounded_md()
+            .bg(rgb(0x111114))
+            .border_1()
+            .border_color(rgb(0x222227))
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_family("monospace")
+                    .text_color(rgb(0x94a3b8))
+                    .child("Position Ledger"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(9.0))
+                    .font_family("monospace")
+                    .text_color(rgb(0x71717a))
+                    .child("Cash")
                     .child(
                         div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(9.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x71717a))
-                            .child("Mark Price")
-                            .child(
-                                div()
-                                    .text_color(rgb(0xe4e4e7))
-                                    .child(format_currency(metrics.mark_price)),
-                            ),
+                            .text_color(rgb(0xe4e4e7))
+                            .child(format_currency(metrics.cash)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(9.0))
+                    .font_family("monospace")
+                    .text_color(rgb(0x71717a))
+                    .child("Active Positions")
+                    .child(
+                        div()
+                            .text_color(rgb(0xe4e4e7))
+                            .child(format!("{:.4}", metrics.position_qty)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(9.0))
+                    .font_family("monospace")
+                    .text_color(rgb(0x71717a))
+                    .child("Mark Price")
+                    .child(
+                        div()
+                            .text_color(rgb(0xe4e4e7))
+                            .child(format_currency(metrics.mark_price)),
                     ),
             )
     }
@@ -900,5 +1034,108 @@ impl TradingSystemWorkspace {
     #[allow(dead_code)]
     pub(crate) fn render_ta_indicator_picker(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
         div().into_any_element()
+    }
+
+    pub(crate) fn set_portfolio_chart_overlay_toggle(
+        &mut self,
+        overlay: PortfolioChartOverlayKey,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match overlay {
+            PortfolioChartOverlayKey::DrawdownShading => {
+                self.portfolio_chart_overlays.drawdown_shading = enabled;
+            }
+            PortfolioChartOverlayKey::SignalMarkers => {
+                self.portfolio_chart_overlays.signal_markers = enabled;
+            }
+            PortfolioChartOverlayKey::RegimeScaleShifts => {
+                self.portfolio_chart_overlays.regime_scale_shifts = enabled;
+            }
+        }
+        cx.notify();
+    }
+}
+
+impl PortfolioChartHost for TradingSystemWorkspace {
+    fn set_portfolio_chart_overlay(
+        &mut self,
+        overlay: PortfolioChartOverlayKey,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_portfolio_chart_overlay_toggle(overlay, enabled, cx);
+    }
+}
+
+impl IntegratorLedgerHost for TradingSystemWorkspace {
+    fn set_integrator_ledger_filter(
+        &mut self,
+        filter: IntegratorLedgerFilter,
+        cx: &mut Context<Self>,
+    ) {
+        self.portfolio_ledger_filter = filter;
+        cx.notify();
+    }
+
+    fn export_integrator_ledger_csv(&mut self, cx: &mut Context<Self>) {
+        let Some(ledger) = self.portfolio_integrator_ledger_for_selection() else {
+            self.push_status_log("Integrator ledger export skipped — no cached matrix.".to_string());
+            return;
+        };
+        let rows: Vec<_> = ledger
+            .rows_for_filter(&self.portfolio_ledger_filter)
+            .into_iter()
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            self.push_status_log("Integrator ledger export skipped — filter returned 0 rows.".to_string());
+            return;
+        }
+
+        let csv = crate::portfolio_integrator_ledger::ledger_csv_content(&rows);
+        let default_name = self
+            .selected_portfolio_node()
+            .map(|node| format!("{}_integrator_ledger.csv", node.name.replace(' ', "_")))
+            .unwrap_or_else(|| "portfolio_integrator_ledger.csv".to_string());
+
+        cx.spawn(async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_file_name(default_name)
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                })
+                .await;
+
+            let Some(path) = picked else {
+                return;
+            };
+
+            let write_result = std::fs::write(&path, csv.as_bytes());
+            let _ = cx.update(|cx| {
+                if let Some(entity) = this.upgrade() {
+                    entity.update(cx, |workspace, cx| {
+                        match write_result {
+                            Ok(()) => workspace.push_status_log(format!(
+                                "Integrator ledger exported — {} rows to `{}`",
+                                rows.len(),
+                                path.display()
+                            )),
+                            Err(error) => workspace.push_status_log(format!(
+                                "Integrator ledger export failed for `{}`: {error}",
+                                path.display()
+                            )),
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
     }
 }

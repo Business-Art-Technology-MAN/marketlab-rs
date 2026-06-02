@@ -16,6 +16,8 @@ mod canvas_compose;
 mod canvas_hydrate;
 mod graph_compiler;
 mod ohlc_chart_pane;
+mod portfolio_integrator_ledger;
+mod portfolio_wealth_chart;
 mod ui;
 mod workspace_state;
 
@@ -23,9 +25,9 @@ use graph_compiler::{portfolio_wired_ta_node_ids, SharedCsvAssetPaths, SharedPip
 use workspace_state::{
     csv_playback_is_active, finalize_csv_playback_at_eof, format_multivector_scalar,
     hot_swap_csv_playback, init_csv_playback_from_path, market_window_from_yahoo_rows,
-    restart_csv_playback, send_chart_series_preload, send_playhead_set, ta_tick_messages_for_asset,
-    CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge, TradingSystemWorkspace,
-    ticker_from_csv_path,
+    restart_csv_playback, send_chart_series_preload, send_playhead_set, send_playhead_set_to_last_bar,
+    ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge,
+    TradingSystemWorkspace, ticker_from_csv_path,
 };
 
 const CSV_PLAYBACK_INTERVAL: Duration = Duration::from_millis(400);
@@ -127,7 +129,7 @@ fn spawn_csv_asset_feeder(
         }
         ta_execution.publish_baseline(&tx);
         if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
-            send_playhead_set(&tx, 0, playback.rows.len(), None);
+            send_playhead_set_to_last_bar(&tx, playback.rows.len());
         }
         let _ = tx.send(PipelineSystemMessage::StatusAlert {
             text: format!(

@@ -3,6 +3,7 @@
 mod binary;
 mod compiler;
 mod engine;
+mod portfolio;
 mod script_resolve;
 
 pub use binary::{
@@ -22,6 +23,12 @@ pub use script_resolve::{
     compile_unified_script, normalize_for_series_eval, resolve_otl_script_src, OtlScriptContext,
 };
 pub use engine::{
-    ComputedAttributeStream, ExecutionNode, GraphCompileSpec, GraphCompileWire, GraphEngineError,
-    MarketLabGraphEngine, SignalTransformFn, StageGraphPrim, StageGraphSnapshot,
+    ComputedAttributeStream, EvaluationContext, ExecutionNode, GraphCompileSpec, GraphCompileWire,
+    GraphEngineError, MarketLabGraphEngine, SignalTransformFn, StageGraphPrim, StageGraphSnapshot,
+    TimelineExecutionResult,
+};
+pub use portfolio::{
+    integrate_portfolio, AssetQuote, BasePosition, ClosureLegKind, DirectionalDistribution,
+    PortfolioIntegrationResult, PortfolioIntegratorConfig, PortfolioOtlState,
+    PortfolioOtlTransformFn, PortfolioTrackingFrame, SymbolicOtlClosure,
 };

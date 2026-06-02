@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::*;
@@ -681,8 +682,7 @@ pub fn restart_csv_playback(
 ) {
     ta_execution.begin_new_epoch();
     for playback in playbacks.iter_mut() {
-        playback.cursor = 0;
-        playback.reader_paused = playback.rows.is_empty();
+        csv_playback_park_at_last_bar(playback);
     }
     let epoch = ta_execution.simulation_epoch();
     let _ = tx.send(PipelineSystemMessage::ResetSimulation { simulation_epoch: epoch });
@@ -692,7 +692,7 @@ pub fn restart_csv_playback(
         .filter(|playback| !playback.rows.is_empty())
         .count();
     if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
-        send_playhead_set(tx, 0, playback.rows.len(), None);
+        send_playhead_set_to_last_bar(tx, playback.rows.len());
     }
     let _ = tx.send(PipelineSystemMessage::StatusAlert {
         text: format!(
@@ -739,6 +739,26 @@ pub fn send_playhead_set(
         total_bars,
         tick_label,
     });
+}
+
+/// Position the feeder/UI playhead at the final bar of a loaded CSV series.
+pub fn send_playhead_set_to_last_bar(tx: &Sender<PipelineSystemMessage>, total_bars: usize) {
+    if total_bars == 0 {
+        send_playhead_set(tx, 0, 0, None);
+    } else {
+        send_playhead_set(tx, total_bars - 1, total_bars, None);
+    }
+}
+
+/// Non-realtime CSV sources stay parked on the last bar until replay is requested.
+pub fn csv_playback_park_at_last_bar(playback: &mut CsvAssetPlayback) {
+    if playback.rows.is_empty() {
+        playback.cursor = 0;
+        playback.reader_paused = true;
+    } else {
+        playback.cursor = playback.rows.len() - 1;
+        playback.reader_paused = true;
+    }
 }
 
 pub fn csv_playback_is_active(playbacks: &[CsvAssetPlayback]) -> bool {
@@ -1361,6 +1381,9 @@ pub struct TradingSystemWorkspace {
     pub(crate) graph_engine_last_compile_ms: u64,
     pub(crate) graph_engine_recompile_inflight: bool,
     pub(crate) graph_engine_recompile_pending: bool,
+    pub(crate) graph_engine_asset_data_epoch: u64,
+    pub(crate) graph_engine_last_swept_asset_epoch: u64,
+    pub(crate) graph_engine_compile_error: Option<String>,
     /// Suppresses reactive observers while the workspace entity is still being constructed.
     pub(crate) bootstrapping: bool,
     /// On-disk path for the active USD root layer (Save / Save As target).
@@ -1378,6 +1401,14 @@ pub struct TradingSystemWorkspace {
     pub(crate) node_lookback_inputs: HashMap<usize, Entity<InputState>>,
     /// Guards one-time inline lookback input construction.
     pub(crate) node_lookback_inputs_ready: bool,
+    /// Pre-computed portfolio wealth timelines keyed by USD prim path.
+    pub(crate) portfolio_timeline_cache: HashMap<String, crate::portfolio_wealth_chart::PortfolioWealthChartSeries>,
+    /// Integrator tracking matrix rows keyed by portfolio prim path.
+    pub(crate) portfolio_ledger_cache: HashMap<String, Arc<crate::portfolio_integrator_ledger::PortfolioIntegratorLedger>>,
+    /// Active quick-filter for the integrator ledger spreadsheet.
+    pub(crate) portfolio_ledger_filter: crate::portfolio_integrator_ledger::IntegratorLedgerFilter,
+    /// Overlay toggles for the portfolio analytics wealth chart.
+    pub(crate) portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles,
 }
 
 fn blank_usd_stage_bridge() -> UsdStageBridge {
@@ -1471,6 +1502,9 @@ impl TradingSystemWorkspace {
             graph_engine_last_compile_ms: 0,
             graph_engine_recompile_inflight: false,
             graph_engine_recompile_pending: false,
+            graph_engine_asset_data_epoch: 0,
+            graph_engine_last_swept_asset_epoch: 0,
+            graph_engine_compile_error: None,
             bootstrapping: true,
             usd_document_path: None,
             canvas_tabs: vec![pulsar_marketlab_ui::workspace::CanvasEnvironmentTab::root()],
@@ -1480,6 +1514,10 @@ impl TradingSystemWorkspace {
             last_ui_selection_generation: 0,
             node_lookback_inputs: HashMap::new(),
             node_lookback_inputs_ready: false,
+            portfolio_timeline_cache: HashMap::new(),
+            portfolio_ledger_cache: HashMap::new(),
+            portfolio_ledger_filter: crate::portfolio_integrator_ledger::IntegratorLedgerFilter::default(),
+            portfolio_chart_overlays: crate::portfolio_wealth_chart::PortfolioChartOverlayToggles::with_defaults(),
         };
 
         workspace.sync_playhead_bounds();
@@ -1607,6 +1645,109 @@ impl TradingSystemWorkspace {
             &self.nodes,
             &self.connections,
         )
+    }
+
+    pub(crate) fn timeline_bar_labels(&self) -> Option<Vec<String>> {
+        let timeline_len = self.playhead_total_bars.max(
+            self.asset_ohlc_history
+                .values()
+                .map(|bars| bars.len())
+                .max()
+                .unwrap_or(0),
+        );
+        if timeline_len == 0 {
+            return None;
+        }
+        self.asset_ohlc_history.values().find_map(|bars| {
+            if bars.is_empty() {
+                return None;
+            }
+            Some(
+                bars.iter()
+                    .take(timeline_len)
+                    .map(|bar| bar.date.clone())
+                    .collect(),
+            )
+        })
+    }
+
+    pub(crate) fn refresh_portfolio_wealth_chart_cache(
+        &mut self,
+        result: &pulsar_marketlab_core::TimelineExecutionResult,
+    ) {
+        use crate::portfolio_integrator_ledger::build_integrator_ledger;
+        use crate::portfolio_wealth_chart::{
+            build_portfolio_wealth_chart_from_streams, build_portfolio_wealth_chart_series,
+        };
+
+        let bar_labels = self.timeline_bar_labels();
+        self.portfolio_timeline_cache.clear();
+        self.portfolio_ledger_cache.clear();
+
+        for (prim_path, integration) in &result.portfolio_results {
+            self.portfolio_timeline_cache.insert(
+                prim_path.clone(),
+                build_portfolio_wealth_chart_series(integration, bar_labels.clone()),
+            );
+            self.portfolio_ledger_cache.insert(
+                prim_path.clone(),
+                Arc::new(build_integrator_ledger(integration, bar_labels.clone())),
+            );
+        }
+
+        if self.portfolio_timeline_cache.is_empty() {
+            for node in &self.nodes {
+                if !node.node_type.is_portfolio() {
+                    continue;
+                }
+                let Some(prim_path) = self.stage_prim_path_for_node_in_graph(node) else {
+                    continue;
+                };
+                if let Some(series) = build_portfolio_wealth_chart_from_streams(
+                    &result.streams,
+                    &prim_path,
+                    bar_labels.clone(),
+                ) {
+                    self.portfolio_timeline_cache.insert(prim_path.clone(), series);
+                }
+                if !self.portfolio_ledger_cache.contains_key(&prim_path) {
+                    self.portfolio_ledger_cache.insert(
+                        prim_path,
+                        Arc::new(build_integrator_ledger(
+                            &pulsar_marketlab_core::PortfolioIntegrationResult {
+                                wealth_series: Vec::new(),
+                                tracking_matrix: Vec::new(),
+                            },
+                            bar_labels.clone(),
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) fn portfolio_wealth_chart_for_selection(
+        &self,
+    ) -> Option<&crate::portfolio_wealth_chart::PortfolioWealthChartSeries> {
+        let selected_id = self.selected_node_id?;
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == selected_id && node.node_type.is_portfolio())?;
+        let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
+        self.portfolio_timeline_cache.get(&prim_path)
+    }
+
+    pub(crate) fn portfolio_integrator_ledger_for_selection(
+        &self,
+    ) -> Option<Arc<crate::portfolio_integrator_ledger::PortfolioIntegratorLedger>> {
+        let selected_id = self.selected_node_id?;
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == selected_id && node.node_type.is_portfolio())?;
+        let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
+        self.portfolio_ledger_cache.get(&prim_path).cloned()
     }
 
     pub(crate) fn node_id_for_stage_path(&self, prim_path: &str) -> Option<usize> {
@@ -1779,6 +1920,8 @@ impl TradingSystemWorkspace {
         self.last_node_header_click = None;
         self.inspector_data.clear();
         self.portfolio_diagnostics = None;
+        self.portfolio_timeline_cache.clear();
+        self.portfolio_ledger_cache.clear();
         self.playhead_current = 0;
         self.playhead_time = 0.0;
         self.playhead_scrubbing = false;
@@ -1823,6 +1966,19 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn sync_pipeline_graph(&mut self, cx: &mut Context<Self>) {
+        use crate::graph_compiler::{
+            portfolio_ensure_spare_input_port, sync_portfolio_input_ports_from_connections,
+        };
+        sync_portfolio_input_ports_from_connections(&mut self.nodes, &self.connections);
+        let portfolio_ids: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|node| node.node_type.is_portfolio())
+            .map(|node| node.id)
+            .collect();
+        for portfolio_id in portfolio_ids {
+            portfolio_ensure_spare_input_port(&mut self.nodes, &self.connections, portfolio_id);
+        }
         self.pipeline_graph
             .replace(self.nodes.clone(), self.connections.clone());
         self.publish_canvas_to_usd_stage(cx);
@@ -1903,12 +2059,81 @@ impl TradingSystemWorkspace {
                     ctx.set_edit_target_layer(Some(layer), cx);
                 }
             }
+            ctx.invalidate_engine_cache(cx);
             cx.notify();
         });
+        self.graph_engine_last_compiled_generation = u64::MAX;
         if let Some(path) = preserved_selection.as_deref() {
             self.selected_node_id = self.node_id_for_stage_path(path);
         }
         self.sync_workspace_ledger(cx);
+        let entity = cx.entity();
+        pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+    }
+
+    /// Re-run the background timeline sweep after asset OHLC data changes without a full USD recompose.
+    pub(crate) fn request_graph_engine_timeline_refresh(&mut self, cx: &mut Context<Self>) {
+        self.graph_engine_asset_data_epoch = self.graph_engine_asset_data_epoch.wrapping_add(1);
+        let entity = cx.entity();
+        pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+    }
+
+    pub(crate) fn bump_graph_engine_asset_data_epoch(&mut self) {
+        self.graph_engine_asset_data_epoch = self.graph_engine_asset_data_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn asset_quote_symbol_for_node(&self, node: &VisualNode) -> String {
+        if let Some(path) = self.stage_prim_path_for_node_in_graph(node) {
+            if let Some(leaf) = path.rsplit('/').next().filter(|leaf| !leaf.is_empty()) {
+                return leaf.trim_end_matches(".csv").to_string();
+            }
+        }
+        if let NodeType::AssetAdaptor { prim_path } = &node.node_type {
+            if let Some(leaf) = prim_path.rsplit('/').next().filter(|leaf| !leaf.is_empty()) {
+                return leaf.to_string();
+            }
+        }
+        node.name.trim_end_matches(".csv").to_string()
+    }
+
+    pub(crate) fn portfolio_graph_engine_status_label(&self, cx: &App) -> String {
+        if self.graph_engine_recompile_inflight {
+            return "Graph engine · compiling portfolio sweep…".to_string();
+        }
+        if let Some(error) = &self.graph_engine_compile_error {
+            return format!("Graph engine · compile failed · {error}");
+        }
+        let workspace = self.workspace_context.read(cx);
+        if workspace.is_engine_cache_dirty(self.graph_engine_last_compiled_generation) {
+            return "Graph engine · pending recompile".to_string();
+        }
+        if self.graph_engine_timeline_len() == 0 {
+            return "Graph engine · waiting for OHLC bars (bind CSV on asset node)".to_string();
+        }
+        if self.graph_engine_last_compile_ms > 0 {
+            let portfolio_streams = workspace
+                .computed_streams()
+                .iter()
+                .filter(|stream| stream.attribute == "outputs:portfolio_wealth")
+                .count();
+            return format!(
+                "Graph engine · ready ({} ms) · {} streams · {} portfolio wealth",
+                self.graph_engine_last_compile_ms,
+                workspace.computed_streams().len(),
+                portfolio_streams
+            );
+        }
+        "Graph engine · idle".to_string()
+    }
+
+    fn graph_engine_timeline_len(&self) -> usize {
+        self.playhead_total_bars.max(
+            self.asset_ohlc_history
+                .values()
+                .map(|bars| bars.len())
+                .max()
+                .unwrap_or(0),
+        )
     }
 
     pub(crate) fn chart_bars_for_selection(&self) -> Vec<OhlcBar> {
@@ -1965,6 +2190,15 @@ impl TradingSystemWorkspace {
                 .min(self.playhead_total_bars - 1);
         }
         self.sync_playhead_time_from_index();
+    }
+
+    /// Snap the evaluation playhead to the final bar of the active OHLC series.
+    pub(crate) fn snap_playhead_to_last_bar(&mut self) {
+        self.sync_playhead_bounds();
+        if self.playhead_total_bars > 0 {
+            self.playhead_current = self.playhead_total_bars - 1;
+            self.sync_playhead_time_from_index();
+        }
     }
 
     pub(crate) fn sync_playhead_time_from_index(&mut self) {
@@ -2266,11 +2500,10 @@ impl TradingSystemWorkspace {
                                                 );
                                             }
                                         }
-                                        workspace.playhead_current = 0;
-                                        workspace.sync_playhead_bounds();
-                                        workspace.sync_playhead_time_from_index();
+                                        workspace.snap_playhead_to_last_bar();
                                         workspace.synchronize_inspector_view();
                                         workspace.recompute_playhead_diagnostics();
+                                        workspace.request_graph_engine_timeline_refresh(cx);
                                         cx.notify();
                                     });
                                 }
@@ -2426,14 +2659,16 @@ pub(crate) struct CsvAssetPlayback {
 
 pub fn init_csv_playback_from_path(node_id: usize, path: &str) -> Result<CsvAssetPlayback, String> {
     let (ticker, rows) = load_yahoo_finance_csv(path)?;
-    Ok(CsvAssetPlayback {
+    let mut playback = CsvAssetPlayback {
         node_id,
         ticker,
         rows,
         cursor: 0,
         current_active_path: path.to_string(),
-        reader_paused: false,
-    })
+        reader_paused: true,
+    };
+    csv_playback_park_at_last_bar(&mut playback);
+    Ok(playback)
 }
 pub fn hot_swap_csv_playback(
     playback: &mut CsvAssetPlayback,
@@ -2460,10 +2695,10 @@ pub fn hot_swap_csv_playback(
             let row_count = rows.len();
             playback.ticker = ticker;
             playback.rows = rows;
-            playback.cursor = 0;
             playback.current_active_path = new_path.to_string();
-            playback.reader_paused = false;
+            csv_playback_park_at_last_bar(playback);
             send_chart_series_preload(tx, playback.node_id, &playback.rows);
+            send_playhead_set_to_last_bar(tx, row_count);
             let _ = tx.send(PipelineSystemMessage::StatusAlert {
                 text: format!(
                     "CSV source bound — node {} streaming `{new_path}` ({row_count} rows)",

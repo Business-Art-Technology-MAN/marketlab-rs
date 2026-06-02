@@ -1,6 +1,7 @@
 //! Core MarketLab resources: OpenUSD financial schema and shared constants.
 
 mod orchestration;
+mod frontend;
 mod schema_defaults;
 mod schema_sidecar;
 mod ta_uber_signal;
@@ -17,10 +18,11 @@ pub use orchestration::{
     normalize_for_series_eval, normalize_script_for_compile, parse, parse_script_entry_point_name,
     parse_script_scalar_uniforms, parse_script_signature, parse_with_context,
     resolve_otl_script_src, rsi, set_script_uniform_default, sma, tokenize, BinOp, CompileError,
-    CompiledSeries, ComputedAttributeStream, ExecutionNode, Expr, GraphCompileSpec, OslParamType,
+    CompiledSeries, ComputedAttributeStream, EvaluationContext, ExecutionNode, Expr, GraphCompileSpec, OslParamType,
     OslParameter, ScriptCompileContext, ScriptSignature, GraphCompileWire, GraphEngineError,
-    MultiSeriesClosure, OtlScriptContext, MarketLabGraphEngine, SeriesClosure, SignalTransformFn,
-    StageGraphPrim, StageGraphSnapshot, Token,
+    MultiSeriesClosure, OtlScriptContext, MarketLabGraphEngine, PortfolioIntegrationResult,
+    PortfolioTrackingFrame, SeriesClosure, SignalTransformFn, StageGraphPrim, StageGraphSnapshot,
+    SymbolicOtlClosure, TimelineExecutionResult, Token,
 };
 pub use ta_uber_signal::{
     algorithm_display_label, compose_uber_script_src, hyperparameter_visibility,
@@ -32,6 +34,12 @@ pub use schema_sidecar::{
     embed_schema_inline_in_layer, ensure_schema_sidecar_for_document, initial_stage_usda,
     schema_class_definitions_usda, schema_sidecar_directory, schema_sidecar_path_for_document,
     schema_sidecar_usda, SCHEMA_SIDECAR_FILENAME, SCHEMA_SUBLAYER_REF,
+};
+pub use frontend::{
+    compile_object_program, object_kind_from_token, parse_program as parse_object_program,
+    tokenize_object_declarations, validate_object, validate_program, FrontendError,
+    OtlObjectDeclaration, OtlObjectKind, OtlProgram, OtlType, ParseError as OtlParseError,
+    PortDirection, PropertyDeclaration, Statement, ValidationError,
 };
 
 #[cfg(test)]

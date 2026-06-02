@@ -123,6 +123,42 @@ fn ta_result_output_wires_into_portfolio() {
 }
 
 #[test]
+fn second_ta_result_wires_into_portfolio_signal_in_one() {
+    let ta = sample_ta_node(4);
+    let mut portfolio = sample_portfolio_node(5);
+    portfolio.inputs.push(portfolio_signal_port_label(1));
+    assert!(connection_is_valid(&ta, 0, &portfolio, 1));
+}
+
+#[test]
+fn sync_portfolio_ports_expands_inputs_for_wired_second_socket() {
+    let mut nodes = vec![sample_ta_node(3), sample_ta_node(4), sample_portfolio_node(5)];
+    let connections = vec![
+        NodeConnection {
+            from_node_id: 3,
+            from_port_idx: 0,
+            to_node_id: 5,
+            to_port_idx: 0,
+        },
+        NodeConnection {
+            from_node_id: 4,
+            from_port_idx: 0,
+            to_node_id: 5,
+            to_port_idx: 1,
+        },
+    ];
+    sync_portfolio_input_ports_from_connections(&mut nodes, &connections);
+    let portfolio = nodes.iter().find(|node| node.id == 5).expect("portfolio");
+    assert!(portfolio.inputs.len() >= 2);
+    assert!(connection_is_valid(
+        nodes.iter().find(|node| node.id == 4).expect("ta"),
+        0,
+        portfolio,
+        1,
+    ));
+}
+
+#[test]
 fn portfolio_output_wires_into_parent_portfolio() {
     let sub = sample_portfolio_node(2);
     let master = sample_portfolio_node(3);

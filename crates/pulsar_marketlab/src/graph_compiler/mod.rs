@@ -1,12 +1,17 @@
 //! Graph configuration, shared snapshots, and DAG compilation.
 
 mod otl_stdlib_catalog;
+mod otl_registry;
 mod registry;
 
 #[cfg(test)]
 mod tests;
 
 pub use otl_stdlib_catalog::{OtlStdlibPreset, OTL_STDLIB_PRESETS};
+pub use otl_registry::{
+    otl_object_kind_for_node, otl_object_registry_snapshot, register_otl_object,
+    register_otl_object_from_source, OtlObjectRegistry, RegistryError,
+};
 pub use registry::{
     apply_canonical_ta_ports, connection_is_valid, effective_otl_script, input_port_kind,
     output_port_kind, otl_script_context, resolved_otl_script, sync_otl_shader_aov_ports,
@@ -132,7 +137,41 @@ pub fn compile_graph_to_dag(snapshot: &PipelineGraphSnapshot) -> (Vec<usize>, bo
     }
 }
 
+/// Ensure portfolio nodes declare enough `Signal In N` sockets for wired connections.
+pub fn sync_portfolio_input_ports_from_connections(
+    nodes: &mut [VisualNode],
+    connections: &[NodeConnection],
+) {
+    for node in nodes.iter_mut() {
+        if !node.node_type.is_portfolio() {
+            continue;
+        }
+        let max_used_port = connections
+            .iter()
+            .filter(|connection| connection.to_node_id == node.id)
+            .map(|connection| connection.to_port_idx)
+            .max();
+        let minimum_ports = match max_used_port {
+            Some(max_port) => max_port + 2,
+            None => 1,
+        };
+        while node.inputs.len() < minimum_ports {
+            node.inputs.push(portfolio_signal_port_label(node.inputs.len()));
+        }
+    }
+}
+
 fn finalize_snapshot(mut snapshot: PipelineGraphSnapshot) -> PipelineGraphSnapshot {
+    sync_portfolio_input_ports_from_connections(&mut snapshot.nodes, &snapshot.connections);
+    let portfolio_ids: Vec<usize> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.node_type.is_portfolio())
+        .map(|node| node.id)
+        .collect();
+    for portfolio_id in portfolio_ids {
+        portfolio_ensure_spare_input_port(&mut snapshot.nodes, &snapshot.connections, portfolio_id);
+    }
     let wiring_errors = validate_graph_wiring(&snapshot);
     snapshot.wiring_valid = wiring_errors.is_empty();
     snapshot.wiring_errors = wiring_errors;
