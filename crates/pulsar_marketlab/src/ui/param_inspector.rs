@@ -53,8 +53,7 @@ impl TradingSystemWorkspace {
                 node.dsl_formula = Some(trimmed.to_string());
             }
             self.sync_pipeline_graph(cx);
-            self.invalidate_playhead_evaluation_cache();
-            self.recompute_playhead_diagnostics();
+            self.sync_view_window(cx);
             cx.notify();
         }
     }
@@ -124,16 +123,12 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             "Ready".to_string()
         };
 
-        let playhead_eval_status = if self.playhead_eval_inflight {
-            if self.playhead_eval_pending {
-                "Running (queued)".to_string()
-            } else {
-                "Running".to_string()
-            }
-        } else if self.playhead_eval_pending {
-            "Queued".to_string()
+        let view_window_status = if self.graph_engine_recompile_inflight {
+            "Vectorized sweep running".to_string()
+        } else if workspace.computed_streams().is_empty() {
+            "Awaiting graph-engine sweep".to_string()
         } else {
-            "Idle".to_string()
+            format!("Ready · {} streams", workspace.computed_streams().len())
         };
 
         Some(GlobalPipelineOverview {
@@ -144,7 +139,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             graph_revision: self.pipeline_graph.revision(),
             computed_stream_count: workspace.computed_streams().len(),
             last_compile_ms: self.graph_engine_last_compile_ms,
-            playhead_eval_status,
+            view_window_status,
             stage_overlay_kib: workspace.usd_stage().overlay_memory_kib(),
         })
     }
@@ -224,8 +219,7 @@ impl ParamInspectorPane for TradingSystemWorkspace {
         }
         self.sync_otl_aov_ports(node_id);
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
-        self.recompute_playhead_diagnostics();
+        self.sync_view_window(cx);
         cx.notify();
     }
 

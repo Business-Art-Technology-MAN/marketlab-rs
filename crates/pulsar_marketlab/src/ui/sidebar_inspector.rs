@@ -159,7 +159,7 @@ impl TradingSystemWorkspace {
                 }
                 self.snap_playhead_to_last_bar();
                 self.synchronize_inspector_view();
-                self.recompute_playhead_diagnostics();
+                self.sync_view_window(cx);
                 self.request_graph_engine_timeline_refresh(cx);
             }
             Err(error) => {
@@ -432,9 +432,7 @@ impl TradingSystemWorkspace {
             .global::<crate::ui::telemetry_bridge::MetricsTelemetryBridge>()
             .global_metrics
             .clone();
-        let metrics = self
-            .portfolio_diagnostics_for_selection()
-            .or(self.portfolio_diagnostics.as_ref());
+        let metrics = self.portfolio_diagnostics_for_selection();
         let graph_status = self.portfolio_graph_engine_status_label(cx);
         let wired_sources = self
             .selected_node_id

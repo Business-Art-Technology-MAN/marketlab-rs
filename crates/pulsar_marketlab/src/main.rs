@@ -30,7 +30,7 @@ use workspace_state::{
     csv_playback_is_active, finalize_csv_playback_at_eof, format_multivector_scalar,
     hot_swap_csv_playback, init_csv_playback_from_path, market_window_from_yahoo_rows,
     restart_csv_playback, send_chart_series_preload, send_playhead_set, send_playhead_set_to_last_bar,
-    ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage, TaExecutionBridge,
+    ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage,
     TradingSystemWorkspace, ticker_from_csv_path,
 };
 
@@ -117,34 +117,33 @@ fn spawn_csv_asset_feeder(
     fix_clock: Arc<FixPlayheadClock>,
 ) {
     std::thread::spawn(move || {
-        let mut playbacks = match init_csv_asset_playbacks(&path_registry) {
-            Ok(playbacks) if !playbacks.is_empty() => playbacks,
-            Ok(_) => return,
+        let mut playbacks: Vec<CsvAssetPlayback> = match init_csv_asset_playbacks(&path_registry) {
+            Ok(playbacks) => playbacks,
             Err(error) => {
                 let _ = tx.send(PipelineSystemMessage::StatusAlert { text: error });
-                return;
+                Vec::new()
             }
         };
-
-        let mut ta_execution = TaExecutionBridge::new();
 
         for playback in &playbacks {
             send_chart_series_preload(&tx, playback.node_id, &playback.rows);
         }
-        ta_execution.publish_baseline(&tx);
         if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
             send_playhead_set_to_last_bar(&tx, playback.rows.len());
         }
-        let _ = tx.send(PipelineSystemMessage::StatusAlert {
-            text: format!(
-                "CSV asset feeder armed — {} Yahoo source(s) @ {}ms/tick; pauses at EOF, replays on change",
-                playbacks.len(),
-                CSV_PLAYBACK_INTERVAL.as_millis()
-            ),
-        });
+        if !playbacks.is_empty() {
+            let _ = tx.send(PipelineSystemMessage::StatusAlert {
+                text: format!(
+                    "CSV asset feeder armed — {} Yahoo source(s) @ {}ms/tick; pauses at EOF, replays on change",
+                    playbacks.len(),
+                    CSV_PLAYBACK_INTERVAL.as_millis()
+                ),
+            });
+        }
 
         let mut last_graph_revision = pipeline_graph.revision();
         let mut last_paths_revision = path_registry.revision();
+        let mut armed_announced = !playbacks.is_empty();
 
         loop {
             std::thread::sleep(CSV_PLAYBACK_INTERVAL);
@@ -155,10 +154,21 @@ fn spawn_csv_asset_feeder(
                 graph_revision != last_graph_revision || paths_revision != last_paths_revision;
             let registry_changed = inspect_csv_path_hot_swaps(&mut playbacks, &path_registry, &tx);
 
+            if registry_changed && !playbacks.is_empty() && !armed_announced {
+                armed_announced = true;
+                let _ = tx.send(PipelineSystemMessage::StatusAlert {
+                    text: format!(
+                        "CSV asset feeder armed — {} Yahoo source(s) @ {}ms/tick; pauses at EOF, replays on change",
+                        playbacks.len(),
+                        CSV_PLAYBACK_INTERVAL.as_millis()
+                    ),
+                });
+            }
+
             if config_changed || registry_changed {
                 last_graph_revision = graph_revision;
                 last_paths_revision = paths_revision;
-                restart_csv_playback(&mut playbacks, &mut ta_execution, &tx);
+                restart_csv_playback(&mut playbacks, &tx);
             }
 
             if !csv_playback_is_active(&playbacks) {
@@ -167,9 +177,7 @@ fn spawn_csv_asset_feeder(
 
             let graph = pipeline_graph.snapshot();
             let portfolio_ta_filter = portfolio_wired_ta_node_ids(&graph);
-            let mut any_processed = false;
             let mut epoch_end = false;
-            let mut last_close = 0.0;
             let mut last_label = None::<String>;
 
             for playback in &mut playbacks {
@@ -177,22 +185,13 @@ fn spawn_csv_asset_feeder(
                     continue;
                 }
 
-                any_processed = true;
                 let row = &playback.rows[playback.cursor];
-                last_close = row.close;
                 last_label = Some(row.date.clone());
                 let window =
                     market_window_from_yahoo_rows(&playback.rows, playback.cursor + 1);
                 let bar_time = pulsar_marketlab::stage_time_from_bar_date(&row.date)
                     .unwrap_or(playback.cursor as f64);
                 fix_clock.set_bar_epoch(bar_time);
-                TaExecutionBridge::record_market_price(
-                    ta_execution.simulation_stage_mut(),
-                    &playback.ticker,
-                    bar_time,
-                    row.close,
-                );
-                let execution = (&mut ta_execution, &tx);
                 let mut messages = vec![PipelineSystemMessage::TickUpdate {
                     tick_index: playback.cursor,
                     tick_label: Some(row.date.clone()),
@@ -209,7 +208,6 @@ fn spawn_csv_asset_feeder(
                     &window,
                     &graph,
                     row.close,
-                    Some(execution),
                     Some(&portfolio_ta_filter),
                 ));
                 for message in messages {
@@ -233,18 +231,6 @@ fn spawn_csv_asset_feeder(
                 }
             }
 
-            if any_processed {
-                let bar_time = last_label
-                    .as_deref()
-                    .and_then(pulsar_marketlab::stage_time_from_bar_date)
-                    .unwrap_or(0.0);
-                let ticker = playbacks
-                    .iter()
-                    .find(|playback| !playback.rows.is_empty())
-                    .map(|playback| playback.ticker.as_str())
-                    .unwrap_or("SPY");
-                ta_execution.finish_simulation_tick(bar_time, &[ticker], last_close);
-            }
             if epoch_end {
                 finalize_csv_playback_at_eof(&mut playbacks, &tx, last_label);
             }

@@ -16,7 +16,7 @@ impl TradingSystemWorkspace {
         self.playhead_current = index.min(self.playhead_total_bars - 1);
         self.sync_playhead_time_from_index();
         cx.notify();
-        self.spawn_playhead_evaluation_async(cx);
+        self.sync_view_window(cx);
     }
 
     pub(crate) fn playhead_index_from_position(&self, position: Point<Pixels>) -> Option<usize> {

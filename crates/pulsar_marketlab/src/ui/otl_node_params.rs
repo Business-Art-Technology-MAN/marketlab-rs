@@ -116,7 +116,6 @@ impl TradingSystemWorkspace {
                 this.push_status_log(format!("OTL port topology: {}", error.message));
             }
             this.sync_pipeline_graph(cx);
-            this.invalidate_playhead_evaluation_cache();
             cx.notify();
         })
         .detach();

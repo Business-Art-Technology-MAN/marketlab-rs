@@ -59,8 +59,8 @@ impl RenderViewportPane for TradingSystemWorkspace {
         self.set_playhead_index(index.min(max_index), cx);
     }
 
-    fn dispatch_playhead_evaluation_async(&mut self, cx: &mut Context<Self>) {
-        self.spawn_playhead_evaluation_async(cx);
+    fn sync_view_window_on_scrub(&mut self, cx: &mut Context<Self>) {
+        self.sync_view_window(cx);
     }
 
     fn render_playhead_chart(&mut self, cx: &mut Context<Self>) -> impl IntoElement {

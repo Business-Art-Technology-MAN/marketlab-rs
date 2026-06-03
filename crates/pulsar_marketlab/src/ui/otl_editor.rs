@@ -104,8 +104,7 @@ impl TradingSystemWorkspace {
                     ));
                 }
                 self.sync_pipeline_graph(cx);
-                self.invalidate_playhead_evaluation_cache();
-                self.recompute_playhead_diagnostics();
+                self.sync_view_window(cx);
             }
             Some(OtlEditorTarget::StagePrim(path)) => {
                 let workspace_context = self.workspace_context.clone();

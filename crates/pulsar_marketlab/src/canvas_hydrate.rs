@@ -15,9 +15,10 @@ use pulsar_marketlab_ui::workspace::blender_slot_position;
 
 use crate::canvas_compose::{compose_pipeline_usda, resolve_node_stage_paths, stage_prim_path_for_node};
 use crate::graph_compiler::{
-    apply_canonical_ta_ports, ta_uber_from_legacy_indicator, NodeConnection, NodeGradeType,
-    NodeType, TaArchetype, TaUberSignalConfig, VisualNode,
+    apply_canonical_ta_ports, ta_uber_from_legacy_indicator, AssetSourceType, NodeConnection,
+    NodeGradeType, NodeType, TaArchetype, TaUberSignalConfig, VisualNode,
 };
+use crate::workspace_state::resolve_csv_path;
 
 const LINEAGE_RELATIONSHIPS: &[&str] = &["inputs:underlying", "inputs:sources"];
 
@@ -127,6 +128,29 @@ fn blender_tier_for_kind(kind: ExecutablePrimKind) -> u8 {
     }
 }
 
+fn hydrate_asset_source(
+    prim_path: &str,
+    symbol: &str,
+    bridge: &UsdStageBridge,
+) -> Option<AssetSourceType> {
+    if let Some(path) = bridge.field_string(prim_path, "inputs:csv_path") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Some(AssetSourceType::Csv {
+                path: path.to_string(),
+            });
+        }
+    }
+
+    let symbol_key = symbol.trim_end_matches(".csv");
+    let candidate = format!("data/{symbol_key}.csv");
+    if resolve_csv_path(&candidate).is_file() {
+        return Some(AssetSourceType::Csv { path: candidate });
+    }
+
+    None
+}
+
 fn build_visual_node(
     id: usize,
     prim_path: &str,
@@ -140,6 +164,7 @@ fn build_visual_node(
                 .field_string(prim_path, "inputs:symbol")
                 .or_else(|| prim_path.rsplit('/').next().map(str::to_string))
                 .unwrap_or_else(|| "ASSET".to_string());
+            let asset_source = hydrate_asset_source(prim_path, &symbol, bridge);
             Some(VisualNode {
                 id,
                 name: format!("{symbol}.csv"),
@@ -148,7 +173,7 @@ fn build_visual_node(
                 portfolio_allocation_id: None,
                 dsl_formula: None,
                 aov_outputs: Vec::new(),
-                asset_source: None,
+                asset_source,
                 x,
                 y,
                 collapsed: false,

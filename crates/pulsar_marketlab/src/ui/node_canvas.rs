@@ -27,11 +27,12 @@ use pulsar_marketlab_ui::workspace::{
     DCC_CAPSULE_WIDTH, DCC_HEADER_ACTIVE, DCC_NODE_CORNER_RADIUS_PX, DCC_NODE_HULL,
     DCC_NODE_SELECTED, DCC_TEXT_PRIMARY, NODE_SELECTION_HALO,
 };
+use pulsar_marketlab::trading_stage::analytics_prim_path;
 use pulsar_marketlab_ui::{node_dropdown_trigger, NodeNumberInput};
 use crate::workspace_state::{
     parse_chart_date_ordinal, ChartHistoryBuffer, CHART_Y_MIN_SPAN, CHART_Y_PADDING_RATIO,
     format_currency, format_percent_signed, format_ratio,
-    TaExecutionBridge, TradingSystemWorkspace, CHART_STROKE_WIDTH,
+    TradingSystemWorkspace, CHART_STROKE_WIDTH,
 };
 
 const AGGREGATOR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
@@ -323,7 +324,7 @@ impl TradingSystemWorkspace {
         self.selected_node_id = Some(node_id);
         self.context_menu_pos = None;
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
+        self.sync_view_window(cx);
         cx.notify();
     }
 
@@ -366,7 +367,7 @@ impl TradingSystemWorkspace {
         self.selected_node_id = Some(node_id);
         self.context_menu_pos = None;
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
+        self.sync_view_window(cx);
         cx.notify();
     }
 
@@ -406,7 +407,7 @@ impl TradingSystemWorkspace {
         });
         self.context_menu_pos = None;
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
+        self.sync_view_window(cx);
         self.prompt_csv_for_node(node_id, cx);
     }
 
@@ -443,7 +444,7 @@ impl TradingSystemWorkspace {
         self.selected_node_id = Some(node_id);
         self.context_menu_pos = None;
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
+        self.sync_view_window(cx);
         cx.notify();
     }
 
@@ -516,16 +517,17 @@ impl TradingSystemWorkspace {
         }
 
         if from_is_ta {
-            let mut bridge = TaExecutionBridge::new();
-            bridge.clear_ta_signal_slot(from_node_id, &mut self.market_stage);
+            let indicator_id = format!("ta_{from_node_id}");
+            if let Ok(path) = analytics_prim_path(&indicator_id) {
+                self.market_stage.prims.remove(&path);
+            }
         }
 
         self.push_status_log(format!(
             "Wire disconnected — node {from_node_id} → node {to_node_id} port {to_port_idx}"
         ));
         self.sync_pipeline_graph(cx);
-        self.invalidate_playhead_evaluation_cache();
-        self.recompute_playhead_diagnostics();
+        self.sync_view_window(cx);
         cx.notify();
     }
 
@@ -621,8 +623,8 @@ impl TradingSystemWorkspace {
             self.push_status_log(format!(
                 "Wire connected → node {to_node_id} port {port} (from node {from_node_id})"
             ));
-            self.invalidate_playhead_evaluation_cache();
-            self.recompute_playhead_diagnostics();
+            self.sync_pipeline_graph(cx);
+            self.sync_view_window(cx);
             cx.notify();
         }
     }

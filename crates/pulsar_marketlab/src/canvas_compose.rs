@@ -562,7 +562,8 @@ fn write_prim(
             write_bool(out, &inner, "inputs:active", true);
             write_token(out, &inner, "inputs:symbol", symbol);
             write_token(out, &inner, "inputs:provider", "yahoo");
-            if matches!(node.asset_source, Some(AssetSourceType::Csv { .. })) {
+            if let Some(AssetSourceType::Csv { path: csv_path }) = &node.asset_source {
+                write_string(out, &inner, "inputs:csv_path", csv_path);
                 write_token(out, &inner, "inputs:asset_class", "Equity");
             }
         }

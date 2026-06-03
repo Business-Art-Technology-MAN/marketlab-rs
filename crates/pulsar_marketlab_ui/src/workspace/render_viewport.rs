@@ -21,7 +21,7 @@ pub trait RenderViewportPane: Sized {
     fn playhead_slider_bounds(&self) -> Option<Bounds<Pixels>>;
     fn set_playhead_slider_bounds(&mut self, bounds: Bounds<Pixels>);
     fn set_playhead_from_slider(&mut self, normalized: f32, cx: &mut Context<Self>);
-    fn dispatch_playhead_evaluation_async(&mut self, cx: &mut Context<Self>);
+    fn sync_view_window_on_scrub(&mut self, cx: &mut Context<Self>);
     fn render_playhead_chart(&mut self, cx: &mut Context<Self>) -> impl IntoElement;
     fn status_log_lines(&self) -> &[String];
 }
@@ -136,7 +136,7 @@ pub fn render_render_viewport<H: RenderViewportPane + 'static>(
                         .child(
                             div()
                                 .text_color(rgb(0x34d399))
-                                .child("Evaluation coordinate"),
+                                .child("View window index"),
                         ),
                 )
                 .child(

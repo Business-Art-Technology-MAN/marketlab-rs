@@ -17,7 +17,7 @@ pub struct GlobalPipelineOverview {
     pub graph_revision: u64,
     pub computed_stream_count: usize,
     pub last_compile_ms: u64,
-    pub playhead_eval_status: String,
+    pub view_window_status: String,
     pub stage_overlay_kib: u64,
 }
 
@@ -139,7 +139,7 @@ fn render_global_pipeline_overview(overview: GlobalPipelineOverview) -> impl Int
             format!("{} ms", overview.last_compile_ms),
             6,
         ))
-        .child(overview_row("Playhead Eval", overview.playhead_eval_status, 7))
+        .child(overview_row("View Window", overview.view_window_status, 7))
         .child(overview_row(
             "Stage Overlay",
             format!("{} KiB", overview.stage_overlay_kib),

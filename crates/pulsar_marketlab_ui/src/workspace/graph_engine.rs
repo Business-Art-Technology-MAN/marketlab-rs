@@ -78,7 +78,7 @@ pub trait GraphEngineInvalidationHost: Sized + 'static {
     }
 }
 
-/// Dispatch a background graph-engine timeline sweep and bounce results to UI state.
+/// Dispatch a background graph-engine vectorized timeline execution and bounce results to UI state.
 pub fn spawn_graph_engine_timeline_sweep<H: GraphEngineInvalidationHost>(
     view: Entity<H>,
     cx: &mut Context<H>,

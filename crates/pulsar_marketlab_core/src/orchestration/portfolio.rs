@@ -148,9 +148,12 @@ fn resolve_asset_quote<'a>(quotes: &'a HashMap<String, AssetQuote>, asset_id: &s
 }
 
 /// Build symbolic closure tokens from upstream scalar series (one token per upstream leg).
+///
+/// Baseline weights are equal placeholders; [`integrate_portfolio`] applies the selected
+/// allocation method at bar 0 using quote history.
 pub fn closures_from_upstream_legs(
     legs: &[(String, Vec<f64>, ClosureLegKind)],
-    allocation_method: &str,
+    _allocation_method: &str,
 ) -> Vec<SymbolicOtlClosure> {
     if legs.is_empty() {
         return Vec::new();
@@ -159,7 +162,6 @@ pub fn closures_from_upstream_legs(
     let n = legs.len() as f64;
     legs.iter()
         .map(|(asset_id, series, leg_kind)| {
-            let baseline = baseline_weight_for_method(allocation_method, n);
             let direction = match leg_kind {
                 ClosureLegKind::SubPortfolio => DirectionalDistribution::MarketLong,
                 ClosureLegKind::Asset => direction_from_series(series),
@@ -167,7 +169,7 @@ pub fn closures_from_upstream_legs(
             SymbolicOtlClosure {
                 asset_id: normalize_asset_quote_key(asset_id),
                 direction,
-                closure_raw_weight: baseline,
+                closure_raw_weight: 1.0 / n,
                 signal_series: series.clone(),
                 leg_kind: *leg_kind,
             }
@@ -175,13 +177,104 @@ pub fn closures_from_upstream_legs(
         .collect()
 }
 
-fn baseline_weight_for_method(method: &str, leg_count: f64) -> f64 {
+fn log_returns_from_series(series: &[f64]) -> Vec<f64> {
+    series
+        .windows(2)
+        .filter_map(|window| {
+            let prev = window[0];
+            let next = window[1];
+            if prev.is_finite() && next.is_finite() && prev.abs() > f64::EPSILON {
+                Some((next / prev).ln())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn mean_and_std(samples: &[f64]) -> (f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let variance =
+        samples.iter().map(|sample| (sample - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+    (mean, variance.sqrt().max(1e-6))
+}
+
+fn leg_return_stats(
+    closure: &SymbolicOtlClosure,
+    quotes: &HashMap<String, AssetQuote>,
+) -> (f64, f64) {
+    let series = match closure.leg_kind {
+        ClosureLegKind::SubPortfolio => closure.signal_series.as_slice(),
+        ClosureLegKind::Asset => {
+            let quote = resolve_asset_quote(quotes, &closure.asset_id);
+            return mean_and_std(&log_returns_from_series(&quote.price_series));
+        }
+    };
+    mean_and_std(&log_returns_from_series(series))
+}
+
+/// Compute normalized portfolio weights for the selected allocation method.
+pub fn compute_allocation_weights(
+    method: &str,
+    closures: &[SymbolicOtlClosure],
+    quotes: &HashMap<String, AssetQuote>,
+) -> Vec<f64> {
+    let n = closures.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if method.contains("EqualWeight") {
+        return vec![1.0 / n as f64; n];
+    }
+
+    let stats: Vec<(f64, f64)> = closures
+        .iter()
+        .map(|closure| leg_return_stats(closure, quotes))
+        .collect();
+
     if method.contains("HierarchicalRiskParity") {
-        1.0 / leg_count * 0.92
-    } else if method.contains("EqualWeight") {
-        1.0 / leg_count
-    } else {
-        1.0 / leg_count * 0.85
+        let inv_vol: Vec<f64> = stats.iter().map(|(_, vol)| 1.0 / vol).collect();
+        let sum: f64 = inv_vol.iter().sum();
+        if sum > f64::EPSILON {
+            return inv_vol.iter().map(|weight| weight / sum).collect();
+        }
+    } else if method.contains("MeanVariance") {
+        let scores: Vec<f64> = stats
+            .iter()
+            .map(|(mean, vol)| (mean / (vol * vol)).max(0.0))
+            .collect();
+        let sum: f64 = scores.iter().sum();
+        if sum > f64::EPSILON {
+            return scores.iter().map(|weight| weight / sum).collect();
+        }
+    }
+
+    vec![1.0 / n as f64; n]
+}
+
+fn apply_allocation_weights(
+    positions: &mut [BasePosition],
+    closures: &[SymbolicOtlClosure],
+    method: &str,
+    quotes: &HashMap<String, AssetQuote>,
+    total_equity: f64,
+) {
+    let weights = compute_allocation_weights(method, closures, quotes);
+    for (position, weight) in positions.iter_mut().zip(weights.iter()) {
+        position.closure_raw_weight = *weight;
+        position.altered_portfolio_weight = *weight * position.direction.sign();
+        position.cash_allocation = total_equity * position.altered_portfolio_weight;
+        if position.leg_kind == ClosureLegKind::SubPortfolio {
+            position.nominal_units = *weight;
+        } else {
+            let denom = position.nominal_price * position.contract_multiplier;
+            if denom > 0.0 {
+                position.nominal_units = (total_equity * *weight) / denom;
+            }
+        }
     }
 }
 
@@ -275,27 +368,6 @@ pub fn default_portfolio_otl_hook(state: PortfolioOtlState<'_>) {
     }
 }
 
-fn normalize_weights(positions: &mut [BasePosition], total_equity: f64) {
-    let gross: f64 = positions.iter().map(|p| p.closure_raw_weight.abs()).sum();
-    if gross <= f64::EPSILON {
-        return;
-    }
-    for position in positions.iter_mut() {
-        let normalized = position.closure_raw_weight / gross;
-        position.closure_raw_weight = normalized;
-        position.altered_portfolio_weight = normalized * position.direction.sign();
-        position.cash_allocation = total_equity * position.altered_portfolio_weight;
-        if position.leg_kind == ClosureLegKind::SubPortfolio {
-            position.nominal_units = normalized;
-        } else {
-            let denom = position.nominal_price * position.contract_multiplier;
-            if denom > 0.0 {
-                position.nominal_units = (total_equity * normalized) / denom;
-            }
-        }
-    }
-}
-
 fn investment_return(
     prior_units: f64,
     current_units: f64,
@@ -363,7 +435,13 @@ pub fn integrate_portfolio(
             let sizing_equity = config.initial_capital;
             let mut positions =
                 map_closures_to_base_positions(&bar_closures, quotes, sizing_equity, bar);
-            normalize_weights(&mut positions, sizing_equity);
+            apply_allocation_weights(
+                &mut positions,
+                &bar_closures,
+                &config.allocation_method,
+                quotes,
+                sizing_equity,
+            );
 
             let drawdown = 0.0;
             hook(PortfolioOtlState {
@@ -665,5 +743,124 @@ mod tests {
             otl_script: "reduce on drawdown",
         });
         assert!(positions[0].altered_portfolio_weight < 1.0);
+    }
+
+    #[test]
+    fn allocation_methods_produce_distinct_weights_for_heterogeneous_volatility() {
+        let closures = vec![
+            SymbolicOtlClosure {
+                asset_id: "LOW_VOL".to_string(),
+                direction: DirectionalDistribution::MarketLong,
+                closure_raw_weight: 0.5,
+                signal_series: vec![100.0; 20],
+                leg_kind: ClosureLegKind::Asset,
+            },
+            SymbolicOtlClosure {
+                asset_id: "HIGH_VOL".to_string(),
+                direction: DirectionalDistribution::MarketLong,
+                closure_raw_weight: 0.5,
+                signal_series: (0..20)
+                    .map(|i| 100.0 + (i as f64 * 3.0).sin() * 10.0)
+                    .collect(),
+                leg_kind: ClosureLegKind::Asset,
+            },
+        ];
+        let quotes = HashMap::from([
+            (
+                "LOW_VOL".to_string(),
+                AssetQuote {
+                    price_series: vec![100.0; 20],
+                    contract_multiplier: 1.0,
+                },
+            ),
+            (
+                "HIGH_VOL".to_string(),
+                AssetQuote {
+                    price_series: (0..20)
+                        .map(|i| 100.0 + (i as f64 * 3.0).sin() * 10.0)
+                        .collect(),
+                    contract_multiplier: 1.0,
+                },
+            ),
+        ]);
+
+        let equal = compute_allocation_weights("Allocation::EqualWeight", &closures, &quotes);
+        let hrp = compute_allocation_weights("Allocation::HierarchicalRiskParity", &closures, &quotes);
+        let mean_var = compute_allocation_weights("Allocation::MeanVariance", &closures, &quotes);
+
+        assert!((equal[0] - 0.5).abs() < 1e-9);
+        assert!((equal[1] - 0.5).abs() < 1e-9);
+        assert!(hrp[0] > equal[0], "HRP should overweight lower-vol leg");
+        assert!(hrp[0] > hrp[1]);
+        assert_ne!(hrp, mean_var);
+    }
+
+    #[test]
+    fn integrate_portfolio_allocation_method_changes_wealth_path() {
+        let low_vol_prices: Vec<f64> = (0..10).map(|i| 100.0 + i as f64 * 0.1).collect();
+        let high_vol_prices: Vec<f64> = (0..10)
+            .map(|i| 100.0 + (i as f64 * 2.5).sin() * 8.0 + i as f64 * 0.05)
+            .collect();
+        let closures = vec![
+            SymbolicOtlClosure {
+                asset_id: "LOW_VOL".to_string(),
+                direction: DirectionalDistribution::MarketLong,
+                closure_raw_weight: 0.5,
+                signal_series: low_vol_prices.clone(),
+                leg_kind: ClosureLegKind::Asset,
+            },
+            SymbolicOtlClosure {
+                asset_id: "HIGH_VOL".to_string(),
+                direction: DirectionalDistribution::MarketLong,
+                closure_raw_weight: 0.5,
+                signal_series: high_vol_prices.clone(),
+                leg_kind: ClosureLegKind::Asset,
+            },
+        ];
+        let quotes = HashMap::from([
+            (
+                "LOW_VOL".to_string(),
+                AssetQuote {
+                    price_series: low_vol_prices,
+                    contract_multiplier: 1.0,
+                },
+            ),
+            (
+                "HIGH_VOL".to_string(),
+                AssetQuote {
+                    price_series: high_vol_prices,
+                    contract_multiplier: 1.0,
+                },
+            ),
+        ]);
+
+        let equal = integrate_portfolio(
+            &closures,
+            &quotes,
+            10,
+            &PortfolioIntegratorConfig {
+                allocation_method: "Allocation::EqualWeight".to_string(),
+                initial_capital: 10_000.0,
+                otl_script: String::new(),
+            },
+            None,
+        );
+        let hrp = integrate_portfolio(
+            &closures,
+            &quotes,
+            10,
+            &PortfolioIntegratorConfig {
+                allocation_method: "Allocation::HierarchicalRiskParity".to_string(),
+                initial_capital: 10_000.0,
+                otl_script: String::new(),
+            },
+            None,
+        );
+
+        assert_ne!(
+            equal.wealth_series.last(),
+            hrp.wealth_series.last(),
+            "allocation method should change terminal wealth"
+        );
     }
 }

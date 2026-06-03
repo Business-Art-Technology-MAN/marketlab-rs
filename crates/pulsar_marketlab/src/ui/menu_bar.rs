@@ -17,8 +17,7 @@ impl TradingSystemWorkspace {
             *stage = bridge;
             cx.notify();
         });
-        self.invalidate_playhead_evaluation_cache();
-        self.spawn_playhead_evaluation_async(cx);
+        self.sync_view_window(cx);
         cx.notify();
     }
 
@@ -97,10 +96,8 @@ impl TradingSystemWorkspace {
 
         self.sync_pipeline_graph(cx);
         self.sync_playhead_bounds();
-        self.synchronize_inspector_view();
-        self.recompute_playhead_diagnostics();
-        self.invalidate_playhead_evaluation_cache();
-        self.spawn_playhead_evaluation_async(cx);
+        self.preload_bound_csv_assets(cx);
+        self.sync_view_window(cx);
         cx.notify();
         self.schedule_session_autosave();
     }
