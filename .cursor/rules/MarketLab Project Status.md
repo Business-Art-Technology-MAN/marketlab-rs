@@ -75,7 +75,7 @@ Default fixture: **6 assets × 2872 bars**. Optional: `RISKPARITY_PORTFOLIO_DIR`
 
 ## Active roadmap
 
-1. **Tier hardening (v8.0)** — remove silent zero-fill; parallel/sequential equivalence
+1. **Tier hardening (v8.0)** — signal tier errors passthrough upstream (no silent zero-fill); parallel/sequential equivalence test in core
 2. **Persistent in-memory USD stage (v9 Phase B)** — eliminate repeated `Stage::open` on structural queries
 3. **New time-navigation viewport** — post-playhead clean slate
 4. **Logical topology from canvas snapshot** — dopesheet tree without live stage walk

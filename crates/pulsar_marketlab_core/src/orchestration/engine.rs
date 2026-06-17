@@ -919,7 +919,7 @@ impl MarketLabGraphEngine {
                             })
                             .unwrap_or_else(|_| {
                                 tier_workspace.rollback_signal_attempt();
-                                vec![0.0; timeline_len]
+                                pad_or_trim_slice(upstream, timeline_len).to_vec()
                             })
                     } else {
                         vec![0.0; timeline_len]

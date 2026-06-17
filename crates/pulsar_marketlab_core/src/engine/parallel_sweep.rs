@@ -332,4 +332,78 @@ signal gate(input closure raw, output closure gated) {
         assert!(outcomes[0].error.is_none());
         assert_eq!(outcomes[0].convictions.len(), 10);
     }
+
+    #[test]
+    fn parallel_batch_matches_sequential_signal_sweep() {
+        let source = r#"
+signal gate(input closure raw, output closure gated) {
+    gated = sma(data, 8);
+}
+"#;
+        let program = compile_object_program(source).expect("parse");
+        let template =
+            compile_object_tier(&program, &ObjectCodegenRegistry::default()).expect("compile");
+        let ctx = ParallelSweepContext {
+            timeline_len: 20,
+            initial_capital: 1_000_000.0,
+            allocation_method: "Allocation::EqualWeight".into(),
+            asset_quotes: HashMap::new(),
+        };
+        let upstream: Vec<f64> = (0..20).map(|bar| 50.0 + bar as f64 * 0.75).collect();
+        let jobs = vec![
+            ParallelSignalJob {
+                node_index: NodeIndex::new(0),
+                prim_path: "/sig/a".into(),
+                column: 0,
+                upstream: upstream.clone(),
+                expression: "sma(data,8)".into(),
+            },
+            ParallelSignalJob {
+                node_index: NodeIndex::new(1),
+                prim_path: "/sig/b".into(),
+                column: 1,
+                upstream: upstream.iter().map(|value| value + 12.0).collect(),
+                expression: "sma(data,8)".into(),
+            },
+        ];
+
+        let mut parallel_tiers = vec![template.fork_for_sweep(), template.fork_for_sweep()];
+        let parallel_outcomes = run_parallel_signal_batch(&jobs, &mut parallel_tiers, &ctx);
+        assert_eq!(parallel_outcomes.len(), 2);
+        assert!(parallel_outcomes.iter().all(|outcome| outcome.error.is_none()));
+
+        for (job, outcome) in jobs.iter().zip(parallel_outcomes.iter()) {
+            let mut sequential_tier = template.fork_for_sweep();
+            let mut exec_ctx = ExecutionContext::new(
+                ctx.timeline_len,
+                ctx.initial_capital,
+                &ctx.allocation_method,
+                ctx.asset_quotes.clone(),
+                HashMap::new(),
+            );
+            exec_ctx.signal_upstream = job.upstream.clone();
+            exec_ctx.signal_output_column = job.column;
+            let mut matrix = GraphSeriesMatrix::with_capacity(ctx.timeline_len, 2, job.column + 1);
+            evaluate_compiled_tier(&mut exec_ctx, &mut sequential_tier, &mut matrix)
+                .expect("sequential tier sweep");
+            let sequential: Vec<f64> = (0..ctx.timeline_len)
+                .map(|bar| {
+                    matrix
+                        .read_signal(job.column, bar)
+                        .expect("sequential signal bar")
+                })
+                .collect();
+            assert_eq!(
+                sequential.len(),
+                outcome.convictions.len(),
+                "sequential and parallel sweep lengths must match"
+            );
+            for (left, right) in sequential.iter().zip(&outcome.convictions) {
+                assert!(
+                    (left - right).abs() < 1e-9,
+                    "parallel batch must match sequential tier sweep (left={left}, right={right})"
+                );
+            }
+        }
+    }
 }

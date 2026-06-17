@@ -1,0 +1,7 @@
+# Local spike fix: WGPUI requires cursor updates during paint.
+# Plugin_Blueprints called window.set_window_cursor_style() from mouse handlers.
+#
+# Apply after cloning external/Plugin_Blueprints (or re-run setup + manual edits):
+# - GraphCanvasPanel.pending_cursor field
+# - input.rs: queue cursor on canvas instead of set_window_cursor_style
+# - workspace_panels render: div().cursor(self.pending_cursor)

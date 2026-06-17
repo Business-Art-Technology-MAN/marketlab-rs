@@ -9,6 +9,7 @@ members = [
 exclude = [
     "external\\Plugin_Blueprints",
     "external\\Graphy",
+    "crates\\marketlab_finance_editor",
 ]
 
 [workspace.dependencies]
