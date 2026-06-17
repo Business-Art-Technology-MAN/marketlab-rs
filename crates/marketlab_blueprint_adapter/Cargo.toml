@@ -1,0 +1,10 @@
+[package]
+name = "marketlab_blueprint_adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Bridge Graphy blueprint graphs to MarketLab StageGraphSnapshot (Track B spike)"
+
+[dependencies]
+pulsar_marketlab_core = { path = "../pulsar_marketlab_core" }
+graphy = { git = "https://github.com/Far-Beyond-Pulsar/Graphy", rev = "e89c5c7b42ed23b06cc8f53dfc618ac8adfb3bb2" }
+serde_json = "1.0"
