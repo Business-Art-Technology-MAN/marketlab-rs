@@ -22,6 +22,14 @@ function Ensure-Clone($name, $url) {
 Ensure-Clone "Plugin_Blueprints" "https://github.com/Far-Beyond-Pulsar/Plugin_Blueprints.git"
 Ensure-Clone "Graphy" "https://github.com/Far-Beyond-Pulsar/Graphy.git"
 
+$pbpCargo = Join-Path $external "Plugin_Blueprints\.cargo"
+$configTemplate = Join-Path $root "scripts\patches\plugin_blueprints_cargo_config.toml"
+if (Test-Path $configTemplate) {
+    New-Item -ItemType Directory -Force -Path $pbpCargo | Out-Null
+    Copy-Item $configTemplate (Join-Path $pbpCargo "config.toml") -Force
+    Write-Host "Installed shared target-dir config for Plugin_Blueprints"
+}
+
 Write-Host ""
 Write-Host "Finance editor (after applying patches in scripts/patches/README.md):"
 Write-Host "  cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml"

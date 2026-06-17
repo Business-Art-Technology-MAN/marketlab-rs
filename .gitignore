@@ -4,3 +4,7 @@ target/
 .DS_Store
 .history/
 external/
+
+# Finance blueprint compile debug spill (regenerated on compile)
+finance_stage_snapshot.txt
+blueprint_graph_debug.json

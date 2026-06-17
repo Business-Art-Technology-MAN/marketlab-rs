@@ -1,49 +1,73 @@
-# Plugin_Blueprints finance patches
+# Finance editor setup
 
-`external/Plugin_Blueprints` is gitignored. After cloning upstream, apply the MarketLab finance spike edits below (or copy from a machine that already has them).
+This folder documents how to run the MarketLab finance blueprint editor on your machine.
 
-## Setup
+## What you get
+
+- A node-graph editor for finance workflows (assets → TA/OTL → portfolio)
+- **Compile** runs a backtest sweep and shows results in the right panel
+- **Wealth Chart** tab (bottom dock) plots portfolio wealth over time
+- Sample price data for SPY, QQQ, IWM, and GLD ships with the repo — leave **CSV path** empty on asset nodes
+
+## Quick start
+
+1. Clone this repo and install Rust if needed.
+
+2. Fetch the blueprint UI dependency (one-time):
+
+   ```powershell
+   .\scripts\setup_pulsar_external.ps1
+   ```
+
+3. Apply the finance UI patches to `external/Plugin_Blueprints` (see file list below), or copy from a machine that already has them. That folder is not in git.
+
+4. Run the editor:
+
+   ```powershell
+   cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml
+   ```
+
+5. In the editor: add a **Financial Asset** (symbol `SPY`), wire it to a **Portfolio Integrator**, click **Compile**. Check **Sweep Results** on the right and the **Wealth Chart** tab at the bottom.
+
+## Tips
+
+- **Symbol** — ticker name, e.g. `SPY`. Used to find bundled CSV at `crates/pulsar_marketlab/data/{SYMBOL}.csv`.
+- **CSV path** — leave blank for bundled samples. Only set this if you have your own CSV file on disk (full path, not just the ticker).
+- **Disk space** — builds share one `target/` folder. To reclaim space after experimenting: `.\scripts\clean_build_artifacts.ps1`
+
+## Regenerate sample CSVs
+
+Bundled OHLC files are ~252 trading days of synthetic data for local testing:
 
 ```powershell
-.\scripts\setup_pulsar_external.ps1
+python scripts/generate_bundled_sample_csvs.py
 ```
 
-Then apply finance-mode changes to `external/Plugin_Blueprints` (see file list). Build:
+## Finance UI patches (external folder)
 
-```powershell
-cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml
-# or (same graph, external manifest)
-cargo run --manifest-path external/Plugin_Blueprints/Cargo.toml --example standalone_finance
-```
-
-## Finance-mode file touch list
+After `setup_pulsar_external.ps1`, edit files under `external/Plugin_Blueprints`:
 
 | Area | Files |
 |------|--------|
 | Compile mode | `src/core/types.rs` — `CompileMode::MarketLabFinance` |
-| Compile + sweep | `src/features/compilation/compiler.rs` — `compile_to_finance_snapshot()`, sweep after compile |
-| Panel state | `src/editor/panel.rs` — `last_finance_sweep`, `last_finance_portfolio_by_node` |
-| Workspace layout | `src/editor/workspace.rs` — wealth chart bottom dock in finance mode |
-| Panels | `src/editor/workspace_panels.rs` — finance property inputs, `FinanceWealthChartPanel` |
-| Properties UI | `src/ui_components/properties.rs` — finance editors, sweep banner |
+| Compile + sweep | `src/features/compilation/compiler.rs` |
+| Panel state | `src/editor/panel.rs` |
+| Workspace layout | `src/editor/workspace.rs` |
+| Panels | `src/editor/workspace_panels.rs` |
+| Properties UI | `src/ui_components/properties.rs` |
 | Wealth chart | `src/ui_components/finance_wealth_chart.rs` |
-| Pin compatibility | `src/core/types.rs` — `finance_data_types_compatible` in `is_compatible_with` |
-| Definitions | `src/core/definitions.rs` — merge finance metadata, skip PBGC type registration for finance nodes |
-| Toolbar | `src/editor/toolbar.rs` — finance compile mode label |
+| Pin compatibility | `src/core/types.rs` |
+| Definitions | `src/core/definitions.rs` |
+| Toolbar | `src/editor/toolbar.rs` |
 | Example | `examples/standalone_finance.rs` |
-| Cursor fix | `src/rendering/input.rs`, `workspace_panels.rs` — `pending_cursor` pattern (see `plugin_blueprints_wgpui_cursor.patch`) |
 
-## Workspace crates
-
-- `crates/marketlab_blueprint_adapter` — Graphy → `StageGraphSnapshot` → engine sweep (in git)
-- `crates/marketlab_finance_editor` — first-party WGPUI host binary (`cargo run -p marketlab_finance_editor`)
-
-## Dependency path
-
-`external/Plugin_Blueprints/Cargo.toml` must include:
+`external/Plugin_Blueprints/Cargo.toml` needs:
 
 ```toml
 marketlab_blueprint_adapter = { path = "../../crates/marketlab_blueprint_adapter" }
 ```
 
-Pinned `graphy` rev must match the adapter crate.
+## Crates in this repo
+
+- `crates/marketlab_blueprint_adapter` — converts the graph to engine format and runs sweeps
+- `crates/marketlab_finance_editor` — standalone editor binary (recommended entry point)

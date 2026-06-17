@@ -8,3 +8,7 @@ description = "Bridge Graphy blueprint graphs to MarketLab StageGraphSnapshot (T
 pulsar_marketlab_core = { path = "../pulsar_marketlab_core" }
 graphy = { git = "https://github.com/Far-Beyond-Pulsar/Graphy", rev = "e89c5c7b42ed23b06cc8f53dfc618ac8adfb3bb2" }
 serde_json = "1.0"
+csv = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

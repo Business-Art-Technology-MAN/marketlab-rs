@@ -1,0 +1,3 @@
+# Share the repo-root target dir (avoids a third ~10GB copy under crates/).
+[build]
+target-dir = "../../target"

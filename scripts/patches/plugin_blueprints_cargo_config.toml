@@ -1,0 +1,3 @@
+# Copy to external/Plugin_Blueprints/.cargo/config.toml after clone.
+[build]
+target-dir = "../../target"

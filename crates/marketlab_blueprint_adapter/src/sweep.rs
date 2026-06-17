@@ -235,32 +235,14 @@ fn build_asset_vectors(snapshot: &StageGraphSnapshot) -> (HashMap<String, Shared
             .unwrap_or_default();
         let explicit_csv = prim.attributes.get("inputs:csv_path");
 
-        let series = match resolve_asset_csv_path(&symbol, explicit_csv) {
-            Some(path) => match load_close_prices(path.to_string_lossy().as_ref()) {
-                Ok(prices) => {
-                    meta.loaded += 1;
-                    Some(prices)
-                }
-                Err(error) => {
-                    meta.warnings.push(format!(
-                        "{}: CSV load failed ({error}) — using flat synthetic prices",
-                        prim.path
-                    ));
-                    meta.synthetic += 1;
-                    Some(flat_series(DEFAULT_BAR_COUNT))
-                }
-            },
-            None => None,
-        };
-
-        let series = series.unwrap_or_else(|| {
+        let (series, loaded, synthetic) =
+            load_asset_close_series(&symbol, explicit_csv, &prim.path, &mut meta.warnings);
+        if loaded {
+            meta.loaded += 1;
+        }
+        if synthetic {
             meta.synthetic += 1;
-            meta.warnings.push(format!(
-                "{} ({symbol}): no csv_path and no bundled data — using flat synthetic prices",
-                prim.path
-            ));
-            flat_series(DEFAULT_BAR_COUNT)
-        });
+        }
 
         vectors.insert(
             prim.path.clone(),
@@ -289,38 +271,152 @@ fn flat_series(len: usize) -> Vec<f64> {
     vec![FLAT_FALLBACK_PRICE; len.max(1)]
 }
 
-fn load_close_prices(path: &str) -> Result<Vec<f64>, String> {
+fn load_asset_close_series(
+    symbol: &str,
+    explicit_csv: Option<&String>,
+    prim_path: &str,
+    warnings: &mut Vec<String>,
+) -> (Vec<f64>, bool, bool) {
+    let mut candidates = resolve_asset_csv_candidates(symbol, explicit_csv);
+    candidates.sort_by_key(|path| path.is_bundled);
+    candidates.dedup_by(|left, right| left.path == right.path);
+
+    for candidate in candidates {
+        match load_close_prices(&candidate.path) {
+            Ok(prices) if prices.len() >= 2 => return (prices, true, false),
+            Ok(_) => warnings.push(format!(
+                "{prim_path}: CSV `{}` has too few price rows",
+                candidate.path.display()
+            )),
+            Err(error) => warnings.push(format!(
+                "{prim_path}: CSV load failed for `{}` ({error})",
+                candidate.path.display()
+            )),
+        }
+    }
+
+    warnings.push(format!(
+        "{prim_path} ({symbol}): using flat synthetic prices — set csv_path to a Yahoo CSV or leave empty for bundled data/{}.csv",
+        symbol.to_ascii_lowercase()
+    ));
+    (flat_series(DEFAULT_BAR_COUNT), false, true)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CsvCandidate {
+    path: std::path::PathBuf,
+    is_bundled: bool,
+}
+
+fn resolve_asset_csv_candidates(symbol: &str, explicit: Option<&String>) -> Vec<CsvCandidate> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = explicit
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if !is_bare_ticker_token(path) {
+            if let Some(resolved) = resolve_existing_path(path) {
+                candidates.push(CsvCandidate {
+                    path: resolved,
+                    is_bundled: false,
+                });
+            }
+        }
+    }
+
+    if !symbol.is_empty() {
+        if let Some(bundled) = bundled_data_csv(symbol) {
+            candidates.push(CsvCandidate {
+                path: bundled,
+                is_bundled: true,
+            });
+        }
+        for path in bundled_csv_candidates(symbol) {
+            candidates.push(CsvCandidate {
+                path,
+                is_bundled: true,
+            });
+        }
+    }
+
+    candidates
+}
+
+fn is_bare_ticker_token(value: &str) -> bool {
+    let token = value.trim();
+    !token.contains(['/', '\\'])
+        && !token.contains('.')
+        && !token.is_empty()
+        && token.len() <= 6
+        && token.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn bundled_data_csv(symbol: &str) -> Option<std::path::PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../pulsar_marketlab/data")
+        .join(format!("{}.csv", symbol.to_ascii_uppercase()));
+    path.is_file().then_some(path)
+}
+
+fn resolve_existing_path(path: &str) -> Option<std::path::PathBuf> {
     let resolved = resolve_csv_path(path);
-    let content = std::fs::read_to_string(&resolved)
-        .map_err(|error| format!("read {}: {error}", resolved.display()))?;
-    let mut lines = content.lines().filter(|line| !line.trim().is_empty());
-    let header = lines
-        .next()
-        .ok_or_else(|| "CSV is empty".to_string())?;
-    let columns: Vec<&str> = header.split(',').map(str::trim).collect();
-    let close_idx = columns
-        .iter()
-        .position(|name| *name == "Adj Close" || *name == "Close")
-        .ok_or_else(|| "CSV missing Close/Adj Close column".to_string())?;
+    resolved.is_file().then_some(resolved)
+}
+
+fn load_close_prices(path: &std::path::Path) -> Result<Vec<f64>, String> {
+    if !path.is_file() {
+        return Err(format!("file not found at {}", path.display()));
+    }
+
+    let mut reader = csv::Reader::from_path(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let headers = reader
+        .headers()
+        .map_err(|error| format!("read header: {error}"))?
+        .clone();
+
+    let close_idx = csv_header_index(&headers, &["Adj Close", "Close"]).ok_or_else(|| {
+        format!(
+            "missing Close/Adj Close column in `{}` (headers: {})",
+            path.display(),
+            headers.iter().collect::<Vec<_>>().join(", ")
+        )
+    })?;
 
     let mut closes = Vec::new();
-    for line in lines {
-        let fields: Vec<&str> = line.split(',').collect();
-        let Some(raw) = fields.get(close_idx) else {
+    for (offset, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| format!("row {}: {error}", offset + 2))?;
+        let first = record.get(0).unwrap_or("").trim();
+        if first.eq_ignore_ascii_case("Ticker") || first.eq_ignore_ascii_case("Date") {
+            continue;
+        }
+        let Some(raw) = record.get(close_idx) else {
             continue;
         };
-        let value = raw
-            .trim()
-            .trim_matches('"')
-            .parse::<f64>()
-            .map_err(|error| format!("invalid close value '{raw}': {error}"))?;
+        let trimmed = raw.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = trimmed.parse::<f64>() else {
+            continue;
+        };
         closes.push(value);
     }
 
     if closes.is_empty() {
-        return Err("CSV has no price rows".to_string());
+        return Err(format!("no numeric close prices parsed from {}", path.display()));
     }
     Ok(closes)
+}
+
+fn csv_header_index(headers: &csv::StringRecord, names: &[&str]) -> Option<usize> {
+    for name in names {
+        if let Some(index) = headers.iter().position(|cell| cell.trim() == *name) {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn resolve_csv_path(path: &str) -> std::path::PathBuf {
@@ -335,29 +431,6 @@ fn resolve_csv_path(path: &str) -> std::path::PathBuf {
         }
     }
     candidate.to_path_buf()
-}
-
-fn resolve_asset_csv_path(
-    symbol: &str,
-    explicit: Option<&String>,
-) -> Option<std::path::PathBuf> {
-    if let Some(path) = explicit.map(|value| value.trim()).filter(|value| !value.is_empty()) {
-        let resolved = resolve_csv_path(path);
-        if resolved.is_file() {
-            return Some(resolved);
-        }
-    }
-
-    if symbol.is_empty() {
-        return None;
-    }
-
-    for candidate in bundled_csv_candidates(symbol) {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 fn bundled_csv_candidates(symbol: &str) -> Vec<std::path::PathBuf> {
@@ -459,9 +532,74 @@ mod tests {
     }
 
     #[test]
-    fn wealth_sparkline_renders_non_empty() {
-        let line = wealth_sparkline(&[1.0, 2.0, 1.5, 3.0], 8);
-        assert!(!line.is_empty());
-        assert!(line.chars().all(|ch| ch == '▁' || ch == '▂' || ch == '▃' || ch == '▄' || ch == '▅' || ch == '▆' || ch == '▇' || ch == '█'));
+    fn sweep_runs_asset_through_ta_trend_to_portfolio() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "trend".into(),
+            source_pin: "result".into(),
+            target_node: "fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.portfolios.len(), 1);
+        assert!(result.portfolios[0].final_wealth > 0.0);
+        assert!(result.assets_loaded >= 1, "{:?}", result);
+    }
+
+    #[test]
+    fn bare_ticker_csv_path_uses_bundled_sample_data() {
+        let mut warnings = Vec::new();
+        let (prices, loaded, synthetic) = load_asset_close_series(
+            "SPY",
+            Some(&"SPY".to_string()),
+            "/MarketLab/Universe/SPY",
+            &mut warnings,
+        );
+        assert!(loaded, "warnings: {warnings:?}");
+        assert!(!synthetic);
+        assert!(prices.len() >= 2);
+    }
+
+    #[test]
+    fn skips_modern_yahoo_ticker_metadata_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("modern.csv");
+        std::fs::write(
+            &path,
+            "Price,Close,High,Low,Open,Volume\n\
+             Ticker,SPY,SPY,SPY,SPY,SPY\n\
+             Date,,,,,\n\
+             2024-01-02,472.65,473.67,470.05,472.16,123456000\n",
+        )
+        .expect("write csv");
+        let closes = load_close_prices(&path).expect("parse modern yahoo csv");
+        assert_eq!(closes.len(), 1);
+        assert!((closes[0] - 472.65).abs() < f64::EPSILON);
     }
 }

@@ -4843,6 +4843,7 @@ dependencies = [
 name = "marketlab_blueprint_adapter"
 version = "0.1.0"
 dependencies = [
+ "csv",
  "graphy",
  "pulsar_marketlab_core",
  "serde_json",

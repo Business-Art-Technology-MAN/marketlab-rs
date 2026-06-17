@@ -1,0 +1,3 @@
+# Single shared artifact directory for all MarketLab builds in this repo.
+[build]
+target-dir = "target"
