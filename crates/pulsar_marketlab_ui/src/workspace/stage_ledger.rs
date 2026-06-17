@@ -4,6 +4,7 @@ use gpui::*;
 use gpui_component::scroll::ScrollableElement;
 
 use super::context::WorkspaceContext;
+use crate::theme;
 
 /// One row in the stage ledger property grid.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,8 +30,17 @@ pub struct StageLedgerExplorer {
 
 impl StageLedgerExplorer {
     pub fn new(workspace: Entity<WorkspaceContext>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&workspace, |_this, _workspace, cx| {
-            cx.notify();
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let last_generation = Rc::new(Cell::new(workspace.read(cx).ledger_generation()));
+        let tracked = last_generation.clone();
+        cx.observe(&workspace, move |_this, workspace, cx| {
+            let generation = workspace.read(cx).ledger_generation();
+            if generation != tracked.get() {
+                tracked.set(generation);
+                cx.notify();
+            }
         })
         .detach();
         Self { workspace }
@@ -44,13 +54,22 @@ impl Render for StageLedgerExplorer {
     }
 }
 
-/// Repaint hosts whenever the shared workspace context model notifies.
+/// Repaint hosts when ledger entries on the shared workspace context change.
 pub fn install_workspace_context_observer<H: 'static>(
     workspace: &Entity<WorkspaceContext>,
     cx: &mut Context<H>,
 ) {
-    cx.observe(workspace, |_host, _workspace, cx| {
-        cx.notify();
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let last_generation = Rc::new(Cell::new(workspace.read(cx).ledger_generation()));
+    let tracked = last_generation.clone();
+    cx.observe(workspace, move |_host, workspace, cx| {
+        let generation = workspace.read(cx).ledger_generation();
+        if generation != tracked.get() {
+            tracked.set(generation);
+            cx.notify();
+        }
     })
     .detach();
 }
@@ -70,7 +89,7 @@ fn render_stage_ledger_grid(entries: Vec<StageLedgerEntry>) -> impl IntoElement 
         grid = grid.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x71717a))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child("No stage properties to explore."),
         );
     } else {
@@ -84,6 +103,7 @@ fn render_stage_ledger_grid(entries: Vec<StageLedgerEntry>) -> impl IntoElement 
         .size_full()
         .flex()
         .flex_col()
+        .min_h_0()
         .child(
             div()
                 .flex_shrink_0()
@@ -92,10 +112,19 @@ fn render_stage_ledger_grid(entries: Vec<StageLedgerEntry>) -> impl IntoElement 
                 .pb_1()
                 .text_size(px(10.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(0xfbbf24))
-                .child("Stage Ledger Explorer // 4-track parse"),
+                .text_color(rgb(theme::STAGE_WARNING))
+                .child("4-track parse"),
         )
         .child(grid.px_2().pb_2())
+}
+
+fn ledger_prim_label(prim_path: &str) -> String {
+    let leaf = prim_path.rsplit('/').next().unwrap_or(prim_path);
+    if leaf.starts_with("node_") {
+        prim_path.to_string()
+    } else {
+        leaf.to_string()
+    }
 }
 
 fn render_ledger_header() -> impl IntoElement {
@@ -107,7 +136,7 @@ fn render_ledger_header() -> impl IntoElement {
         .text_size(px(9.0))
         .font_weight(FontWeight::BOLD)
         .font_family("monospace")
-        .text_color(rgb(0x52525b))
+        .text_color(rgb(theme::TEXT_HINT))
         .child(div().w(px(140.0)).child("Prim / Property"))
         .child(div().w(px(72.0)).child("Value"))
         .child(div().flex_1().child("Lineage"))
@@ -121,9 +150,9 @@ fn render_ledger_row(entry: StageLedgerEntry, row_index: usize) -> impl IntoElem
         FontWeight::NORMAL
     };
     let value_color = if entry.deviates_from_schema {
-        rgb(0xfbbf24)
+        rgb(theme::STAGE_WARNING)
     } else {
-        rgb(0xa1a1aa)
+        rgb(theme::TEXT_SECONDARY)
     };
 
     let lineage_text = if entry.lineage.is_empty() {
@@ -138,16 +167,17 @@ fn render_ledger_row(entry: StageLedgerEntry, row_index: usize) -> impl IntoElem
         .gap_2()
         .px_1()
         .py_0p5()
-        .bg(rgb(0x111113))
+        .bg(rgb(theme::STAGE_LEDGER_BG))
         .border_1()
-        .border_color(rgb(0x1f1f23))
+        .border_color(rgb(theme::STAGE_LEDGER_BORDER))
         .opacity(opacity)
         .pl(px(8.0 + 10.0 * entry.depth as f32));
 
+    let prim_label = ledger_prim_label(&entry.prim_path);
     let prim_property = if entry.property.is_empty() {
-        entry.prim_path.clone()
+        prim_label
     } else {
-        format!("{} · {}", entry.prim_path, entry.property)
+        format!("{} · {}", prim_label, entry.property)
     };
 
     row = row.child(
@@ -160,7 +190,7 @@ fn render_ledger_row(entry: StageLedgerEntry, row_index: usize) -> impl IntoElem
                 div()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0xe4e4e7))
+                    .text_color(rgb(theme::TEXT_PRIMARY))
                     .child(prim_property),
             ),
     );
@@ -172,10 +202,10 @@ fn render_ledger_row(entry: StageLedgerEntry, row_index: usize) -> impl IntoElem
                 .px_1p5()
                 .py_0p5()
                 .rounded_xs()
-                .bg(rgb(0x422006))
+                .bg(rgb(theme::STAGE_WARNING_BG))
                 .text_size(px(8.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(0xfbbf24))
+                .text_color(rgb(theme::STAGE_WARNING))
                 .child("⚠️ OVERRIDE ACTIVE"),
         );
     }
@@ -195,7 +225,7 @@ fn render_ledger_row(entry: StageLedgerEntry, row_index: usize) -> impl IntoElem
                 .flex_1()
                 .text_size(px(8.0))
                 .font_family("monospace")
-                .text_color(rgb(0x38bdf8))
+                .text_color(rgb(theme::LEDGER_ACCENT))
                 .child(lineage_text),
         );
 

@@ -11,12 +11,13 @@ use pulsar_marketlab::trading_stage::{
 use pulsar_marketlab::technical_analysis::{
     ta_indicator_label, DEFAULT_TA_INDICATOR_ID, DEFAULT_TA_LOOKBACK,
 };
+use pulsar_marketlab_core::{prim_display_label, USER_LABEL_ATTR};
 use pulsar_marketlab_ui::workspace::blender_slot_position;
 
-use crate::canvas_compose::{compose_pipeline_usda, resolve_node_stage_paths, stage_prim_path_for_node};
 use crate::graph_compiler::{
-    apply_canonical_ta_ports, ta_uber_from_legacy_indicator, AssetSourceType, NodeConnection,
-    NodeGradeType, NodeType, TaArchetype, TaUberSignalConfig, VisualNode,
+    apply_canonical_ta_ports, deoverlap_canvas_columns, ta_uber_from_legacy_indicator,
+    AssetSourceType, NodeConnection, NodeGradeType, NodeType, TaArchetype, TaUberSignalConfig,
+    VisualNode,
 };
 use crate::workspace_state::resolve_csv_path;
 
@@ -70,6 +71,7 @@ pub fn hydrate_canvas_from_stage(bridge: &UsdStageBridge) -> HydratedCanvas {
     }
 
     canvas.connections = hydrate_connections(bridge, &path_to_id);
+    deoverlap_canvas_columns(&mut canvas.nodes);
     canvas
 }
 
@@ -158,6 +160,12 @@ fn build_visual_node(
     (x, y): (f32, f32),
     bridge: &UsdStageBridge,
 ) -> Option<VisualNode> {
+    let (display_name, stable_leaf) = {
+        let leaf = prim_path.rsplit('/').next().unwrap_or(prim_path);
+        let user_label = bridge.field_string(prim_path, USER_LABEL_ATTR);
+        let name = prim_display_label(leaf, user_label.as_deref());
+        (name, Some(leaf.to_string()))
+    };
     match kind {
         ExecutablePrimKind::FinancialAsset => {
             let symbol = bridge
@@ -167,7 +175,12 @@ fn build_visual_node(
             let asset_source = hydrate_asset_source(prim_path, &symbol, bridge);
             Some(VisualNode {
                 id,
-                name: format!("{symbol}.csv"),
+                stable_prim_leaf: stable_leaf.clone(),
+                name: if display_name.contains('.') {
+                    display_name
+                } else {
+                    format!("{display_name}.csv")
+                },
                 node_type: NodeType::asset_adaptor(prim_path.to_string()),
                 grade: NodeGradeType::Scalar,
                 portfolio_allocation_id: None,
@@ -188,6 +201,7 @@ fn build_visual_node(
                 .to_string();
             let mut node = VisualNode {
                 id,
+                stable_prim_leaf: stable_leaf,
                 name: label,
                 node_type: NodeType::ta_uber_signal(config),
                 grade: NodeGradeType::Scalar,
@@ -227,7 +241,8 @@ fn build_visual_node(
             };
             let mut node = VisualNode {
                 id,
-                name: "OTL Shader".to_string(),
+                stable_prim_leaf: stable_leaf,
+                name: display_name,
                 node_type,
                 grade: NodeGradeType::Scalar,
                 portfolio_allocation_id: None,
@@ -252,7 +267,7 @@ fn build_visual_node(
             Some(node)
         }
         ExecutablePrimKind::PortfolioIntegrator => {
-            let leaf = prim_path.rsplit('/').next().unwrap_or("portfolio");
+            let _leaf = prim_path.rsplit('/').next().unwrap_or("portfolio");
             let allocation = bridge.field_string(prim_path, "inputs:id");
             let is_portfolio = allocation
                 .as_deref()
@@ -265,7 +280,8 @@ fn build_visual_node(
             };
             Some(VisualNode {
                 id,
-                name: leaf.replace('_', " "),
+                stable_prim_leaf: stable_leaf.clone(),
+                name: display_name,
                 node_type,
                 grade: NodeGradeType::Scalar,
                 portfolio_allocation_id: allocation.filter(|id| id.starts_with("Allocation::")),
@@ -392,12 +408,16 @@ fn hydrate_connections(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas_compose::{
+        compose_pipeline_usda_for_tests, resolve_node_stage_paths,
+    };
     use crate::graph_compiler::{apply_canonical_ta_ports, ta_uber_from_legacy_indicator, AssetSourceType};
     use pulsar_marketlab::stage_bridge::UsdStageBridge;
 
     fn sample_asset(id: usize) -> VisualNode {
         VisualNode {
             id,
+            stable_prim_leaf: crate::graph_compiler::test_visual_node_fields(id),
             name: "GLD.csv".to_string(),
             node_type: NodeType::asset_adaptor("/MarketLab/GLD".to_string()),
             grade: NodeGradeType::Scalar,
@@ -418,6 +438,7 @@ mod tests {
     fn sample_ta(id: usize) -> VisualNode {
         let mut node = VisualNode {
             id,
+            stable_prim_leaf: crate::graph_compiler::test_visual_node_fields(id),
             name: "RSI".to_string(),
             node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("rsi", 14)),
             grade: NodeGradeType::Scalar,
@@ -445,7 +466,7 @@ mod tests {
             to_port_idx: 0,
         }];
         let paths = resolve_node_stage_paths(&nodes, &connections);
-        let usda = compose_pipeline_usda(&nodes, &connections);
+        let usda = compose_pipeline_usda_for_tests(&nodes, &connections);
         let bridge = UsdStageBridge::open_from_usda_text(&usda).expect("parse composed stage");
         let hydrated = hydrate_canvas_from_stage(&bridge);
 

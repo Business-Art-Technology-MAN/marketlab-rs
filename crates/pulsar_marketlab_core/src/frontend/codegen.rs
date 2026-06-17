@@ -1,6 +1,6 @@
 //! Runtime script resolution for OTL three-tier object declarations.
 
-use super::ast::{OtlObjectDeclaration, OtlObjectKind, OtlProgram, Statement};
+use super::ast::{OtlObjectDeclaration, OtlObjectKind, Statement};
 use super::{compile_object_program, FrontendError};
 
 /// Resolved executable script text after object-declaration desugaring.

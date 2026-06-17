@@ -6,11 +6,15 @@ mod graph_engine;
 mod menu_bar;
 mod node_canvas;
 mod param_inspector;
-mod render_viewport;
 mod split_layout;
+mod dopesheet_state;
+mod layer_control;
+mod logical_topology;
 mod stage_composer;
 mod stage_ledger;
 mod stage_tree_columns;
+mod topology_dopesheet;
+mod workstation_shelf;
 
 pub use otl_editor_pane::{
     OtlEditorPane, WorkspaceTab, render_otl_editor, render_workspace_tab_bar,
@@ -18,10 +22,15 @@ pub use otl_editor_pane::{
 pub use menu_bar::{MenuBar, MenuBarHost};
 
 pub use node_canvas::{
-    blender_slot_position, compile_relationship_directive, execution_slot_for_target_prim,
-    execution_slot_for_target_type,
+    blender_slot_position, canvas_zoom_detail_level, compile_relationship_directive,
+    execution_slot_for_target_prim, execution_slot_for_target_type,
     on_wire_disconnected, on_wire_released, paint_bezier_wire, paint_socket_dot,
-    paint_wires_for_graph, render_collapsed_node_capsule, render_node_canvas,
+    paint_wires_for_graph, render_canvas_single_line, render_collapsed_node_capsule,
+    render_node_canvas, collapsed_pill_text_width, render_collapsed_pill_title,
+    sanitize_node_label_text, truncate_node_header_title_at_runway, truncate_to_runway,
+    CANVAS_ZOOM_COMPACT, CANVAS_ZOOM_MINIMAL, CanvasZoomDetailLevel,
+    COLLAPSED_PILL_PAD_LEFT, COLLAPSED_PILL_PAD_RIGHT, truncate_node_header_title,
+    NodeHeaderTitleBudget,
     render_wiring_alerts, socket_color, socket_pin, paint_dcc_canvas_grid, CanvasEnvironmentTab, CapsuleSocketSide,
     ExecutionSlotKind, GraphWireSegment, NodeCanvasPane, SocketWireKind, StageRelationshipDirective,
     BLENDER_COLUMN_WIDTH, BLENDER_ORIGIN_X, BLENDER_ORIGIN_Y, BLENDER_ROW_HEIGHT, DCC_BORDER,
@@ -32,10 +41,9 @@ pub use node_canvas::{
 pub use crate::theme::{NODE_SELECTION_HALO, GRID_MAJOR_SPACING_PX, GRID_MINOR_SPACING_PX};
 pub use crate::theme;
 pub use param_inspector::{
-    GlobalPipelineOverview, ParamInspectorPane, render_param_inspector,
+    GlobalPipelineOverview, ParamInspectorPane, render_composed_asset_metadata_grid,
+    render_param_inspector,
 };
-pub use render_viewport::{LedgerRow, RenderViewportPane, render_render_viewport};
-// Render viewport retained for future GUI; not mounted in the current layout.
 pub use split_layout::{
     SplitHandle, SplitLayoutHost, WorkstationSplitLayout, render_split_handle,
 };
@@ -44,13 +52,23 @@ pub use context::{
     PanelType, Point2D, WorkspaceContext, install_ui_selection_observer,
 };
 pub use graph_engine::{
-    begin_graph_engine_timeline_sweep, build_graph_compile_spec, build_stage_graph_snapshot,
+    begin_graph_engine_timeline_sweep, build_composed_asset_registry, build_graph_compile_spec,
+    build_path_binding_index, build_stage_graph_snapshot, build_stage_graph_snapshot_from_usda,
+    composed_asset_meta_from_prim,
     install_graph_engine_invalidation_worker, spawn_graph_engine_timeline_sweep,
     GraphEngineInvalidationHost,
 };
+pub use dopesheet_state::DopesheetUiState;
+pub use layer_control::{LayerDescriptor, LayerDisplayState, LayerStackControlState};
+pub use logical_topology::{compile_logical_strategy_tree, LogicalTreeNode};
 pub use stage_composer::{
-    StageComposerPane, StagePrimRow, install_stage_composition_observer,
-    install_stage_selection_observer, render_stage_composer,
+    LayerStackPane, StageComposerPane, StagePrimRow, install_stage_composition_observer,
+    install_stage_selection_observer, render_stage_composer_shelf_body,
+    render_workstation_layer_stack,
+};
+pub use topology_dopesheet::{
+    render_topology_dopesheet_panel, render_unified_bottom_topology_dopesheet,
+    TopologyDopesheetHost,
 };
 pub use stage_tree_columns::{
     StageTreeColumnHandle, StageTreeColumnHost, StageTreeColumnLayout,
@@ -60,6 +78,10 @@ pub use stage_tree_columns::{
 pub use stage_ledger::{
     StageLedgerEntry, StageLedgerExplorer, install_workspace_context_observer,
     render_stage_ledger,
+};
+pub use workstation_shelf::{
+    render_collapsible_shelf, render_shelf_stack, WorkstationShelfHost, WorkstationShelfId,
+    WorkstationShelfState,
 };
 
 use gpui::*;
@@ -87,12 +109,15 @@ pub trait WorkstationLayoutHost:
     + StageComposerPane
     + StageTreeColumnHost
     + ParamInspectorPane
+    + WorkstationShelfHost
     + OtlEditorPane
     + MenuBarHost
     + NodeCanvasPane
     + GraphEngineInvalidationHost
+    + LayerStackPane
     + 'static
 {
+    fn param_inspector_workspace(&self) -> Entity<WorkspaceContext>;
 }
 
 /// Build the nested splitter tree with GPUI drag-captured handles.
@@ -104,34 +129,72 @@ pub fn render_workstation_layout<H: WorkstationLayoutHost>(
     let view = cx.entity();
     let layout = host.split_layout().clamp();
     let menu_bar = MenuBar::render(view.clone(), host, window, cx);
-    let stage_composer = render_stage_composer(view.clone(), host, cx);
-    let active_tab = host.active_workspace_tab();
-    let right_pane_body: AnyElement = match active_tab {
-        WorkspaceTab::ParamInspector => {
-            render_param_inspector(view.clone(), host, window, cx).into_any_element()
-        }
-        WorkspaceTab::OtlEditor => {
-            render_otl_editor(view.clone(), host, window, cx).into_any_element()
-        }
-    };
-    let right_pane_tabs = render_workspace_tab_bar(view.clone(), host);
-    let node_canvas = node_canvas::render_node_canvas(view.clone(), host, cx);
+    let stage_composer_body = render_stage_composer_shelf_body(host, cx);
+    let inspector_body = render_param_inspector(view.clone(), host, window, cx);
+    let otl_body = render_otl_editor(view.clone(), host, window, cx);
+    let layer_stack = render_workstation_layer_stack(
+        view.clone(),
+        host.param_inspector_workspace().clone(),
+        cx,
+    );
+    let shelves = host.workstation_shelf_state().clone();
+    let context_tower = render_shelf_stack(
+        div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(render_collapsible_shelf(
+                view.clone(),
+                &shelves,
+                WorkstationShelfId::TowerInspector,
+                "Param Inspector",
+                true,
+                inspector_body,
+            ))
+            .child(render_collapsible_shelf(
+                view.clone(),
+                &shelves,
+                WorkstationShelfId::TowerOtlEditor,
+                "OTL Script Editor",
+                true,
+                otl_body,
+            ))
+            .child(render_collapsible_shelf(
+                view.clone(),
+                &shelves,
+                WorkstationShelfId::TowerLayerStack,
+                "USD Layer Stack",
+                false,
+                layer_stack,
+            ))
+            .child(render_collapsible_shelf(
+                view.clone(),
+                &shelves,
+                WorkstationShelfId::TowerStageComposer,
+                "Stage Composer",
+                true,
+                stage_composer_body,
+            )),
+    );
+    let center_body: AnyElement = div()
+        .id("node-canvas-viewport")
+        .relative()
+        .size_full()
+        .min_h_0()
+        .min_w_0()
+        .child(node_canvas::render_node_canvas(view.clone(), host, cx))
+        .into_any_element();
+    let bottom_dopesheet =
+        render_unified_bottom_topology_dopesheet(view.clone(), host, cx);
 
     div()
-        .on_children_prepainted({
-            let view = view.clone();
-            move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                if let Some(root_bounds) = union_bounds(&bounds) {
-                    view.update(cx, |host, _cx| host.set_split_container_bounds(root_bounds));
-                }
-            }
-        })
         .id("marketlab-workstation-root")
         .relative()
         .size_full()
         .flex()
         .flex_col()
-        .bg(rgb(0x09090b))
+        .bg(rgb(theme::WORKSTATION_ROOT))
         .on_key_down({
             let view = view.clone();
             move |event: &KeyDownEvent, _window: &mut Window, cx: &mut App| {
@@ -157,34 +220,42 @@ pub fn render_workstation_layout<H: WorkstationLayoutHost>(
                 .on_children_prepainted({
                     let view = view.clone();
                     move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                        if let Some(upper_bounds) = union_bounds(&bounds) {
-                            view.update(cx, |host, _cx| host.set_upper_row_bounds(upper_bounds));
+                        if let Some(container_bounds) = union_bounds(&bounds) {
+                            view.update(cx, |host, _cx| {
+                                host.set_split_container_bounds(container_bounds);
+                            });
                         }
                     }
                 })
-                .id("marketlab-workstation-main")
-                .relative()
+                .id("marketlab-workstation-split-container")
                 .flex_1()
                 .min_h_0()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .child(
                     div()
-                        .flex_shrink_0()
-                        .w(relative(layout.stage_share))
-                        .min_w(px(140.0))
-                        .child(pane_shell("Stage Composer", stage_composer)),
-                )
-                .child(render_split_handle(
-                    view.clone(),
-                    SplitHandle::StageCanvas,
-                    Axis::Horizontal,
-                ))
+                        .on_children_prepainted({
+                            let view = view.clone();
+                            move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
+                                if let Some(upper_bounds) = union_bounds(&bounds) {
+                                    view.update(cx, |host, _cx| {
+                                        host.set_upper_row_bounds(upper_bounds);
+                                    });
+                                }
+                            }
+                        })
+                        .id("marketlab-workstation-main")
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_row()
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(180.0))
-                        .child(pane_shell("Node Canvas", node_canvas)),
+                        .min_h_0()
+                        .child(center_body),
                 )
                 .child(render_split_handle(
                     view.clone(),
@@ -196,51 +267,57 @@ pub fn render_workstation_layout<H: WorkstationLayoutHost>(
                         .flex_shrink_0()
                         .w(relative(layout.inspector_share))
                         .min_w(px(220.0))
-                        .child(pane_shell_with_tabs(
-                            active_tab.label(),
-                            right_pane_tabs,
-                            right_pane_body,
-                        )),
+                        .child(
+                            div()
+                                .size_full()
+                                .min_h_0()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_3()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(crate::theme::chrome_color(
+                                            crate::theme::GRID_MAJOR,
+                                        ))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_family("monospace")
+                                        .text_color(crate::theme::chrome_color(
+                                            crate::theme::TEXT_SECONDARY,
+                                        ))
+                                        .child("Context Tower"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(context_tower),
+                                ),
+                        ),
                 ),
-        )
-}
-
-fn pane_shell_with_tabs(
-    title: &'static str,
-    tabs: impl IntoElement,
-    body: impl IntoElement,
-) -> impl IntoElement {
-    div()
-        .size_full()
-        .min_h_0()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .bg(crate::theme::chrome_color(crate::theme::PANE_BACKPLATE))
-        .border_1()
-        .border_color(crate::theme::chrome_color(crate::theme::GRID_MAJOR))
-        .child(
-            div()
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(crate::theme::chrome_color(crate::theme::GRID_MAJOR))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .font_family("monospace")
-                .text_color(crate::theme::chrome_color(crate::theme::TEXT_SECONDARY))
-                .child(title),
-        )
-        .child(tabs)
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(body),
+                )
+                .child(render_split_handle(
+                    view.clone(),
+                    SplitHandle::MainBottom,
+                    Axis::Vertical,
+                ))
+                .child(
+                    div()
+                        .id("marketlab-workstation-bottom")
+                        .flex_shrink_0()
+                        .h(relative(layout.bottom_share))
+                        .min_h(px(96.0))
+                        .max_h(relative(0.72))
+                        .min_w_0()
+                        .child(bottom_dopesheet),
+                ),
         )
 }
 

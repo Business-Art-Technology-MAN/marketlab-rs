@@ -4,6 +4,11 @@ members = [
     "crates\\pulsar_marketlab",
     "crates\\pulsar_marketlab_core",
     "crates\\pulsar_marketlab_ui",
+    "crates\\marketlab_blueprint_adapter",
+]
+exclude = [
+    "external\\Plugin_Blueprints",
+    "external\\Graphy",
 ]
 
 [workspace.dependencies]
@@ -12,6 +17,8 @@ serde_json = "1.0"
 ndarray = "0.15"
 nalgebra = "0.32"
 rayon = "1.8"
+arrow-array = { version = "54", default-features = false }
+arrow-buffer = { version = "54", default-features = false }
 vector-ta = "0.2.7"
 thiserror = "1.0"
 csv = "1.3"

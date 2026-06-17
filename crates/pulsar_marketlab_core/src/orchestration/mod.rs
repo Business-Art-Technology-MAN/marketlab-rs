@@ -20,15 +20,15 @@ pub use compiler::{
     ScriptSignature, SeriesClosure, Token,
 };
 pub use script_resolve::{
-    compile_unified_script, normalize_for_series_eval, resolve_otl_script_src, OtlScriptContext,
+    compile_unified_script, normalize_for_series_eval, resolve_otl_script_src,
+    wrap_series_script_as_signal_source, OtlScriptContext,
 };
 pub use engine::{
-    ComputedAttributeStream, EvaluationContext, ExecutionNode, GraphCompileSpec, GraphCompileWire,
-    GraphEngineError, MarketLabGraphEngine, SignalTransformFn, StageGraphPrim, StageGraphSnapshot,
-    TimelineExecutionResult,
+    ComposedAssetMeta, ComputedAttributeStream, ComputedTokenStream, EvaluationContext,
+    ExecutionNode, GraphCompileSpec, GraphCompileWire, GraphEngineError, MarketLabGraphEngine,
+    PathBindingIndex, SignalTransformFn, StageGraphPrim, StageGraphSnapshot, TimelineExecutionResult,
 };
 pub use portfolio::{
-    integrate_portfolio, AssetQuote, BasePosition, ClosureLegKind, DirectionalDistribution,
-    PortfolioIntegrationResult, PortfolioIntegratorConfig, PortfolioOtlState,
-    PortfolioOtlTransformFn, PortfolioTrackingFrame, SymbolicOtlClosure,
+    compute_allocation_weights, AssetQuote, ClosureLegKind,
+    DirectionalDistribution, PortfolioIntegrationResult, PortfolioTrackingFrame, SymbolicOtlClosure,
 };

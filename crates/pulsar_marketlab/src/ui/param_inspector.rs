@@ -6,6 +6,7 @@ use pulsar_marketlab_ui::workspace::{GlobalPipelineOverview, ParamInspectorPane}
 
 use crate::graph_compiler::{
     effective_otl_script, portfolio_wired_source_count, sync_otl_shader_aov_ports,
+    sync_otl_shader_ports_from_script,
 };
 use crate::workspace_state::TradingSystemWorkspace;
 
@@ -40,22 +41,36 @@ impl TradingSystemWorkspace {
         self.otl_script_node_id = None;
     }
 
+    pub(crate) fn commit_otl_script_from_inspector_text(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.otl_script_node_id.or(self.selected_otl_shader_node_id()) else {
+            return;
+        };
+        let Some(input) = self.otl_script_input.as_ref() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        self.commit_otl_script(node_id, text, cx);
+    }
+
     fn commit_otl_script(&mut self, node_id: usize, script: String, cx: &mut Context<Self>) {
-        let trimmed = script.trim();
-        if let Some(node) = self
+        let trimmed = script.trim().to_string();
+        let Some(node) = self
             .nodes
             .iter_mut()
             .find(|node| node.id == node_id && node.node_type.is_otl_shader())
-        {
-            if trimmed.is_empty() {
-                node.dsl_formula = None;
-            } else {
-                node.dsl_formula = Some(trimmed.to_string());
-            }
-            self.sync_pipeline_graph(cx);
-            self.sync_view_window(cx);
-            cx.notify();
+        else {
+            return;
+        };
+        if trimmed.is_empty() {
+            node.dsl_formula = None;
+        } else {
+            node.dsl_formula = Some(trimmed.clone());
+            sync_otl_shader_ports_from_script(node, &trimmed, &mut self.connections);
         }
+        self.otl_shader_param_inputs.clear();
+        self.sync_pipeline_graph(cx);
+        self.sync_view_window(cx);
+        cx.notify();
     }
 
     fn sync_otl_aov_ports(&mut self, node_id: usize) {
@@ -82,10 +97,10 @@ impl ParamInspectorPane for TradingSystemWorkspace {
     }
 
     fn param_inspector_global_overview(&self, cx: &App) -> Option<GlobalPipelineOverview> {
-        let workspace = self.workspace_context.read(cx);
-        if workspace.selected_path().is_some() {
+        if self.selected_node_id.is_some() {
             return None;
         }
+        let workspace = self.workspace_context.read(cx);
 
         let edit_target_layer = workspace
             .edit_target_layer()
@@ -162,7 +177,11 @@ impl ParamInspectorPane for TradingSystemWorkspace {
 
         let tracked_id = selected_id;
         cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
-            if !matches!(event, InputEvent::Change) {
+            let commit = matches!(
+                event,
+                InputEvent::Blur | InputEvent::PressEnter { secondary: true }
+            );
+            if !commit {
                 return;
             }
             let Some(node_id) = this.otl_script_node_id.or(tracked_id) else {
@@ -218,6 +237,87 @@ impl ParamInspectorPane for TradingSystemWorkspace {
             node.aov_outputs.retain(|name| name != channel);
         }
         self.sync_otl_aov_ports(node_id);
+        self.sync_pipeline_graph(cx);
+        self.sync_view_window(cx);
+        cx.notify();
+    }
+
+    fn commit_focused_otl_script(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_otl_script_from_inspector_text(cx);
+    }
+
+    fn node_label_editing_enabled(&self) -> bool {
+        self.selected_node_id.is_some()
+    }
+
+    fn ensure_node_label_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<InputState>> {
+        let selected_id = self.selected_node_id?;
+        if self.node_label_input.is_some() && self.node_label_node_id == Some(selected_id) {
+            return self.node_label_input.clone();
+        }
+
+        let initial = self
+            .nodes
+            .iter()
+            .find(|node| node.id == selected_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |state, cx| {
+            state.set_value(initial, window, cx);
+        });
+
+        let tracked_id = Some(selected_id);
+        cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+            let commit = matches!(
+                event,
+                InputEvent::Blur | InputEvent::PressEnter { secondary: false }
+            );
+            if !commit {
+                return;
+            }
+            let Some(node_id) = this.node_label_node_id.or(tracked_id) else {
+                return;
+            };
+            let Some(input) = this.node_label_input.as_ref() else {
+                return;
+            };
+            let text = input.read(cx).value().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            if let Some(node) = this.nodes.iter_mut().find(|node| node.id == node_id) {
+                node.name = text;
+            }
+            this.sync_pipeline_graph(cx);
+            this.sync_view_window(cx);
+            cx.notify();
+        })
+        .detach();
+
+        self.node_label_input = Some(input.clone());
+        self.node_label_node_id = tracked_id;
+        Some(input)
+    }
+
+    fn commit_node_label(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node_id) = self.node_label_node_id.or(self.selected_node_id) else {
+            return;
+        };
+        let Some(input) = self.node_label_input.as_ref() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(node) = self.nodes.iter_mut().find(|node| node.id == node_id) {
+            node.name = text;
+        }
         self.sync_pipeline_graph(cx);
         self.sync_view_window(cx);
         cx.notify();

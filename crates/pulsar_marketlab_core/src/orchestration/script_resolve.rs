@@ -40,7 +40,7 @@ pub fn normalize_for_series_eval(source: &str) -> String {
         return String::new();
     }
 
-    let mapped_input = remap_input_identifiers(trimmed);
+    let mapped_input = strip_ta_namespace_prefix(&remap_input_identifiers(trimmed));
 
     if let Some(expanded) = expand_indicator_shorthand(&mapped_input) {
         return expanded;
@@ -51,6 +51,23 @@ pub fn normalize_for_series_eval(source: &str) -> String {
 
 fn remap_input_identifiers(source: &str) -> String {
     source.replace("(input,", "(data,").replace("(input ", "(data ")
+}
+
+fn strip_ta_namespace_prefix(source: &str) -> String {
+    source.replace("ta::", "")
+}
+
+/// Wrap a vectorized series expression as a tier-1 OTL `signal` object for parallel codegen.
+pub fn wrap_series_script_as_signal_source(source: &str) -> String {
+    let body = normalize_for_series_eval(source);
+    if body.is_empty() {
+        "signal auto_pass(input closure raw, output closure gated) {\n    gated = raw;\n}\n"
+            .to_string()
+    } else {
+        format!(
+            "signal auto_series(input closure raw, output closure gated) {{\n    gated = {body};\n}}\n"
+        )
+    }
 }
 
 /// Parse and compile OTL using shared normalization (graph engine entry point).

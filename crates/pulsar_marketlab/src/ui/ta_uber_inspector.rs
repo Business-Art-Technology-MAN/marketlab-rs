@@ -2,7 +2,7 @@
 
 use gpui::*;
 use pulsar_marketlab_core::{
-    algorithm_display_label, hyperparameter_visibility, node_display_name, TaArchetype,
+    algorithm_display_label, node_display_name, TaArchetype,
     TaUberSignalConfig,
 };
 
@@ -52,6 +52,10 @@ impl TradingSystemWorkspace {
     pub(crate) fn set_ta_period_for_node(&mut self, node_id: usize, period: u32, cx: &mut Context<Self>) {
         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
             node.set_overlay_period(period);
+        }
+        if self.ta_lookback_scrubbing {
+            cx.notify();
+            return;
         }
         self.commit_ta_uber_parameter_change(cx);
     }
@@ -210,7 +214,7 @@ fn step_button(
 }
 
 pub(crate) fn adjust_period(this: &mut TradingSystemWorkspace, node_id: usize, delta: i32, cx: &mut Context<TradingSystemWorkspace>) {
-    use pulsar_marketlab::technical_analysis::{clamp_ta_lookback, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK};
+    use pulsar_marketlab::technical_analysis::clamp_ta_lookback;
     let current = this
         .nodes
         .iter()

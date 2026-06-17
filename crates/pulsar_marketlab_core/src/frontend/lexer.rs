@@ -46,7 +46,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             ';' => tokens.push(Token::Semicolon),
             ',' => tokens.push(Token::Comma),
             '=' => tokens.push(Token::Assign),
-            mut c if c.is_ascii_alphabetic() || c == '_' => {
+            c if c.is_ascii_alphabetic() || c == '_' => {
                 let mut ident = String::new();
                 ident.push(c);
                 while chars
@@ -57,7 +57,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 }
                 tokens.push(keyword_or_ident(&ident));
             }
-            mut c if c.is_ascii_digit() => {
+            c if c.is_ascii_digit() => {
                 let mut number = String::new();
                 number.push(c);
                 while chars.peek().is_some_and(|next| next.is_ascii_digit() || *next == '.') {

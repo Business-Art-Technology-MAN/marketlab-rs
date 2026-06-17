@@ -116,7 +116,7 @@ pub fn render_column_splitter<H: StageTreeColumnHost>(
         .w(px(STAGE_TREE_SPLITTER_HIT_WIDTH))
         .h_full()
         .cursor(CursorStyle::ResizeColumn)
-        .hover(|style| style.bg(rgb(0x3f3f46)))
+        .hover(|style| style.bg(rgb(crate::theme::STAGE_TREE_HOVER)))
         .on_mouse_down(
             MouseButton::Left,
             {

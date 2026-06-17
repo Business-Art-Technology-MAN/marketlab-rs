@@ -1701,6 +1701,9 @@ fn zip_binary(left: &[f64], right: &[f64], op: BinOp) -> Vec<f64> {
 }
 
 /// Simple moving average over `data` with lookback `period`.
+///
+/// Causal invariant: `out[i]` depends only on `data[0..=i]` (window `index + 1 - period..=index`).
+/// Safe for full-series vector evaluation; no look-ahead beyond bar `i`.
 pub fn sma(data: &[f64], period: usize) -> Vec<f64> {
     if period == 0 || data.is_empty() {
         return Vec::new();
@@ -1973,6 +1976,41 @@ mod tests {
         assert!(out[1].is_nan());
         assert_eq!(out[2], 2.0);
         assert_eq!(out[4], 4.0);
+    }
+
+    #[test]
+    fn sma_is_causal_under_future_price_perturbation() {
+        let data: Vec<f64> = (0..20).map(|bar| (bar as f64) + 1.0).collect();
+        let baseline = sma(&data, 5);
+        for bar in 4..data.len() {
+            let mut poisoned = data.clone();
+            for value in poisoned.iter_mut().skip(bar + 1) {
+                *value = 999.0;
+            }
+            let perturbed = sma(&poisoned, 5);
+            assert_eq!(
+                baseline[bar], perturbed[bar],
+                "sma at bar {bar} must not read future samples"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_sma_closure_is_causal_under_future_price_perturbation() {
+        let data: Vec<f64> = (0..20).map(|bar| (bar as f64) + 1.0).collect();
+        let closure = compile_script("sma(data, 5)").expect("compile sma");
+        let baseline = closure(&data);
+        for bar in 4..data.len() {
+            let mut poisoned = data.clone();
+            for value in poisoned.iter_mut().skip(bar + 1) {
+                *value = 999.0;
+            }
+            let perturbed = closure(&poisoned);
+            assert_eq!(
+                baseline[bar], perturbed[bar],
+                "compiled sma at bar {bar} must not read future samples"
+            );
+        }
     }
 
     #[test]

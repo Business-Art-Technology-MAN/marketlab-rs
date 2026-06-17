@@ -1,6 +1,7 @@
 //! Portfolio integrator: symbolic OTL closure ingestion, base allocation, and tracking matrix.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Directional exposure encoded in an upstream OTL closure token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,14 +44,14 @@ pub struct SymbolicOtlClosure {
 /// Absolute market quote for nominal sizing (price × multiplier → dollars per unit).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetQuote {
-    pub price_series: Vec<f64>,
+    pub price_series: Arc<[f64]>,
     pub contract_multiplier: f64,
 }
 
 impl Default for AssetQuote {
     fn default() -> Self {
         Self {
-            price_series: vec![1.0],
+            price_series: Arc::from([1.0]),
             contract_multiplier: 1.0,
         }
     }
@@ -61,9 +62,16 @@ impl AssetQuote {
         self.price_series
             .get(bar_index)
             .copied()
-            .or_else(|| self.price_series.last().copied())
-            .unwrap_or(1.0)
-            .max(f64::MIN_POSITIVE)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    /// Strict lookback: indices before frame `0` resolve to `0.0`.
+    pub fn price_at_frame(&self, frame: isize) -> f64 {
+        if frame < 0 {
+            return 0.0;
+        }
+        self.price_at(frame as usize)
     }
 }
 
@@ -133,17 +141,20 @@ pub fn normalize_asset_quote_key(asset_id: &str) -> String {
 }
 
 fn resolve_asset_quote<'a>(quotes: &'a HashMap<String, AssetQuote>, asset_id: &str) -> AssetQuote {
+    if let Some(quote) = quotes.get(asset_id) {
+        return quote.clone();
+    }
     let key = normalize_asset_quote_key(asset_id);
+    if let Some(quote) = quotes.get(&key) {
+        return quote.clone();
+    }
     quotes
-        .get(&key)
-        .or_else(|| quotes.get(asset_id))
-        .or_else(|| {
-            quotes
-                .iter()
-                .find(|(symbol, _)| symbol.eq_ignore_ascii_case(&key))
-                .map(|(_, quote)| quote)
+        .iter()
+        .find(|(path, _)| {
+            path.eq_ignore_ascii_case(asset_id)
+                || normalize_asset_quote_key(path) == key
         })
-        .cloned()
+        .map(|(_, quote)| quote.clone())
         .unwrap_or_default()
 }
 
@@ -167,7 +178,7 @@ pub fn closures_from_upstream_legs(
                 ClosureLegKind::Asset => direction_from_series(series),
             };
             SymbolicOtlClosure {
-                asset_id: normalize_asset_quote_key(asset_id),
+                asset_id: asset_id.clone(),
                 direction,
                 closure_raw_weight: 1.0 / n,
                 signal_series: series.clone(),
@@ -565,7 +576,7 @@ mod tests {
         quotes.insert(
             "SPY".to_string(),
             AssetQuote {
-                price_series: vec![5000.0],
+                price_series: Arc::from([5000.0]),
                 contract_multiplier: 1.0,
             },
         );
@@ -575,7 +586,7 @@ mod tests {
         quotes.insert(
             "ES".to_string(),
             AssetQuote {
-                price_series: vec![5000.0],
+                price_series: Arc::from([5000.0]),
                 contract_multiplier: 50.0,
             },
         );
@@ -612,14 +623,14 @@ mod tests {
         quotes.insert(
             "SPY".to_string(),
             AssetQuote {
-                price_series: vec![100.0, 102.0],
+                price_series: Arc::from([100.0, 102.0]),
                 contract_multiplier: 1.0,
             },
         );
         quotes.insert(
             "QQQ".to_string(),
             AssetQuote {
-                price_series: vec![200.0, 201.0],
+                price_series: Arc::from([200.0, 201.0]),
                 contract_multiplier: 1.0,
             },
         );
@@ -684,6 +695,44 @@ mod tests {
     }
 
     #[test]
+    fn integrate_asset_legs_track_price_moves_with_prim_path_quotes() {
+        let prices: Vec<f64> = (0..5).map(|i| 100.0 + i as f64 * 2.0).collect();
+        // Closure id may be leaf or prim path; quote map is keyed by absolute prim path (graph sweep).
+        let closures = vec![SymbolicOtlClosure {
+            asset_id: "QQQ".to_string(),
+            direction: DirectionalDistribution::MarketLong,
+            closure_raw_weight: 1.0,
+            signal_series: prices.clone(),
+            leg_kind: ClosureLegKind::Asset,
+        }];
+        let quotes = HashMap::from([(
+            "/MarketLab/QQQ".to_string(),
+            AssetQuote {
+                price_series: Arc::from(prices.into_boxed_slice()),
+                contract_multiplier: 1.0,
+            },
+        )]);
+
+        let result = integrate_portfolio(
+            &closures,
+            &quotes,
+            5,
+            &PortfolioIntegratorConfig {
+                allocation_method: "Allocation::EqualWeight".to_string(),
+                initial_capital: 10_000.0,
+                otl_script: String::new(),
+            },
+            None,
+        );
+
+        assert!(
+            result.wealth_series.last().copied().unwrap_or(0.0) > 10_000.0,
+            "prim-path keyed quotes should drive rising NAV, got {:?}",
+            result.wealth_series
+        );
+    }
+
+    #[test]
     fn integrate_asset_legs_track_price_moves() {
         let prices: Vec<f64> = (0..5).map(|i| 100.0 + i as f64 * 2.0).collect();
         let closures = vec![SymbolicOtlClosure {
@@ -696,7 +745,7 @@ mod tests {
         let quotes = HashMap::from([(
             "QQQ".to_string(),
             AssetQuote {
-                price_series: prices,
+                price_series: Arc::from(prices.into_boxed_slice()),
                 contract_multiplier: 1.0,
             },
         )]);
@@ -769,7 +818,7 @@ mod tests {
             (
                 "LOW_VOL".to_string(),
                 AssetQuote {
-                    price_series: vec![100.0; 20],
+                    price_series: Arc::from((0..20).map(|_| 100.0).collect::<Vec<_>>().into_boxed_slice()),
                     contract_multiplier: 1.0,
                 },
             ),
@@ -821,14 +870,14 @@ mod tests {
             (
                 "LOW_VOL".to_string(),
                 AssetQuote {
-                    price_series: low_vol_prices,
+                    price_series: Arc::from(low_vol_prices.into_boxed_slice()),
                     contract_multiplier: 1.0,
                 },
             ),
             (
                 "HIGH_VOL".to_string(),
                 AssetQuote {
-                    price_series: high_vol_prices,
+                    price_series: Arc::from(high_vol_prices.into_boxed_slice()),
                     contract_multiplier: 1.0,
                 },
             ),

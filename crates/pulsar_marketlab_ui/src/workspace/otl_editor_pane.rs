@@ -53,8 +53,8 @@ const TEXT: u32 = theme::TEXT_PRIMARY;
 const TEXT_MUTED: u32 = theme::TEXT_SECONDARY;
 const DIVIDER: u32 = theme::GRID_MAJOR;
 const CONSOLE_BG: u32 = theme::ROW_BACKPLATE_B;
-const OK_GREEN: u32 = 0x22c55e;
-const ERR_RED: u32 = 0xf87171;
+const OK_GREEN: u32 = theme::PNL_POSITIVE;
+const ERR_RED: u32 = theme::PNL_NEGATIVE;
 
 fn compile_button_variant(cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
@@ -124,7 +124,7 @@ pub fn render_workspace_tab_bar<H: OtlEditorPane + 'static>(
                         .border_1()
                         .border_color(rgb(DIVIDER))
                 })
-                .when(!is_active, |el| el.hover(|style| style.bg(rgb(0x18181b))))
+                .when(!is_active, |el| el.hover(|style| style.bg(rgb(theme::TAB_HOVER_IDLE))))
                 .text_size(px(10.0))
                 .font_weight(if is_active {
                     FontWeight::SEMIBOLD

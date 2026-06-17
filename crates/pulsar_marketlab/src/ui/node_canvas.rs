@@ -11,37 +11,79 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use openusd::sdf::Value;
 
 use crate::graph_compiler::{
-    apply_canonical_ta_ports, effective_otl_script, input_port_kind, output_port_kind,
-    portfolio_signal_port_label, sync_otl_shader_ports_from_script, NodeConnection,
-    portfolio_wired_source_count, connection_is_valid, input_port_is_wired, input_port_world_center,
-    node_shows_price_chart, output_port_is_wired, output_port_world_center,
-    portfolio_ensure_spare_input_port, portfolio_resolve_input_port, NodeGradeType, NodeType,
-    OtlStdlibPreset, OTL_STDLIB_PRESETS, PortWireKind, VisualNode, CONNECTION_STROKE_WIDTH,
-    MAX_ZOOM, MIN_ZOOM, NODE_CHART_HEIGHT, NODE_WIDTH, WIRE_PORT_HIT_RADIUS, ZOOM_WHEEL_SENSITIVITY,
+    apply_canonical_ta_ports, effective_otl_script, input_port_kind,
+    output_port_kind, portfolio_signal_port_label, sync_otl_shader_ports_from_script,
+    NodeConnection, portfolio_wired_source_count, connection_is_valid, input_port_is_wired,
+    input_port_world_center, node_shows_price_chart, node_total_height_world, output_port_is_wired,
+    output_port_world_center, portfolio_ensure_spare_input_port, portfolio_resolve_input_port,
+    NodeGradeType, NodeType, OtlStdlibPreset, OTL_STDLIB_PRESETS, PortWireKind, VisualNode,
+    CONNECTION_STROKE_WIDTH, MAX_ZOOM, MIN_ZOOM, NODE_CHART_HEIGHT, NODE_COLUMN_GAP, NODE_WIDTH,
+    PORT_ROW_HEIGHT, WIRE_PORT_HIT_RADIUS, ZOOM_WHEEL_SENSITIVITY,
 };
 use crate::ui::ta_uber_inspector::{archetype_summary, ta_header_tint};
 use pulsar_marketlab_core::{node_display_name, parse_script_scalar_uniforms, TaArchetype, TaUberSignalConfig};
 use pulsar_marketlab_ui::workspace::{
-    blender_slot_position, paint_dcc_canvas_grid, paint_socket_dot, socket_pin, NodeCanvasPane,
-    SocketWireKind, DCC_BORDER, DCC_CANVAS_BACKPLATE, DCC_CAPSULE_HEIGHT,
-    DCC_CAPSULE_WIDTH, DCC_HEADER_ACTIVE, DCC_NODE_CORNER_RADIUS_PX, DCC_NODE_HULL,
-    DCC_NODE_SELECTED, DCC_TEXT_PRIMARY, NODE_SELECTION_HALO,
+    canvas_zoom_detail_level, paint_dcc_canvas_grid, paint_socket_dot, render_canvas_single_line,
+    socket_color, truncate_node_header_title_at_runway, truncate_to_runway, CanvasZoomDetailLevel,
+    NodeCanvasPane, NodeHeaderTitleBudget, SocketWireKind, BLENDER_COLUMN_WIDTH, BLENDER_ORIGIN_X,
+    BLENDER_ORIGIN_Y, DCC_BORDER, DCC_CANVAS_BACKPLATE, DCC_CAPSULE_HEIGHT, DCC_CAPSULE_WIDTH,
+    DCC_HEADER_ACTIVE, DCC_NODE_CORNER_RADIUS_PX, DCC_NODE_HULL, render_collapsed_pill_title,
+    COLLAPSED_PILL_PAD_LEFT, COLLAPSED_PILL_PAD_RIGHT, DCC_NODE_SELECTED, DCC_TEXT_PRIMARY,
+    NODE_SELECTION_HALO,
 };
 use pulsar_marketlab::trading_stage::analytics_prim_path;
 use pulsar_marketlab_ui::{node_dropdown_trigger, NodeNumberInput};
-use crate::workspace_state::{
-    parse_chart_date_ordinal, ChartHistoryBuffer, CHART_Y_MIN_SPAN, CHART_Y_PADDING_RATIO,
-    format_currency, format_percent_signed, format_ratio,
-    TradingSystemWorkspace, CHART_STROKE_WIDTH,
-};
+use crate::workspace_state::{format_currency, format_percent_signed, TradingSystemWorkspace};
 
 const AGGREGATOR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+fn canvas_scaled_px(base: f32, zoom: f32) -> Pixels {
+    px((base * zoom).clamp(6.0, 18.0))
+}
+
+fn canvas_layout_px(world_px: f32, zoom: f32) -> Pixels {
+    px(world_px * zoom)
+}
+
+fn px_to_f32(value: Pixels) -> f32 {
+    value.into()
+}
+
+/// Screen height locked to world layout × zoom so cards keep a stable aspect ratio.
+fn node_card_display_height(node: &VisualNode, zoom: f32, include_chart: bool) -> f32 {
+    node_total_height_world(node, include_chart) * zoom
+}
 
 const PORTFOLIO_ALLOCATION_OPTIONS: &[(&str, &str)] = &[
     ("Allocation::HierarchicalRiskParity", "Hierarchical Risk Parity"),
     ("Allocation::EqualWeight", "Equal Weight"),
     ("Allocation::MeanVariance", "Mean Variance"),
 ];
+
+fn portfolio_allocation_short_label(node: &VisualNode) -> Option<String> {
+    let allocation_id = node.portfolio_allocation_id.as_deref()?;
+    Some(match allocation_id {
+        "Allocation::HierarchicalRiskParity" => "HRP",
+        "Allocation::EqualWeight" => "EW",
+        "Allocation::MeanVariance" => "MV",
+        _ => allocation_id
+            .rsplit("::")
+            .next()
+            .unwrap_or(allocation_id),
+    }
+    .to_string())
+}
+
+fn collapsed_node_pill_label(node: &VisualNode) -> String {
+    let name = pulsar_marketlab_ui::workspace::sanitize_node_label_text(&node.name);
+    if !node.node_type.is_portfolio() {
+        return name;
+    }
+    let Some(alloc) = portfolio_allocation_short_label(node) else {
+        return name;
+    };
+    format!("{name} · {alloc}")
+}
 
 fn upstream_subgraph_node_ids(
     aggregator_id: usize,
@@ -60,28 +102,15 @@ fn upstream_subgraph_node_ids(
     ids
 }
 
-fn socket_kind_from_port(kind: PortWireKind) -> SocketWireKind {
+fn socket_kind_from_port(node: &VisualNode, kind: PortWireKind) -> SocketWireKind {
     match kind {
         PortWireKind::StructuralPath => SocketWireKind::StructuralPath,
-        PortWireKind::NumericSignal => SocketWireKind::NumericSignal,
         PortWireKind::Aov => SocketWireKind::Aov,
+        PortWireKind::NumericSignal => match &node.node_type {
+            NodeType::TerminalIntegrator { .. } => SocketWireKind::PortfolioExecution,
+            _ => SocketWireKind::NumericSignal,
+        },
     }
-}
-
-fn union_canvas_bounds(bounds: &[Bounds<Pixels>]) -> Option<Bounds<Pixels>> {
-    let mut iter = bounds.iter();
-    let first = *iter.next()?;
-    Some(iter.fold(first, |acc, next| {
-        let top_left = point(
-            acc.origin.x.min(next.origin.x),
-            acc.origin.y.min(next.origin.y),
-        );
-        let bottom_right = point(
-            acc.bottom_right().x.max(next.bottom_right().x),
-            acc.bottom_right().y.max(next.bottom_right().y),
-        );
-        Bounds::from_corners(top_left, bottom_right)
-    }))
 }
 
 impl TradingSystemWorkspace {
@@ -215,11 +244,15 @@ impl TradingSystemWorkspace {
         self.last_pan_mouse_pos = point(px(local_x), px(local_y));
     }
 
-    fn end_pan(&mut self) {
+    fn end_pan(&mut self, cx: &mut Context<Self>) {
+        if !self.is_panning {
+            return;
+        }
         self.is_panning = false;
+        self.on_pipeline_interaction_ended(cx);
     }
 
-    fn begin_node_drag(&mut self, node_id: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+    fn begin_node_drag(&mut self, node_id: usize, position: Point<Pixels>, _cx: &mut Context<Self>) {
         let Some((node_x, node_y)) = self
             .nodes
             .iter()
@@ -232,17 +265,8 @@ impl TradingSystemWorkspace {
         let (local_x, local_y) = self.canvas_local_position(position);
         let (world_x, world_y) = self.screen_to_world(local_x, local_y);
         if self.selected_node_id != Some(node_id) {
-            if let Some(prim_path) = self
-                .nodes
-                .iter()
-                .find(|node| node.id == node_id)
-                .and_then(|node| self.resolved_stage_path_for_node(node))
-            {
-                self.select_stage_path(Some(prim_path), cx);
-            } else {
-                self.selected_node_id = Some(node_id);
-                self.sync_inspector_from_selection(cx);
-            }
+            self.selected_node_id = Some(node_id);
+            self.defer_inspector_sync_after_drag = true;
         }
         self.active_drag_node_id = Some(node_id);
         self.drag_offset = point(
@@ -269,8 +293,92 @@ impl TradingSystemWorkspace {
         }
     }
 
-    fn end_node_drag(&mut self) {
-        self.active_drag_node_id = None;
+    fn end_node_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(dragged_id) = self.active_drag_node_id.take() else {
+            return;
+        };
+        self.pipeline_graph
+            .replace(self.nodes.clone(), self.connections.clone());
+        if self.defer_inspector_sync_after_drag {
+            self.defer_inspector_sync_after_drag = false;
+            if let Some(node) = self.nodes.iter().find(|node| node.id == dragged_id) {
+                if let Some(prim_path) = self.resolved_stage_path_for_node(node) {
+                    self.select_stage_path(Some(prim_path), cx);
+                    self.schedule_canvas_stage_sync(cx);
+                    self.on_pipeline_interaction_ended(cx);
+                    return;
+                }
+            }
+            self.sync_inspector_from_selection(cx);
+        }
+        self.schedule_canvas_stage_sync(cx);
+        self.on_pipeline_interaction_ended(cx);
+    }
+
+    fn column_world_x(tier: u8) -> f32 {
+        BLENDER_ORIGIN_X + tier as f32 * BLENDER_COLUMN_WIDTH
+    }
+
+    fn next_column_slot_y(&self, tier: u8) -> f32 {
+        let column_x = Self::column_world_x(tier);
+        let mut cursor_y = BLENDER_ORIGIN_Y;
+        for node in &self.nodes {
+            if (node.x - column_x).abs() > BLENDER_COLUMN_WIDTH * 0.45 {
+                continue;
+            }
+            let bottom = node.y
+                + node_total_height_world(node, self.node_includes_chart(node))
+                + NODE_COLUMN_GAP;
+            cursor_y = cursor_y.max(bottom);
+        }
+        cursor_y
+    }
+
+    pub(crate) fn fit_canvas_to_visible_nodes(&mut self, cx: &mut Context<Self>) {
+        let nodes = self.canvas_visible_nodes();
+        if nodes.is_empty() {
+            return;
+        }
+
+        let viewport_w: f32 = self.canvas_viewport_size.width.into();
+        let viewport_h: f32 = self.canvas_viewport_size.height.into();
+        if viewport_w < 64.0 || viewport_h < 64.0 {
+            return;
+        }
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for node in &nodes {
+            let width = if node.collapsed {
+                DCC_CAPSULE_WIDTH
+            } else {
+                NODE_WIDTH
+            };
+            let height = if node.collapsed {
+                DCC_CAPSULE_HEIGHT
+            } else {
+                node_total_height_world(node, self.node_includes_chart(node))
+            };
+            min_x = min_x.min(node.x);
+            min_y = min_y.min(node.y);
+            max_x = max_x.max(node.x + width);
+            max_y = max_y.max(node.y + height);
+        }
+
+        let pad = 56.0;
+        let world_w = (max_x - min_x + pad * 2.0).max(1.0);
+        let world_h = (max_y - min_y + pad * 2.0).max(1.0);
+        let scale = (viewport_w / world_w)
+            .min(viewport_h / world_h)
+            .clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom_scale = scale;
+        self.pan_offset = point(
+            px((viewport_w - world_w * scale) * 0.5 + pad * scale - min_x * scale),
+            px((viewport_h - world_h * scale) * 0.5 + pad * scale - min_y * scale),
+        );
+        cx.notify();
     }
 
     fn open_context_menu(&mut self, position: Point<Pixels>) {
@@ -287,25 +395,20 @@ impl TradingSystemWorkspace {
     }
 
     fn spawn_ta_uber_archetype(&mut self, archetype: TaArchetype, cx: &mut Context<Self>) {
-        let Some(menu_pos) = self.context_menu_pos else {
+        let Some(_menu_pos) = self.context_menu_pos else {
             return;
         };
 
         let node_id = self.next_node_id();
-        let ta_index = self
-            .nodes
-            .iter()
-            .filter(|node| node.node_type.is_ta_uber_signal())
-            .count();
-        let (column_x, _) = blender_slot_position(1, ta_index);
-        let x = column_x;
-        let y: f32 = menu_pos.y.into();
+        let x = Self::column_world_x(1);
+        let y = self.next_column_slot_y(1);
 
         let config = TaUberSignalConfig::new(archetype);
         let name = node_display_name(&config);
 
         let mut node = VisualNode {
             id: node_id,
+            stable_prim_leaf: Some(crate::graph_compiler::allocate_stable_prim_leaf()),
             name,
             node_type: NodeType::ta_uber_signal(config),
             grade: NodeGradeType::Scalar,
@@ -329,22 +432,17 @@ impl TradingSystemWorkspace {
     }
 
     fn spawn_otl_stdlib_preset(&mut self, preset: &OtlStdlibPreset, cx: &mut Context<Self>) {
-        let Some(menu_pos) = self.context_menu_pos else {
+        let Some(_menu_pos) = self.context_menu_pos else {
             return;
         };
 
         let node_id = self.next_node_id();
-        let shader_index = self
-            .nodes
-            .iter()
-            .filter(|node| node.node_type.is_otl_shader())
-            .count();
-        let (column_x, _) = blender_slot_position(1, shader_index);
-        let x = column_x;
-        let y: f32 = menu_pos.y.into();
+        let x = Self::column_world_x(1);
+        let y = self.next_column_slot_y(1);
 
         let mut node = VisualNode {
             id: node_id,
+            stable_prim_leaf: Some(crate::graph_compiler::allocate_stable_prim_leaf()),
             name: preset.display_name.to_string(),
             node_type: NodeType::otl_shader(preset.default_script),
             grade: NodeGradeType::Scalar,
@@ -372,22 +470,17 @@ impl TradingSystemWorkspace {
     }
 
     fn spawn_csv_asset_node(&mut self, cx: &mut Context<Self>) {
-        let Some(menu_pos) = self.context_menu_pos else {
+        let Some(_menu_pos) = self.context_menu_pos else {
             return;
         };
 
         let node_id = self.next_node_id();
-        let asset_index = self
-            .nodes
-            .iter()
-            .filter(|node| node.node_type.is_asset_adaptor())
-            .count();
-        let (column_x, _) = blender_slot_position(0, asset_index);
-        let x = column_x;
-        let y: f32 = menu_pos.y.into();
+        let x = Self::column_world_x(0);
+        let y = self.next_column_slot_y(0);
 
         self.nodes.push(VisualNode {
             id: node_id,
+            stable_prim_leaf: Some(crate::graph_compiler::allocate_stable_prim_leaf()),
             name: "CSV Asset".to_string(),
             node_type: NodeType::asset_adaptor_from_label("CSV Asset"),
             grade: NodeGradeType::Scalar,
@@ -412,7 +505,7 @@ impl TradingSystemWorkspace {
     }
 
     fn spawn_portfolio_node(&mut self, cx: &mut Context<Self>) {
-        let Some(menu_pos) = self.context_menu_pos else {
+        let Some(_menu_pos) = self.context_menu_pos else {
             return;
         };
 
@@ -422,12 +515,12 @@ impl TradingSystemWorkspace {
             .iter()
             .filter(|node| node.node_type.is_portfolio())
             .count();
-        let (column_x, _) = blender_slot_position(2, portfolio_index);
-        let x = column_x;
-        let y: f32 = menu_pos.y.into();
+        let x = Self::column_world_x(2);
+        let y = self.next_column_slot_y(2);
 
         self.nodes.push(VisualNode {
             id: node_id,
+            stable_prim_leaf: Some(crate::graph_compiler::allocate_stable_prim_leaf()),
             name: format!("Sim Portfolio {}", portfolio_index + 1),
             node_type: NodeType::portfolio(),
             grade: NodeGradeType::Scalar,
@@ -630,17 +723,13 @@ impl TradingSystemWorkspace {
     }
 
     fn node_includes_chart(&self, node: &VisualNode) -> bool {
-        node_shows_price_chart(node)
-            && self
-                .asset_chart_history
-                .get(&node.id)
-                .map(|buffer| buffer.values.len() >= 2)
-                .unwrap_or(false)
+        node_shows_price_chart(node) && self.asset_chart_bitmaps.contains_key(&node.id)
     }
 
     fn find_wire_drop_target(&self, screen_pos: Point<Pixels>) -> Option<(usize, usize)> {
         let (local_x, local_y) = self.canvas_local_position(screen_pos);
-        let hit_radius_sq = WIRE_PORT_HIT_RADIUS * WIRE_PORT_HIT_RADIUS;
+        let hit_radius = (WIRE_PORT_HIT_RADIUS * self.zoom_scale).clamp(14.0, 36.0);
+        let hit_radius_sq = hit_radius * hit_radius;
 
         for node in self.canvas_visible_nodes().iter() {
             let include_chart = self.node_includes_chart(node);
@@ -684,7 +773,8 @@ impl TradingSystemWorkspace {
         let (port_screen_x, port_screen_y) = self.world_to_screen(port_world_x, port_world_y);
         let dx = local_x - port_screen_x;
         let dy = local_y - port_screen_y;
-        dx * dx + dy * dy <= WIRE_PORT_HIT_RADIUS * WIRE_PORT_HIT_RADIUS
+        let hit_radius = (WIRE_PORT_HIT_RADIUS * self.zoom_scale).clamp(14.0, 36.0);
+        dx * dx + dy * dy <= hit_radius * hit_radius
     }
 
     fn handle_canvas_left_mouse_up(&mut self, screen_pos: Point<Pixels>, cx: &mut Context<Self>) {
@@ -693,8 +783,7 @@ impl TradingSystemWorkspace {
         }
 
         if self.active_drag_node_id.is_some() {
-            self.end_node_drag();
-            cx.notify();
+            self.end_node_drag(cx);
             return;
         }
 
@@ -716,6 +805,7 @@ impl TradingSystemWorkspace {
         start_x: f32,
         start_y: f32,
         end: Point<Pixels>,
+        zoom_scale: f32,
         window: &mut Window,
         stroke: impl Into<Background>,
     ) {
@@ -723,93 +813,30 @@ impl TradingSystemWorkspace {
         let start = Self::canvas_point(bounds, start_x, start_y);
         let start_x_px: f32 = start.x.into();
         let end_x_px: f32 = end.x.into();
-        let mid_x = (start_x_px + end_x_px) / 2.0;
+        let start_y_px: f32 = start.y.into();
+        let end_y_px: f32 = end.y.into();
+        let dx = end_x_px - start_x_px;
+        let dy = end_y_px - start_y_px;
+        let spread = (dx.abs() * 0.5 + dy.abs() * 0.2 + 56.0).clamp(56.0, 240.0);
+        let c1_x = if dx >= 0.0 {
+            start_x_px + spread
+        } else {
+            start_x_px - spread
+        };
+        let c2_x = if dx >= 0.0 {
+            end_x_px - spread
+        } else {
+            end_x_px + spread
+        };
+        let stroke_width = (CONNECTION_STROKE_WIDTH * zoom_scale).clamp(1.25, 3.0);
 
-        let mut builder = PathBuilder::stroke(px(CONNECTION_STROKE_WIDTH));
+        let mut builder = PathBuilder::stroke(px(stroke_width));
         builder.move_to(start);
         builder.cubic_bezier_to(
             end,
-            point(px(mid_x), start.y),
-            point(px(mid_x), end.y),
+            point(px(c1_x), start.y),
+            point(px(c2_x), end.y),
         );
-
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, stroke);
-        }
-    }
-
-    fn paint_asset_price_chart(
-        bounds: Bounds<Pixels>,
-        buffer: &ChartHistoryBuffer,
-        window: &mut Window,
-        stroke: impl Into<Background>,
-    ) {
-        if buffer.values.len() < 2 || buffer.timestamps.len() != buffer.values.len() {
-            return;
-        }
-
-        let stroke = stroke.into();
-        let x_coords: Vec<f32> = buffer
-            .timestamps
-            .iter()
-            .filter_map(|date| parse_chart_date_ordinal(date))
-            .collect();
-        if x_coords.len() != buffer.values.len() {
-            return;
-        }
-
-        let min_value = buffer
-            .values
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min);
-        let max_value = buffer
-            .values
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let raw_span = (max_value - min_value).max(CHART_Y_MIN_SPAN);
-        let y_padding = raw_span * CHART_Y_PADDING_RATIO;
-        let y_min = min_value - y_padding;
-        let y_max = max_value + y_padding;
-        let y_span = (y_max - y_min).max(f32::EPSILON);
-
-        let x_min = x_coords[0];
-        let x_max = x_coords[x_coords.len() - 1];
-        let x_span = (x_max - x_min).max(f32::EPSILON);
-
-        let origin_x: f32 = bounds.origin.x.into();
-        let origin_y: f32 = bounds.origin.y.into();
-        let width: f32 = bounds.size.width.into();
-        let height: f32 = bounds.size.height.into();
-        let inset = 2.0;
-        let plot_width = (width - inset * 2.0).max(1.0);
-        let plot_height = (height - inset * 2.0).max(1.0);
-
-        let grid_stroke = rgba(0x27272a);
-        for grid_line in 1..4 {
-            let grid_y = origin_y + inset + plot_height * grid_line as f32 / 4.0;
-            let mut grid = PathBuilder::stroke(px(1.0));
-            grid.move_to(point(px(origin_x + inset), px(grid_y)));
-            grid.line_to(point(px(origin_x + inset + plot_width), px(grid_y)));
-            if let Ok(path) = grid.build() {
-                window.paint_path(path, grid_stroke);
-            }
-        }
-
-        let mut builder = PathBuilder::stroke(px(CHART_STROKE_WIDTH));
-        for (index, value) in buffer.values.iter().enumerate() {
-            let t = (x_coords[index] - x_min) / x_span;
-            let x = origin_x + inset + t * plot_width;
-            let normalized = (*value - y_min) / y_span;
-            let y = origin_y + inset + plot_height - normalized * plot_height;
-            let chart_point = point(px(x), px(y));
-            if index == 0 {
-                builder.move_to(chart_point);
-            } else {
-                builder.line_to(chart_point);
-            }
-        }
 
         if let Ok(path) = builder.build() {
             window.paint_path(path, stroke);
@@ -874,13 +901,9 @@ impl TradingSystemWorkspace {
             };
 
             let wire_kind = output_port_kind(from_node, connection.from_port_idx)
-                .map(socket_kind_from_port)
+                .map(|kind| socket_kind_from_port(from_node, kind))
                 .unwrap_or(SocketWireKind::NumericSignal);
-            let stroke = match wire_kind {
-                SocketWireKind::StructuralPath => rgb(0x71717a),
-                SocketWireKind::NumericSignal => rgb(0x22c55e),
-                SocketWireKind::Aov => rgb(0x22d3ee),
-            };
+            let stroke = socket_color(wire_kind);
 
             let (out_x, out_y) = Self::output_port_origin(
                 from_node,
@@ -897,7 +920,15 @@ impl TradingSystemWorkspace {
             let (screen_out_x, screen_out_y) = world_to_screen(out_x, out_y);
             let (screen_in_x, screen_in_y) = world_to_screen(in_x, in_y);
             let end = Self::canvas_point(bounds, screen_in_x, screen_in_y);
-            Self::paint_bezier_wire(bounds, screen_out_x, screen_out_y, end, window, stroke);
+            Self::paint_bezier_wire(
+                bounds,
+                screen_out_x,
+                screen_out_y,
+                end,
+                zoom_scale,
+                window,
+                stroke,
+            );
         }
 
         if let Some((from_node_id, from_port_idx)) = active_wire_source {
@@ -916,6 +947,7 @@ impl TradingSystemWorkspace {
                 screen_out_x,
                 screen_out_y,
                 active_mouse_pos,
+                zoom_scale,
                 window,
                 rgb(0x3b82f6),
             );
@@ -946,7 +978,7 @@ impl TradingSystemWorkspace {
                     continue;
                 }
                 let kind = input_port_kind(node, port_idx)
-                    .map(socket_kind_from_port)
+                    .map(|kind| socket_kind_from_port(node, kind))
                     .unwrap_or(SocketWireKind::NumericSignal);
                 let (world_x, world_y) = Self::input_port_origin(
                     node,
@@ -966,7 +998,7 @@ impl TradingSystemWorkspace {
                     continue;
                 }
                 let kind = output_port_kind(node, port_idx)
-                    .map(socket_kind_from_port)
+                    .map(|kind| socket_kind_from_port(node, kind))
                     .unwrap_or(SocketWireKind::NumericSignal);
                 let (world_x, world_y) = Self::output_port_origin(
                     node,
@@ -990,13 +1022,10 @@ impl TradingSystemWorkspace {
         let nodes_for_wires = visible_nodes.clone();
         let connections_for_wires = visible_connections.clone();
         let chart_node_ids: HashSet<usize> = self
-            .asset_chart_history
-            .iter()
-            .filter(|(node_id, buffer)| {
-                buffer.values.len() >= 2
-                    && visible_nodes.iter().any(|node| node.id == **node_id)
-            })
-            .map(|(node_id, _)| *node_id)
+            .asset_chart_bitmaps
+            .keys()
+            .copied()
+            .filter(|node_id| visible_nodes.iter().any(|node| node.id == *node_id))
             .collect();
         let chart_node_ids_for_wires = chart_node_ids.clone();
         let active_wire_source = self.active_wire_source;
@@ -1004,17 +1033,8 @@ impl TradingSystemWorkspace {
         let pan_offset = self.pan_offset;
         let zoom_scale = self.zoom_scale;
 
+        let view_for_viewport = view.clone();
         let mut canvas = div()
-            .on_children_prepainted({
-                move |bounds: Vec<Bounds<Pixels>>, _window: &mut Window, cx: &mut App| {
-                    if let Some(canvas_bounds) = union_canvas_bounds(&bounds) {
-                        let origin = canvas_bounds.origin;
-                        let _ = view.update(cx, |this, _cx| {
-                            this.canvas_origin = origin;
-                        });
-                    }
-                }
-            })
             .id("node-canvas")
             .size_full()
             .min_h_0()
@@ -1060,7 +1080,7 @@ impl TradingSystemWorkspace {
                     }
                     this.active_mouse_pos = event.position;
                     if changed {
-                        cx.notify();
+                        this.schedule_canvas_interaction_repaint(cx);
                     }
                 },
             ))
@@ -1075,26 +1095,20 @@ impl TradingSystemWorkspace {
             .on_mouse_up(
                 MouseButton::Middle,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    if this.is_panning {
-                        this.end_pan();
-                        cx.notify();
-                    }
+                    this.end_pan(cx);
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Middle,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    if this.is_panning {
-                        this.end_pan();
-                        cx.notify();
-                    }
+                    this.end_pan(cx);
                 }),
             )
             .on_scroll_wheel(cx.listener(
                 |this, event: &ScrollWheelEvent, _window, cx| {
                     this.apply_scroll_zoom(event);
+                    this.schedule_canvas_interaction_repaint(cx);
                     cx.stop_propagation();
-                    cx.notify();
                 },
             ))
             .on_mouse_up(
@@ -1111,7 +1125,13 @@ impl TradingSystemWorkspace {
             )
             .child(
                 canvas(
-                    |bounds, _window, _cx| bounds,
+                    move |bounds, _window, cx| {
+                        let _ = view_for_viewport.update(cx, |this, _cx| {
+                            this.canvas_origin = bounds.origin;
+                            this.canvas_viewport_size = bounds.size;
+                        });
+                        bounds
+                    },
                     move |bounds, _state, window, _cx| {
                         paint_dcc_canvas_grid(bounds, pan_offset, zoom_scale, window);
                         TradingSystemWorkspace::paint_node_sockets(
@@ -1142,7 +1162,12 @@ impl TradingSystemWorkspace {
                 .size_full(),
             );
 
-        let suppress_charts = self.active_drag_node_id.is_some();
+        let zoom_detail = canvas_zoom_detail_level(zoom_scale);
+        let compact_chrome = self.canvas_interaction_active()
+            || zoom_detail == CanvasZoomDetailLevel::Compact;
+        let minimal_chrome = zoom_detail == CanvasZoomDetailLevel::Minimal;
+        // Sparklines only drop during active drag/pan — not when zoomed out.
+        let suppress_charts = self.canvas_interaction_active();
         let mut render_order: Vec<usize> = visible_nodes.iter().map(|node| node.id).collect();
         if let Some(drag_id) = self.active_drag_node_id {
             render_order.retain(|node_id| *node_id != drag_id);
@@ -1195,7 +1220,9 @@ impl TradingSystemWorkspace {
                         .h(px(pill_height))
                         .flex()
                         .items_center()
-                        .justify_center()
+                        .justify_start()
+                        .pl(px(COLLAPSED_PILL_PAD_LEFT * self.zoom_scale))
+                        .pr(px(COLLAPSED_PILL_PAD_RIGHT * self.zoom_scale))
                         .bg(hull_color)
                         .when(is_selected, |this| this.border_2())
                         .when(!is_selected, |this| this.border_1())
@@ -1204,6 +1231,7 @@ impl TradingSystemWorkspace {
                             pill.border_l_2().border_color(tier_accent)
                         })
                         .rounded_full()
+                        .overflow_hidden()
                         .cursor_move()
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1221,36 +1249,58 @@ impl TradingSystemWorkspace {
                                 },
                             ),
                         )
-                        .child(
-                            div()
-                                .px_3()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(DCC_TEXT_PRIMARY))
-                                .child(node.name.clone()),
-                        ),
+                        .child(render_collapsed_pill_title(
+                            &collapsed_node_pill_label(node),
+                            NodeHeaderTitleBudget::CollapsedCapsule,
+                            (DCC_CAPSULE_WIDTH - COLLAPSED_PILL_PAD_LEFT - COLLAPSED_PILL_PAD_RIGHT)
+                                * self.zoom_scale,
+                        )),
                 );
                 continue;
             }
 
             let display_width = NODE_WIDTH * self.zoom_scale;
+            let zoom = self.zoom_scale;
+            let include_chart = self.node_includes_chart(node);
+            let display_height = node_card_display_height(node, zoom, include_chart);
+            let label_size = canvas_scaled_px(9.0, zoom);
+            let meta_size = canvas_scaled_px(8.0, zoom);
+            let title_size = canvas_scaled_px(12.0, zoom);
+            let socket_size = canvas_layout_px(8.0, zoom);
+            let port_pad_y = canvas_layout_px(4.0, zoom);
+            let card_pad = canvas_layout_px(8.0, zoom);
+            let card_pad_f = px_to_f32(card_pad);
+            let label_size_f = px_to_f32(label_size);
+            let title_size_f = px_to_f32(title_size);
+            let header_runway =
+                (display_width - card_pad_f * 4.0 - px_to_f32(socket_size)).max(0.0);
+            let port_text_runway =
+                (display_width - px_to_f32(socket_size) - card_pad_f * 4.0 - 12.0).max(0.0);
 
-            let mut ports = div().flex_col().gap_1().p_2();
+            let mut ports = div()
+                .flex_col()
+                .flex_none()
+                .gap_1()
+                .p(card_pad)
+                .border_t_1()
+                .border_color(rgb(0x2a2a2e));
             for (port_idx, input) in node.inputs.iter().enumerate() {
                 let input_node_id = node_id;
-                let has_wire = self.connections.iter().any(|connection| {
-                    connection.to_node_id == input_node_id && connection.to_port_idx == port_idx
-                });
+                let has_wire = input_port_is_wired(node, port_idx, &self.connections);
+                if compact_chrome && !has_wire {
+                    continue;
+                }
                 let input_kind = input_port_kind(node, port_idx)
-                    .map(socket_kind_from_port)
+                    .map(|kind| socket_kind_from_port(node, kind))
                     .unwrap_or(SocketWireKind::NumericSignal);
                 ports = ports.child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1()
-                        .py_1()
-                        .px_1()
+                        .py(port_pad_y)
+                        .px(port_pad_y)
+                        .min_h(canvas_layout_px(PORT_ROW_HEIGHT, zoom))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(DCC_NODE_SELECTED)))
                         .on_mouse_down(
@@ -1286,17 +1336,37 @@ impl TradingSystemWorkspace {
                                 },
                             ),
                         )
-                        .text_size(px(9.0))
+                        .text_size(label_size)
                         .font_family("monospace")
                         .text_color(rgb(0xaeaeb2))
-                        .child(socket_pin(input_kind))
-                        .child(format!("→ {input}")),
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(socket_size)
+                                .h(socket_size)
+                                .rounded_full()
+                                .bg(socket_color(input_kind))
+                                .border_1()
+                                .border_color(rgb(0x18181b)),
+                        )
+                        .when(!minimal_chrome, |row| {
+                            row.child(render_canvas_single_line(
+                                truncate_to_runway(
+                                    &format!("→ {input}"),
+                                    port_text_runway,
+                                    label_size_f,
+                                    true,
+                                ),
+                                label_size,
+                                rgb(0xaeaeb2).into(),
+                            ))
+                        }),
                 );
             }
             for (port_idx, output) in node.outputs.iter().enumerate() {
                 let output_node_id = node_id;
                 let output_kind = output_port_kind(node, port_idx)
-                    .map(socket_kind_from_port)
+                    .map(|kind| socket_kind_from_port(node, kind))
                     .unwrap_or(SocketWireKind::NumericSignal);
                 ports = ports.child(
                     div()
@@ -1304,8 +1374,9 @@ impl TradingSystemWorkspace {
                         .items_center()
                         .justify_end()
                         .gap_1()
-                        .py_1()
-                        .px_1()
+                        .py(port_pad_y)
+                        .px(port_pad_y)
+                        .min_h(canvas_layout_px(PORT_ROW_HEIGHT, zoom))
                         .cursor_pointer()
                         .hover(|style| style.bg(rgb(DCC_NODE_SELECTED)))
                         .on_mouse_down(
@@ -1322,31 +1393,55 @@ impl TradingSystemWorkspace {
                                 },
                             ),
                         )
-                        .text_size(px(9.0))
+                        .text_size(label_size)
                         .font_family("monospace")
                         .text_color(rgb(0xaeaeb2))
-                        .child(format!("{output} →"))
-                        .child(socket_pin(output_kind)),
+                        .when(!minimal_chrome, |row| {
+                            row.child(render_canvas_single_line(
+                                truncate_to_runway(
+                                    &format!("{output} →"),
+                                    port_text_runway,
+                                    label_size_f,
+                                    true,
+                                ),
+                                label_size,
+                                rgb(0xaeaeb2).into(),
+                            ))
+                        })
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(socket_size)
+                                .h(socket_size)
+                                .rounded_full()
+                                .bg(socket_color(output_kind))
+                                .border_1()
+                                .border_color(rgb(0x18181b)),
+                        ),
                 );
             }
 
-            let mut node_card = div()
-                .absolute()
-                .left(px(display_left))
-                .top(px(display_top))
-                .w(px(display_width))
-                .flex()
+            let mut node_body = div()
                 .flex_col()
-                .bg(hull_color)
-                .when(is_selected, |this| this.border_2())
-                .when(!is_selected, |this| this.border_1())
-                .border_color(border_color)
-                .rounded(px(DCC_NODE_CORNER_RADIUS_PX))
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .cursor_move()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(
+                        move |this, event: &MouseDownEvent, _window, cx| {
+                            this.begin_node_drag(node_id, event.position, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        },
+                    ),
+                )
                 .child(
                     div()
                         .id(("node-header", node_id))
                         .bg(header_bg)
-                        .p_2()
+                        .p(card_pad)
                         .flex()
                         .items_center()
                         .justify_between()
@@ -1369,89 +1464,128 @@ impl TradingSystemWorkspace {
                         )
                         .child(
                             div()
-                                .text_xs()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_size(title_size)
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(DCC_TEXT_PRIMARY))
-                                .child(node.name.clone()),
+                                .truncate()
+                                .child(truncate_node_header_title_at_runway(
+                                    &node.name,
+                                    header_runway,
+                                    title_size_f,
+                                )),
                         )
-                        .child(div().w_2().h_2().bg(tier_accent).rounded_full()),
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(canvas_scaled_px(8.0, zoom))
+                                .h(canvas_scaled_px(8.0, zoom))
+                                .bg(tier_accent)
+                                .rounded_full(),
+                        ),
                 )
                 .child(
                     div()
-                        .p_2()
-                        .text_size(px(9.0))
-                        .text_color(rgb(0xaeaeb2))
-                        .child(format!("Grade Space: {:?}", node.grade)),
+                        .p(card_pad)
+                        .overflow_hidden()
+                        .child(render_canvas_single_line(
+                            truncate_to_runway(
+                                &format!("Grade Space: {:?}", node.grade),
+                                display_width - card_pad_f * 2.0,
+                                px_to_f32(meta_size),
+                                false,
+                            ),
+                            meta_size,
+                            rgb(0xaeaeb2).into(),
+                        )),
                 );
 
             if let Some(config) = node.node_type.ta_uber_config() {
-                node_card = node_card.child(
-                    div()
-                        .px_2()
-                        .pb_2()
-                        .text_size(px(8.0))
-                        .font_family("monospace")
-                        .text_color(rgb(0x8e8e93))
-                        .child(archetype_summary(config)),
-                );
+                if zoom_detail == CanvasZoomDetailLevel::Full {
+                    node_body = node_body.child(
+                        div()
+                            .px(card_pad)
+                            .pb(card_pad)
+                            .text_size(meta_size)
+                            .font_family("monospace")
+                            .text_color(rgb(0x8e8e93))
+                            .child(archetype_summary(config)),
+                    );
+                }
             } else if node.node_type.is_otl_shader() {
                 if let Some(script) = effective_otl_script(&node) {
                     let uniforms = parse_script_scalar_uniforms(script);
                     if !uniforms.is_empty() {
-                        let mut param_panel = div().px_2().pb_2().flex_col().gap_1();
-                        param_panel = param_panel.child(
-                            div()
-                                .text_size(px(8.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0x8e8e93))
-                                .child("Parameters"),
-                        );
-                        for param in uniforms {
-                            let param_key = TradingSystemWorkspace::otl_shader_param_input_key(
-                                node_id, &param.name,
+                        if compact_chrome {
+                            node_body = node_body.child(
+                                div()
+                                    .px(card_pad)
+                                    .pb(card_pad)
+                                    .text_size(meta_size)
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(format!("OTL · {} parameter(s)", uniforms.len())),
                             );
-                            let ty_label = match param.ty {
-                                pulsar_marketlab_core::OslParamType::Int => "int",
-                                pulsar_marketlab_core::OslParamType::Float => "float",
-                                pulsar_marketlab_core::OslParamType::String => "string",
-                            };
-                            let mut row = div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .text_size(px(8.0))
-                                                .text_color(rgb(0xaeaeb2))
-                                                .child(param.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(7.0))
-                                                .text_color(rgb(0x636366))
-                                                .child(ty_label.to_string()),
-                                        ),
-                                );
-                            if let Some(input) = self.otl_shader_param_inputs.get(&param_key) {
-                                let integer = matches!(
-                                    param.ty,
-                                    pulsar_marketlab_core::OslParamType::Int
-                                );
-                                row = row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .w(px(112.0))
-                                        .child(NodeNumberInput::new(input).integer(integer)),
-                                );
+                        } else {
+                            let mut param_panel =
+                                div().px(card_pad).pb(card_pad).flex_col().gap_1();
+                            param_panel = param_panel.child(
+                                div()
+                                    .text_size(meta_size)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x8e8e93))
+                                    .child("Parameters"),
+                            );
+                            for param in uniforms {
+                                let param_key =
+                                    TradingSystemWorkspace::otl_shader_param_input_key(
+                                        node_id, &param.name,
+                                    );
+                                let ty_label = match param.ty {
+                                    pulsar_marketlab_core::OslParamType::Int => "int",
+                                    pulsar_marketlab_core::OslParamType::Float => "float",
+                                    pulsar_marketlab_core::OslParamType::String => "string",
+                                };
+                                let mut row = div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_size(meta_size)
+                                                    .text_color(rgb(0xaeaeb2))
+                                                    .child(param.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(canvas_scaled_px(7.0, zoom))
+                                                    .text_color(rgb(0x636366))
+                                                    .child(ty_label.to_string()),
+                                            ),
+                                    );
+                                if let Some(input) = self.otl_shader_param_inputs.get(&param_key)
+                                {
+                                    let integer = matches!(
+                                        param.ty,
+                                        pulsar_marketlab_core::OslParamType::Int
+                                    );
+                                    row = row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .w(px(112.0))
+                                            .child(NodeNumberInput::new(input).integer(integer)),
+                                    );
+                                }
+                                param_panel = param_panel.child(row);
                             }
-                            param_panel = param_panel.child(row);
+                            node_body = node_body.child(param_panel);
                         }
-                        node_card = node_card.child(param_panel);
                     }
                 }
             }
@@ -1467,230 +1601,287 @@ impl TradingSystemWorkspace {
                     .find(|(token, _)| *token == allocation_id.as_str())
                     .map(|(_, label)| (*label).to_string())
                     .unwrap_or_else(|| allocation_id.clone());
-                let prim_path = node_prim_path.clone().unwrap_or_default();
-                let host_view = view.clone();
-                node_card = node_card.child(
-                    div()
-                        .px_2()
-                        .pb_2()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(8.0))
-                                .text_color(rgb(0x8e8e93))
-                                .child("Allocation"),
-                        )
-                        .child(
-                            node_dropdown_trigger(
-                                ("node-allocation", node_id),
-                                allocation_label,
-                                cx,
-                            )
-                            .dropdown_menu(move |menu, _, _| {
-                                PORTFOLIO_ALLOCATION_OPTIONS
-                                    .iter()
-                                    .fold(menu, |menu, (token, label)| {
-                                        let token = (*token).to_string();
-                                        let prim_path = prim_path.clone();
-                                        let view = host_view.clone();
-                                        menu.item(
-                                            PopupMenuItem::new(*label).on_click(move |_, _, cx| {
-                                                let token = token.clone();
-                                                let prim_path = prim_path.clone();
-                                                let view_for_defer = view.clone();
-                                                view.update(cx, |ws, cx| {
-                                                    if let Some(node) = ws
-                                                        .nodes
-                                                        .iter_mut()
-                                                        .find(|n| n.id == node_id)
-                                                    {
-                                                        node.portfolio_allocation_id =
-                                                            Some(token.clone());
-                                                    }
-                                                    let workspace_context =
-                                                        ws.workspace_context.clone();
-                                                    cx.defer(move |cx| {
-                                                        if !prim_path.is_empty() {
-                                                            workspace_context.update(
-                                                                cx,
-                                                                |ctx, cx| {
-                                                                    ctx.modify_attribute(
-                                                                        &prim_path,
-                                                                        "inputs:id",
-                                                                        Value::String(
-                                                                            token.clone(),
-                                                                        ),
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        }
-                                                        view_for_defer.update(cx, |ws, cx| {
-                                                            ws.sync_pipeline_graph(cx);
-                                                            cx.notify();
-                                                        });
-                                                    });
-                                                    cx.notify();
-                                                });
-                                            }),
-                                        )
-                                    })
-                            }),
-                        ),
-                );
-                let node_metrics = cx
-                    .global::<crate::ui::telemetry_bridge::MetricsTelemetryBridge>()
-                    .metrics_for_node(node_id)
-                    .cloned()
-                    .or_else(|| {
-                        self.portfolio_diagnostics_for_node(node_id)
-                            .map(crate::ui::telemetry_bridge::EvaluatedMetrics::from)
-                    });
-                if let Some(metrics) = node_metrics {
-                    let return_color = if metrics.total_return >= 0.0 {
-                        rgb(0x10b981)
-                    } else {
-                        rgb(0xf87171)
-                    };
-                    node_card = node_card.child(
+                let allocation_display = if zoom_detail == CanvasZoomDetailLevel::Full {
+                    allocation_label.clone()
+                } else {
+                    portfolio_allocation_short_label(node).unwrap_or(allocation_label.clone())
+                };
+                if minimal_chrome {
+                    // Header-only chrome at extreme zoom — skip portfolio body.
+                } else if compact_chrome {
+                    node_body = node_body.child(
                         div()
-                            .px_2()
-                            .pb_1()
-                            .flex_col()
-                            .gap_0p5()
-                            .font_family("monospace")
-                            .text_size(px(8.0))
-                            .child(
-                                div()
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!(
-                                        "{wired_count} source(s) · {} trades · live GE",
-                                        metrics.trailing_trades_count
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(return_color)
-                                    .child(format!(
-                                        "R_total {}",
-                                        format_percent_signed(metrics.total_return)
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(0x94a3b8))
-                                    .child(format!(
-                                        "Exp {:.0}% · Conv {:.2}",
-                                        metrics.net_exposure * 100.0,
-                                        metrics.current_conviction
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!(
-                                        "MDD {}",
-                                        format_percent_signed(-metrics.rolling_drawdown)
-                                    )),
-                            ),
-                    );
-                } else if node_prim_path
-                    .as_ref()
-                    .and_then(|path| self.portfolio_timeline_cache.get(path))
-                    .is_some_and(|series| !series.wealth.is_empty())
-                {
-                    let series = self
-                        .portfolio_timeline_cache
-                        .get(node_prim_path.as_ref().expect("prim path"))
-                        .expect("series present");
-                    let last_nav = series.wealth.last().copied().unwrap_or(0.0);
-                    let base = series.wealth.first().copied().unwrap_or(last_nav);
-                    let return_pct = if base.abs() > f64::EPSILON {
-                        (last_nav / base - 1.0) * 100.0
-                    } else {
-                        0.0
-                    };
-                    let return_color = if return_pct >= 0.0 {
-                        rgb(0x10b981)
-                    } else {
-                        rgb(0xf87171)
-                    };
-                    node_card = node_card.child(
-                        div()
-                            .px_2()
-                            .pb_1()
-                            .flex_col()
-                            .gap_0p5()
-                            .font_family("monospace")
-                            .text_size(px(8.0))
-                            .child(
-                                div()
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!(
-                                        "{wired_count} source(s) · graph sweep · {} bars",
-                                        series.wealth.len()
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(return_color)
-                                    .child(format!(
-                                        "NAV {} · R {}",
-                                        format_currency(last_nav),
-                                        format_percent_signed(return_pct)
-                                    )),
-                            ),
+                            .px(card_pad)
+                            .pb(card_pad)
+                            .overflow_hidden()
+                            .child(render_canvas_single_line(
+                                truncate_to_runway(
+                                    &format!("{allocation_display} · {wired_count} src"),
+                                    display_width - card_pad_f * 2.0,
+                                    px_to_f32(meta_size),
+                                    false,
+                                ),
+                                meta_size,
+                                rgb(0x64748b).into(),
+                            )),
                     );
                 } else {
-                    node_card = node_card.child(
+                    let prim_path = node_prim_path.clone().unwrap_or_default();
+                    let host_view = view.clone();
+                    node_body = node_body.child(
                         div()
-                            .px_2()
-                            .pb_1()
+                            .px(card_pad)
+                            .pb(card_pad)
                             .flex_col()
-                            .gap_0p5()
-                            .text_size(px(8.0))
-                            .font_family("monospace")
-                            .text_color(rgb(0x64748b))
-                            .child(format!("{wired_count} execution source(s) wired"))
-                            .child(self.portfolio_graph_engine_status_label(cx)),
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(meta_size)
+                                    .text_color(rgb(0x8e8e93))
+                                    .child("Allocation"),
+                            )
+                            .child(
+                                node_dropdown_trigger(
+                                    ("node-allocation", node_id),
+                                    allocation_display,
+                                    cx,
+                                )
+                                .dropdown_menu(move |menu, _, _| {
+                                    PORTFOLIO_ALLOCATION_OPTIONS
+                                        .iter()
+                                        .fold(menu, |menu, (token, label)| {
+                                            let token = (*token).to_string();
+                                            let prim_path = prim_path.clone();
+                                            let view = host_view.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(*label).on_click(
+                                                    move |_, _, cx| {
+                                                        let token = token.clone();
+                                                        let prim_path = prim_path.clone();
+                                                        let view_for_defer = view.clone();
+                                                        view.update(cx, |ws, cx| {
+                                                            if let Some(node) = ws
+                                                                .nodes
+                                                                .iter_mut()
+                                                                .find(|n| n.id == node_id)
+                                                            {
+                                                                node.portfolio_allocation_id =
+                                                                    Some(token.clone());
+                                                            }
+                                                            let workspace_context =
+                                                                ws.workspace_context.clone();
+                                                            cx.defer(move |cx| {
+                                                                if !prim_path.is_empty() {
+                                                                    workspace_context.update(
+                                                                        cx,
+                                                                        |ctx, cx| {
+                                                                            ctx.modify_attribute(
+                                                                                &prim_path,
+                                                                                "inputs:id",
+                                                                                Value::String(
+                                                                                    token.clone(),
+                                                                                ),
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }
+                                                                view_for_defer.update(
+                                                                    cx,
+                                                                    |ws, cx| {
+                                                                        ws.sync_pipeline_graph(
+                                                                            cx,
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                );
+                                                            });
+                                                            cx.notify();
+                                                        });
+                                                    },
+                                                ),
+                                            )
+                                        })
+                                }),
+                            ),
                     );
+                    let node_metrics = cx
+                        .global::<crate::ui::telemetry_bridge::MetricsTelemetryBridge>()
+                        .metrics_for_node(node_id)
+                        .cloned()
+                        .or_else(|| {
+                            self.portfolio_diagnostics_for_node(node_id)
+                                .map(crate::ui::telemetry_bridge::EvaluatedMetrics::from)
+                        });
+                    if let Some(metrics) = node_metrics {
+                        let return_color = if metrics.total_return >= 0.0 {
+                            rgb(0x10b981)
+                        } else {
+                            rgb(0xf87171)
+                        };
+                        node_body = node_body.child(
+                            div()
+                                .px(card_pad)
+                                .pb(card_pad)
+                                .flex_col()
+                                .gap_0p5()
+                                .font_family("monospace")
+                                .text_size(meta_size)
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x64748b))
+                                        .child(format!(
+                                            "{wired_count} source(s) · {} trades · live GE",
+                                            metrics.trailing_trades_count
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(return_color)
+                                        .child(format!(
+                                            "R_total {}",
+                                            format_percent_signed(metrics.total_return)
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x94a3b8))
+                                        .child(format!(
+                                            "Exp {:.0}% · Conv {:.2}",
+                                            metrics.net_exposure * 100.0,
+                                            metrics.current_conviction
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x64748b))
+                                        .child(format!(
+                                            "MDD {}",
+                                            format_percent_signed(-metrics.rolling_drawdown)
+                                        )),
+                                ),
+                        );
+                    } else if node_prim_path
+                        .as_ref()
+                        .and_then(|path| {
+                            self.ui_read_snapshot()
+                                .and_then(|snap| snap.portfolio_timeline_cache.get(path))
+                        })
+                        .is_some_and(|series| !series.wealth.is_empty())
+                    {
+                        let series = self
+                            .ui_read_snapshot()
+                            .and_then(|snap| {
+                                snap.portfolio_timeline_cache
+                                    .get(node_prim_path.as_ref().expect("prim path"))
+                            })
+                            .expect("series present");
+                        let last_nav = series.wealth.last().copied().unwrap_or(0.0);
+                        let base = series.wealth.first().copied().unwrap_or(last_nav);
+                        let return_pct = if base.abs() > f64::EPSILON {
+                            (last_nav / base - 1.0) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let return_color = if return_pct >= 0.0 {
+                            rgb(0x10b981)
+                        } else {
+                            rgb(0xf87171)
+                        };
+                        node_body = node_body.child(
+                            div()
+                                .px(card_pad)
+                                .pb(card_pad)
+                                .flex_col()
+                                .gap_0p5()
+                                .font_family("monospace")
+                                .text_size(meta_size)
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x64748b))
+                                        .child(format!(
+                                            "{wired_count} source(s) · graph sweep · {} bars",
+                                            series.wealth.len()
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(return_color)
+                                        .child(format!(
+                                            "NAV {} · R {}",
+                                            format_currency(last_nav),
+                                            format_percent_signed(return_pct)
+                                        )),
+                                ),
+                        );
+                    } else {
+                        node_body = node_body.child(
+                            div()
+                                .px(card_pad)
+                                .pb(card_pad)
+                                .flex_col()
+                                .gap_0p5()
+                                .text_size(meta_size)
+                                .font_family("monospace")
+                                .text_color(rgb(0x64748b))
+                                .child(format!("{wired_count} execution source(s) wired"))
+                                .child(self.portfolio_graph_engine_status_label(cx)),
+                        );
+                    }
                 }
             }
 
             if node.node_type.displays_price_chart() && !suppress_charts {
-                let chart_buffer = self
-                    .asset_chart_history
-                    .get(&node_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let chart_height = NODE_CHART_HEIGHT * self.zoom_scale;
-                let chart_stroke = tier_accent;
-                node_card = node_card.child(
+                if let Some(chart_bitmap) = self.asset_chart_bitmaps.get(&node_id).cloned() {
+                    let chart_height = canvas_layout_px(NODE_CHART_HEIGHT, zoom);
+                    node_body = node_body.child(
+                        div()
+                            .px(card_pad)
+                            .pb(card_pad)
+                            .child(
+                                img(chart_bitmap)
+                                    .w_full()
+                                    .h(chart_height)
+                                    .rounded_sm()
+                                    .object_fit(ObjectFit::Fill),
+                            ),
+                    );
+                }
+            }
+
+            if self.graph_engine_recompile_inflight
+                && (node.node_type.is_ta_uber_signal()
+                    || node.node_type.is_portfolio()
+                    || node.node_type.is_otl_shader())
+            {
+                node_body = node_body.child(
                     div()
-                        .px_2()
-                        .pb_1()
-                        .child(
-                            gpui::canvas(
-                                |bounds, _window, _cx| bounds,
-                                move |bounds, _state, window, _cx| {
-                                    TradingSystemWorkspace::paint_asset_price_chart(
-                                        bounds,
-                                        &chart_buffer,
-                                        window,
-                                        chart_stroke,
-                                    );
-                                },
-                            )
-                            .w_full()
-                            .h(px(chart_height))
-                            .rounded_sm()
-                            .bg(rgb(DCC_CANVAS_BACKPLATE)),
-                        ),
+                        .px(card_pad)
+                        .pb(card_pad)
+                        .text_size(meta_size)
+                        .text_color(rgb(0x94a3b8))
+                        .child("⟳ compiling sweep…"),
                 );
             }
 
-            canvas = canvas.child(node_card.child(ports));
+            let node_card = div()
+                .absolute()
+                .left(px(display_left))
+                .top(px(display_top))
+                .w(px(display_width))
+                .h(px(display_height))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .bg(hull_color)
+                .when(is_selected, |this| this.border_2())
+                .when(!is_selected, |this| this.border_1())
+                .border_color(border_color)
+                .rounded(canvas_layout_px(DCC_NODE_CORNER_RADIUS_PX, zoom))
+                .child(node_body)
+                .child(ports);
+
+            canvas = canvas.child(node_card);
         }
 
         if self.active_drag_node_id.is_some() {
@@ -1703,20 +1894,20 @@ impl TradingSystemWorkspace {
                     .on_mouse_move(cx.listener(
                         |this, event: &MouseMoveEvent, _window, cx| {
                             this.update_dragged_node_position(event.position);
-                            cx.notify();
+                            this.schedule_canvas_interaction_repaint(cx);
                         },
                     ))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                            this.end_node_drag();
+                            this.end_node_drag(cx);
                             cx.notify();
                         }),
                     )
                     .on_mouse_up_out(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                            this.end_node_drag();
+                            this.end_node_drag(cx);
                             cx.notify();
                         }),
                     ),
@@ -1735,6 +1926,16 @@ impl TradingSystemWorkspace {
                             move |_, _, cx| {
                                 view.update(cx, |this, cx| {
                                     this.spawn_csv_asset_node(cx);
+                                });
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Fit Graph to View").on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.fit_canvas_to_visible_nodes(cx);
                                 });
                             }
                         }),

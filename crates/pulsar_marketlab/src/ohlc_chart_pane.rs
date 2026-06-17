@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui::prelude::FluentBuilder;
 use gpui_component::chart::{CandlestickChart, LineChart};
+use pulsar_marketlab_ui::theme;
 use pulsar_marketlab::technical_analysis::{
     build_ta_chart_layers, compute_ta_all_outputs_with_params, MarketSeriesWindow, TaChartLayer,
     TaVisualRole,
@@ -25,8 +26,6 @@ pub struct OhlcChartPaneConfig {
     pub overlay_algorithm_label: Option<String>,
     /// Uber-signal period hyperparameter (`TaUberSignalConfig::period`).
     pub overlay_period: Option<u32>,
-    /// Global synchronized playhead bar index (0-based).
-    pub playhead_index: Option<usize>,
 }
 
 impl OhlcChartPaneConfig {
@@ -64,73 +63,15 @@ fn overlay_colors() -> [Hsla; 6] {
     ]
 }
 
-const BUY_SIGNAL_COLOR: u32 = 0x22c55e;
-const SELL_SIGNAL_COLOR: u32 = 0xef4444;
-pub const PLAYHEAD_COLOR: u32 = 0xf59e0b;
-pub const PLAYHEAD_STROKE_PX: f32 = 1.5;
 pub const CHART_PLOT_INSET: f32 = 8.0;
 
-pub fn playhead_x_for_index(index: usize, bounds: Bounds<Pixels>, total_bars: usize) -> f32 {
-    let origin_x: f32 = bounds.origin.x.into();
-    let width: f32 = bounds.size.width.into();
-    let plot_width = (width - CHART_PLOT_INSET * 2.0).max(1.0);
-    let bar_count = total_bars.max(1);
-    if bar_count <= 1 {
-        origin_x + CHART_PLOT_INSET + plot_width * 0.5
-    } else {
-        origin_x + CHART_PLOT_INSET + plot_width * index as f32 / (bar_count - 1) as f32
-    }
-}
-
-pub fn playhead_index_for_mouse_x(
-    mouse_x: f32,
-    bounds: Bounds<Pixels>,
-    total_bars: usize,
-) -> usize {
-    if total_bars <= 1 {
-        return 0;
-    }
-    let origin_x: f32 = bounds.origin.x.into();
-    let width: f32 = bounds.size.width.into();
-    let plot_width = (width - CHART_PLOT_INSET * 2.0).max(1.0);
-    let relative = ((mouse_x - origin_x - CHART_PLOT_INSET) / plot_width).clamp(0.0, 1.0);
-    let index = (relative * (total_bars - 1) as f32).round() as usize;
-    index.min(total_bars - 1)
-}
-
-pub fn paint_playhead_line(
-    bounds: Bounds<Pixels>,
-    playhead_index: usize,
-    total_bars: usize,
-    window: &mut Window,
-) {
-    if total_bars < 2 {
-        return;
-    }
-    let x = playhead_x_for_index(playhead_index, bounds, total_bars);
-    let origin_y: f32 = bounds.origin.y.into();
-    let height: f32 = bounds.size.height.into();
-    let stroke = rgb(PLAYHEAD_COLOR);
-    let mut builder = PathBuilder::stroke(px(PLAYHEAD_STROKE_PX));
-    builder.move_to(point(px(x), px(origin_y)));
-    builder.line_to(point(px(x), px(origin_y + height)));
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, stroke);
-    }
-}
-
 pub fn render_ohlc_candlestick_pane(config: OhlcChartPaneConfig) -> AnyElement {
-    let mut title = match (&config.asset_name, &config.overlay_algorithm_label) {
+    let title = match (&config.asset_name, &config.overlay_algorithm_label) {
         (Some(asset), Some(overlay)) => format!("OHLC // {asset} + {overlay}"),
         (Some(asset), None) => format!("OHLC // {asset}"),
         (None, Some(overlay)) => format!("OHLC // {overlay}"),
         (None, None) => "OHLC Chart".to_string(),
     };
-    if let Some(index) = config.playhead_index {
-        if let Some(bar) = config.bars.get(index) {
-            title = format!("{title} · bar {}/{} · {}", index + 1, config.bars.len(), bar.date);
-        }
-    }
 
     let header = chart_header(&title);
 
@@ -153,28 +94,18 @@ fn render_ohlc_chart_body(
     header: impl IntoElement,
 ) -> impl IntoElement {
     let bars = config.bars;
-    let playhead_end = config
-        .playhead_index
-        .unwrap_or_else(|| bars.len().saturating_sub(1))
-        .min(bars.len().saturating_sub(1));
-    let bounded_bars = if bars.is_empty() {
-        &bars[..]
-    } else {
-        &bars[..=playhead_end]
-    };
     let ta_layers = config
         .overlay_algorithm
         .as_deref()
         .and_then(|algorithm_id| {
             build_ta_layers(
                 algorithm_id,
-                bounded_bars,
+                &bars,
                 config.overlay_period.unwrap_or(14) as usize,
             )
         })
         .unwrap_or_default();
-    let playhead_index = config.playhead_index;
-    let total_bars = bars.len();
+    let _total_bars = bars.len();
     let has_oscillator = ta_layers
         .iter()
         .any(|layer| layer.role == TaVisualRole::Oscillator);
@@ -213,9 +144,9 @@ fn render_ohlc_chart_body(
         .flex()
         .flex_col()
         .min_h_0()
-        .bg(rgb(0x0f0f12))
+        .bg(rgb(theme::CHART_PANE_BG))
         .border_b_1()
-        .border_color(rgb(0x2d2d34))
+        .border_color(rgb(theme::CHART_PANE_BORDER))
         .child(header)
         .child(
             div()
@@ -251,9 +182,6 @@ fn render_ohlc_chart_body(
                                         &signal_layers,
                                         window,
                                     );
-                                    if let Some(index) = playhead_index {
-                                        paint_playhead_line(bounds, index, total_bars, window);
-                                    }
                                 },
                             )
                             .absolute()
@@ -264,7 +192,7 @@ fn render_ohlc_chart_body(
                 )
                 .when(has_oscillator, |pane| {
                     pane.child(render_oscillator_panel(
-                        bounded_bars,
+                        &bars,
                         &oscillator_layers,
                         tick_margin,
                     ))
@@ -277,12 +205,12 @@ fn chart_header(title: &str) -> impl IntoElement {
     div()
         .px_3()
         .py_2()
-        .bg(rgb(0x1c1c21))
+        .bg(rgb(theme::LEDGER_HEADER))
         .border_b_1()
-        .border_color(rgb(0x2d2d34))
+        .border_color(rgb(theme::CHART_PANE_BORDER))
         .text_xs()
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(0xa1a1aa))
+        .text_color(rgb(theme::TEXT_SECONDARY))
         .child(title.to_string())
 }
 
@@ -292,9 +220,9 @@ fn empty_pane(header: impl IntoElement, hint: &str) -> impl IntoElement {
         .flex()
         .flex_col()
         .min_h_0()
-        .bg(rgb(0x0f0f12))
+        .bg(rgb(theme::CHART_PANE_BG))
         .border_b_1()
-        .border_color(rgb(0x2d2d34))
+        .border_color(rgb(theme::CHART_PANE_BORDER))
         .child(header)
         .child(
             div()
@@ -403,8 +331,8 @@ fn paint_ta_overlays(
 
     for layer in signal_layers {
         let color = match layer.role {
-            TaVisualRole::SellSignal => rgb(SELL_SIGNAL_COLOR),
-            _ => rgb(BUY_SIGNAL_COLOR),
+            TaVisualRole::SellSignal => rgb(theme::SIGNAL_SELL),
+            _ => rgb(theme::SIGNAL_BUY),
         };
         for (index, value) in layer.values.iter().enumerate() {
             if !matches!(value, Some(v) if *v > 0.0) {
@@ -478,7 +406,7 @@ fn render_oscillator_panel(
             div()
                 .text_size(px(8.0))
                 .font_family("monospace")
-                .text_color(rgb(0x71717a))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(title),
         );
 
@@ -524,8 +452,8 @@ fn render_ta_legend(layers: &[TaChartLayer]) -> impl IntoElement {
                 colors[layer.color_index % colors.len()],
                 "oscillator",
             ),
-            TaVisualRole::BuySignal => (hsla(0.33, 0.7, 0.5, 1.0), "buy"),
-            TaVisualRole::SellSignal => (hsla(0.0, 0.7, 0.55, 1.0), "sell"),
+            TaVisualRole::BuySignal => (theme::chrome_color(theme::SIGNAL_BUY), "buy"),
+            TaVisualRole::SellSignal => (theme::chrome_color(theme::SIGNAL_SELL), "sell"),
         };
         legend = legend.child(
             div()
@@ -537,7 +465,7 @@ fn render_ta_legend(layers: &[TaChartLayer]) -> impl IntoElement {
                     div()
                         .text_size(px(8.0))
                         .font_family("monospace")
-                        .text_color(rgb(0x71717a))
+                        .text_color(rgb(theme::TEXT_MUTED))
                         .child(format!("{} ({role_label})", layer.label)),
                 ),
         );

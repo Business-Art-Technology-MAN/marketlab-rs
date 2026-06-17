@@ -9,7 +9,7 @@ use crate::graph_compiler::{AssetSourceType, NodeType, VisualNode};
 use pulsar_marketlab::technical_analysis::{
     clamp_ta_lookback, DEFAULT_TA_LOOKBACK, MAX_TA_LOOKBACK, MIN_TA_LOOKBACK,
 };
-use pulsar_marketlab_core::{algorithm_display_label, hyperparameter_visibility, TaArchetype};
+use pulsar_marketlab_core::{algorithm_display_label, hyperparameter_visibility};
 
 use crate::ui::ta_uber_inspector::{
     adjust_period, adjust_signal_period, algorithm_picker_chip, archetype_summary,
@@ -18,18 +18,19 @@ use crate::ui::ta_uber_inspector::{
 use std::path::PathBuf;
 use crate::asset_path_input::PathInputEvent;
 use crate::workspace_state::{
-    chart_buffer_from_csv_rows, csv_node_label_from_path, hydrate_market_stage_from_ohlc,
-    load_yahoo_finance_csv, ohlc_bars_from_csv_rows, format_currency, format_percent_magnitude,
-    format_percent_signed, format_ratio, format_tick_label, MatrixDataRow, TradingSystemWorkspace,
-    SIM_INITIAL_CASH,
+    csv_node_label_from_path, format_currency, format_percent_magnitude, format_percent_signed,
+    format_ratio, format_tick_label, MatrixDataRow, TradingSystemWorkspace, SIM_INITIAL_CASH,
 };
 use crate::portfolio_integrator_ledger::{
     render_integrator_ledger_spreadsheet, IntegratorLedgerFilter, IntegratorLedgerHost,
 };
+use pulsar_marketlab_ui::workspace::render_composed_asset_metadata_grid;
+
 use crate::portfolio_wealth_chart::{
-    build_portfolio_wealth_chart_from_streams, render_portfolio_wealth_chart,
-    PortfolioChartHost, PortfolioChartOverlayKey,
+    build_portfolio_wealth_chart_from_streams, render_allocation_area_chart,
+    render_portfolio_wealth_chart, PortfolioChartHost, PortfolioChartOverlayKey,
 };
+use pulsar_marketlab_ui::theme;
 
 impl TradingSystemWorkspace {
     pub(crate) fn selected_technical_analysis_node(&self) -> Option<&VisualNode> {
@@ -92,8 +93,13 @@ impl TradingSystemWorkspace {
         }
     }
 
-    pub(crate) fn end_ta_lookback_scrub(&mut self, _cx: &mut Context<Self>) {
+    pub(crate) fn end_ta_lookback_scrub(&mut self, cx: &mut Context<Self>) {
+        if !self.ta_lookback_scrubbing {
+            return;
+        }
         self.ta_lookback_scrubbing = false;
+        self.commit_ta_uber_parameter_change(cx);
+        self.on_pipeline_interaction_ended(cx);
     }
 
     pub(crate) fn adjust_ta_lookback_period(&mut self, node_id: usize, delta: i32, cx: &mut Context<Self>) {
@@ -110,8 +116,12 @@ impl TradingSystemWorkspace {
     pub(crate) fn sync_inspector_from_selection(&mut self, cx: &mut Context<Self>) {
         self.reset_otl_script_input();
         self.reset_otl_editor_input();
+        self.reset_otl_shader_param_inputs();
+        self.node_label_input = None;
+        self.node_label_node_id = None;
         self.sync_asset_path_draft_from_selection(cx);
         self.sync_ta_inspector_category_from_selection();
+        self.sync_view_window(cx);
     }
 
     pub(crate) fn sync_ta_inspector_category_from_selection(&mut self) {
@@ -139,33 +149,8 @@ impl TradingSystemWorkspace {
         path: &str,
         cx: &mut Context<Self>,
     ) {
-        match load_yahoo_finance_csv(path) {
-            Ok((_, rows)) => {
-                self.asset_chart_history
-                    .insert(node_id, chart_buffer_from_csv_rows(&rows));
-                let ohlc_bars = ohlc_bars_from_csv_rows(&rows);
-                if ohlc_bars.is_empty() {
-                    self.asset_ohlc_history.remove(&node_id);
-                } else {
-                    self.asset_ohlc_history
-                        .insert(node_id, ohlc_bars.clone());
-                    if let Some(node) = self.nodes.iter().find(|node| node.id == node_id) {
-                        hydrate_market_stage_from_ohlc(
-                            &mut self.market_stage,
-                            &node.name,
-                            &ohlc_bars,
-                        );
-                    }
-                }
-                self.snap_playhead_to_last_bar();
-                self.synchronize_inspector_view();
-                self.sync_view_window(cx);
-                self.request_graph_engine_timeline_refresh(cx);
-            }
-            Err(error) => {
-                self.push_status_log(format!("Chart reload failed for `{path}`: {error}"));
-            }
-        }
+        self.load_asset_csv_for_node_async(node_id, path.to_string(), cx);
+        self.synchronize_inspector_view();
     }
 
     pub(crate) fn apply_asset_path_to_node(
@@ -185,8 +170,8 @@ impl TradingSystemWorkspace {
             });
             node.name = csv_node_label_from_path(&path);
             self.csv_path_registry.set_path(node_id, path.clone());
-            self.reload_asset_chart_from_path(node_id, &path, cx);
             self.sync_pipeline_graph(cx);
+            self.load_asset_csv_for_node_async(node_id, path, cx);
         }
     }
 
@@ -203,10 +188,12 @@ impl TradingSystemWorkspace {
 
     pub(crate) fn on_asset_path_input_event(&mut self, event: &PathInputEvent, cx: &mut Context<Self>) {
         match event {
-            PathInputEvent::Changed(path) => {
-                self.apply_asset_path_to_selected_node(path.clone(), cx);
-            }
+            PathInputEvent::Changed(_) => {}
             PathInputEvent::Submit => {
+                let path = self.asset_path_input.read(cx).content().to_string();
+                if !path.trim().is_empty() {
+                    self.apply_asset_path_to_selected_node(path, cx);
+                }
                 cx.notify();
             }
         }
@@ -220,18 +207,18 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn prompt_csv_for_node(&mut self, node_id: usize, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open".into()),
-        });
         let view = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let picked = match receiver.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                _ => None,
-            };
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                })
+                .await;
             let _ = cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |workspace, cx| {
@@ -242,12 +229,9 @@ impl TradingSystemWorkspace {
                                 input.set_content(path_str.clone(), cx);
                             });
                             workspace.apply_asset_path_to_node(node_id, path_str, cx);
-                            workspace.push_status_log(format!(
-                                "CSV Asset bound — node {node_id} loaded"
-                            ));
                         } else {
                             workspace.push_status_log(format!(
-                                "CSV Asset node {node_id} created — use Browse to bind a file"
+                                "CSV Asset node {node_id} — browse cancelled"
                             ));
                         }
                         cx.notify();
@@ -267,7 +251,17 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn render_asset_path_config_row(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let composed_meta = self
+            .selected_asset_node()
+            .and_then(|node| self.stage_prim_path_for_node_in_graph(node))
+            .and_then(|prim_path| {
+                self.workspace_context
+                    .read(cx)
+                    .composed_asset_for_path(&prim_path)
+                    .cloned()
+            });
+
+        let mut panel = div()
             .mt_2()
             .mb_2()
             .flex_col()
@@ -276,7 +270,7 @@ impl TradingSystemWorkspace {
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xa1a1aa))
+                    .text_color(rgb(theme::TEXT_SECONDARY))
                     .child("📁 Data Stream Target Path:"),
             )
             .child(
@@ -288,9 +282,9 @@ impl TradingSystemWorkspace {
                         div()
                             .flex_1()
                             .p_2()
-                            .bg(rgb(0x141417))
+                            .bg(rgb(theme::PANE_BG))
                             .border_1()
-                            .border_color(rgb(0x222227))
+                            .border_color(rgb(theme::BORDER_MUTED))
                             .rounded_sm()
                             .child(render_asset_path_input(&self.asset_path_input)),
                     )
@@ -298,12 +292,12 @@ impl TradingSystemWorkspace {
                         div()
                             .px_3()
                             .py_2()
-                            .bg(rgb(0x2563eb))
+                            .bg(rgb(theme::ACCENT_DCC_BLUE))
                             .rounded_sm()
                             .cursor(CursorStyle::PointingHand)
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(theme::TEXT_ON_ACCENT))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _event: &MouseDownEvent, window, cx| {
@@ -313,7 +307,13 @@ impl TradingSystemWorkspace {
                             )
                             .child("Browse…"),
                     ),
-            )
+            );
+
+        if let Some(meta) = composed_meta {
+            panel = panel.child(render_composed_asset_metadata_grid(&meta));
+        }
+
+        panel
     }
     pub(crate) fn render_spreadsheet_inspector(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let inspector_title = match self.selected_node_id {
@@ -347,24 +347,25 @@ impl TradingSystemWorkspace {
                         .flex()
                         .justify_between()
                         .p_1()
-                        .bg(rgb(0x141417))
+                        .bg(rgb(theme::PANE_BG))
                         .border_1()
-                        .border_color(rgb(0x222227))
+                        .border_color(rgb(theme::BORDER_MUTED))
                         .font_family("monospace")
                         .text_size(px(9.0))
-                        .child(div().w_12().text_color(rgb(0x71717a)).child(row.tick.clone()))
-                        .child(div().w_16().text_color(rgb(0xffffff)).child(row.asset.clone()))
+                        .hover(|style| style.bg(rgb(theme::ROW_HOVER_BG)))
+                        .child(div().w_12().text_color(rgb(theme::TEXT_MUTED)).child(row.tick.clone()))
+                        .child(div().w_16().text_color(rgb(theme::TEXT_PRIMARY)).child(row.asset.clone()))
                         .child(
                             div()
                                 .w_20()
-                                .text_color(rgb(0x38bdf8))
+                                .text_color(rgb(theme::LEDGER_ACCENT))
                                 .child(row.grade_type.clone()),
                         )
                         .child(
                             div()
                                 .flex_1()
                                 .text_right()
-                                .text_color(rgb(0x10b981))
+                                .text_color(rgb(theme::PNL_POSITIVE))
                                 .child(row.multivector_value.clone()),
                         ),
                 );
@@ -382,7 +383,7 @@ impl TradingSystemWorkspace {
                     .flex_shrink_0()
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xe4e4e7))
+                    .text_color(rgb(theme::TEXT_PRIMARY))
                     .child(inspector_title),
             );
 
@@ -448,7 +449,7 @@ impl TradingSystemWorkspace {
                 div()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child(graph_status),
             )
             .when(self.graph_engine_analytics_active(), |panel| {
@@ -456,12 +457,12 @@ impl TradingSystemWorkspace {
                     div()
                         .p_3()
                         .rounded_md()
-                        .bg(rgb(0x101014))
+                        .bg(rgb(theme::PANEL_SUBTLE_BG))
                         .border_1()
-                        .border_color(rgb(0x222227))
+                        .border_color(rgb(theme::BORDER_MUTED))
                         .text_size(px(10.0))
                         .font_family("monospace")
-                        .text_color(rgb(0xcbd5e1))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
                         .child(format!(
                             "Live GraphEngine · R {} · MDD {} · Exp {:.0}% · {} trades · conv {:.2}",
                             format_percent_signed(bridge_metrics.total_return),
@@ -477,16 +478,16 @@ impl TradingSystemWorkspace {
                     div()
                         .p_3()
                         .rounded_md()
-                        .bg(rgb(0x141417))
+                        .bg(rgb(theme::PANE_BG))
                         .border_1()
-                        .border_color(rgb(0x222227))
+                        .border_color(rgb(theme::BORDER_MUTED))
                         .flex_col()
                         .gap_1()
                         .child(
                             div()
                                 .text_size(px(9.0))
                                 .font_family("monospace")
-                                .text_color(rgb(0x71717a))
+                                .text_color(rgb(theme::TEXT_MUTED))
                                 .child(format!(
                                     "Wired execution sources ({})",
                                     wired_sources.len()
@@ -496,7 +497,7 @@ impl TradingSystemWorkspace {
                             div()
                                 .text_size(px(10.0))
                                 .font_family("monospace")
-                                .text_color(rgb(0xcbd5e1))
+                                .text_color(rgb(theme::TEXT_PRIMARY))
                                 .child(format!("node {node_id} · {name}"))
                         })),
                 )
@@ -505,9 +506,9 @@ impl TradingSystemWorkspace {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x141417))
+                    .bg(rgb(theme::PANE_BG))
                     .border_1()
-                    .border_color(rgb(0x222227))
+                    .border_color(rgb(theme::BORDER_MUTED))
                     .flex_col()
                     .gap_2()
                     .child(
@@ -515,10 +516,11 @@ impl TradingSystemWorkspace {
                             .text_size(px(9.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .font_family("monospace")
-                            .text_color(rgb(0x94a3b8))
+                            .text_color(rgb(theme::LABEL_EMPHASIS))
                             .child("Wealth Timeline"),
                     )
-                    .child(self.render_portfolio_wealth_chart_section(cx)),
+                    .child(self.render_portfolio_wealth_chart_section(cx))
+                    .child(self.render_portfolio_allocation_chart_section(cx)),
             );
 
         if self.portfolio_integrator_ledger_for_selection().is_some() {
@@ -526,9 +528,9 @@ impl TradingSystemWorkspace {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x141417))
+                    .bg(rgb(theme::PANE_BG))
                     .border_1()
-                    .border_color(rgb(0x222227))
+                    .border_color(rgb(theme::BORDER_MUTED))
                     .child({
                         let ledger = self
                             .portfolio_integrator_ledger_for_selection()
@@ -537,6 +539,7 @@ impl TradingSystemWorkspace {
                             ledger,
                             self.portfolio_ledger_filter.clone(),
                             cx.entity(),
+                            cx,
                         )
                     }),
             );
@@ -553,12 +556,12 @@ impl TradingSystemWorkspace {
             return div()
                 .p_3()
                 .rounded_md()
-                .bg(rgb(0x111114))
+                .bg(rgb(theme::LEDGER_ROW_B))
                 .border_1()
-                .border_color(rgb(0x222227))
+                .border_color(rgb(theme::BORDER_MUTED))
                 .text_size(px(10.0))
                 .font_family("monospace")
-                .text_color(rgb(0x71717a))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(
                     "Portfolio metrics appear after the first asset tick. \
                      Graph-engine wealth and integrator rows below use the compiled portfolio sweep.",
@@ -570,20 +573,20 @@ impl TradingSystemWorkspace {
             .clone()
             .unwrap_or_else(|| format_tick_label(metrics.tick_index));
         let return_color = if metrics.total_return_pct >= 0.0 {
-            rgb(0x10b981)
+            rgb(theme::PNL_POSITIVE)
         } else {
-            rgb(0xf87171)
+            rgb(theme::PNL_NEGATIVE)
         };
         let alpha_color = metrics
             .excess_return_pct
             .map(|alpha| {
                 if alpha >= 0.0 {
-                    rgb(0x10b981)
+                    rgb(theme::PNL_POSITIVE)
                 } else {
-                    rgb(0xf87171)
+                    rgb(theme::PNL_NEGATIVE)
                 }
             })
-            .unwrap_or(rgb(0x64748b));
+            .unwrap_or(rgb(theme::EQUITY_PEAK_LINE));
         let activity_summary = if metrics.trade_count == 0 {
             format!(
                 "{} bars · 0 trades · sat in cash (avg exposure {:.0}%)",
@@ -606,12 +609,12 @@ impl TradingSystemWorkspace {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x111114))
+                    .bg(rgb(theme::LEDGER_ROW_B))
                     .border_1()
-                    .border_color(rgb(0x222227))
+                    .border_color(rgb(theme::BORDER_MUTED))
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(theme::LABEL_EMPHASIS))
                     .child(activity_summary),
             )
             .child(self.render_portfolio_metrics_cards(metrics, return_color, alpha_color))
@@ -620,7 +623,7 @@ impl TradingSystemWorkspace {
                 div()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child(format!(
                         "CSV simulation ledger · epoch {} · {tick_label} · base {}",
                         metrics.simulation_epoch,
@@ -629,12 +632,23 @@ impl TradingSystemWorkspace {
             )
     }
 
+    fn render_portfolio_allocation_chart_section(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(series) = self.portfolio_allocation_chart_for_selection() {
+            return render_allocation_area_chart(series);
+        }
+        div()
+            .text_size(px(10.0))
+            .font_family("monospace")
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child("Allocation area chart appears after a portfolio graph sweep.")
+            .into_any_element()
+    }
+
     fn render_portfolio_wealth_chart_section(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if let Some(series) = self.portfolio_wealth_chart_for_selection() {
             return render_portfolio_wealth_chart(
                 series,
                 self.portfolio_chart_overlays,
-                self.playhead_current,
                 cx.entity(),
             );
         }
@@ -651,14 +665,13 @@ impl TradingSystemWorkspace {
                 return render_portfolio_wealth_chart(
                     &series,
                     self.portfolio_chart_overlays,
-                    self.playhead_current,
                     cx.entity(),
                 );
             }
             return div()
                 .text_size(px(10.0))
                 .font_family("monospace")
-                .text_color(rgb(0x71717a))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(format!(
                     "Awaiting graph-engine sweep for `{prim_path}`. \
                      Wire asset → signal → portfolio and load CSV data."
@@ -668,7 +681,7 @@ impl TradingSystemWorkspace {
         div()
             .text_size(px(10.0))
             .font_family("monospace")
-            .text_color(rgb(0x71717a))
+            .text_color(rgb(theme::TEXT_MUTED))
             .child("Select a portfolio integrator node.")
             .into_any_element()
     }
@@ -686,16 +699,16 @@ impl TradingSystemWorkspace {
                 div()
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x141417))
+                    .bg(rgb(theme::PANE_BG))
                     .border_1()
-                    .border_color(rgb(0x222227))
+                    .border_color(rgb(theme::BORDER_MUTED))
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
                             .text_size(px(9.0))
                             .font_family("monospace")
-                            .text_color(rgb(0x71717a))
+                            .text_color(rgb(theme::TEXT_MUTED))
                             .child("Total Return (R_total)"),
                     )
                     .child(
@@ -710,7 +723,7 @@ impl TradingSystemWorkspace {
                         div()
                             .text_size(px(9.0))
                             .font_family("monospace")
-                            .text_color(rgb(0x52525b))
+                            .text_color(rgb(theme::TEXT_HINT))
                             .child(format!(
                                 "NAV {} vs base {}",
                                 format_currency(metrics.nav),
@@ -727,16 +740,16 @@ impl TradingSystemWorkspace {
                             .flex_1()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x141417))
+                            .bg(rgb(theme::PANE_BG))
                             .border_1()
-                            .border_color(rgb(0x222227))
+                            .border_color(rgb(theme::BORDER_MUTED))
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x71717a))
+                                    .text_color(rgb(theme::TEXT_MUTED))
                                     .child("Buy & Hold Benchmark"),
                             )
                             .child(
@@ -744,7 +757,7 @@ impl TradingSystemWorkspace {
                                     .text_size(px(16.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .font_family("monospace")
-                                    .text_color(rgb(0xe2e8f0))
+                                    .text_color(rgb(theme::BENCHMARK_VALUE))
                                     .child(
                                         metrics
                                             .benchmark_return_pct
@@ -756,7 +769,7 @@ impl TradingSystemWorkspace {
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x52525b))
+                                    .text_color(rgb(theme::TEXT_HINT))
                                     .child("Same-window asset return"),
                             ),
                     )
@@ -765,16 +778,16 @@ impl TradingSystemWorkspace {
                             .flex_1()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x141417))
+                            .bg(rgb(theme::PANE_BG))
                             .border_1()
-                            .border_color(rgb(0x222227))
+                            .border_color(rgb(theme::BORDER_MUTED))
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x71717a))
+                                    .text_color(rgb(theme::TEXT_MUTED))
                                     .child("Alpha (vs B&H)"),
                             )
                             .child(
@@ -794,7 +807,7 @@ impl TradingSystemWorkspace {
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x52525b))
+                                    .text_color(rgb(theme::TEXT_HINT))
                                     .child("Strategy return minus benchmark"),
                             ),
                     ),
@@ -808,16 +821,16 @@ impl TradingSystemWorkspace {
                             .flex_1()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x141417))
+                            .bg(rgb(theme::PANE_BG))
                             .border_1()
-                            .border_color(rgb(0x222227))
+                            .border_color(rgb(theme::BORDER_MUTED))
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x71717a))
+                                    .text_color(rgb(theme::TEXT_MUTED))
                                     .child("Max Drawdown (MDD)"),
                             )
                             .child(
@@ -825,7 +838,7 @@ impl TradingSystemWorkspace {
                                     .text_size(px(16.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .font_family("monospace")
-                                    .text_color(rgb(0xf59e0b))
+                                    .text_color(rgb(theme::RISK_WEIGHT_HIGHLIGHT))
                                     .child(format_percent_magnitude(metrics.max_drawdown_pct)),
                             ),
                     )
@@ -834,16 +847,16 @@ impl TradingSystemWorkspace {
                             .flex_1()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(0x141417))
+                            .bg(rgb(theme::PANE_BG))
                             .border_1()
-                            .border_color(rgb(0x222227))
+                            .border_color(rgb(theme::BORDER_MUTED))
                             .flex_col()
                             .gap_1()
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .font_family("monospace")
-                                    .text_color(rgb(0x71717a))
+                                    .text_color(rgb(theme::TEXT_MUTED))
                                     .child("Sharpe Ratio (S)"),
                             )
                             .child(
@@ -851,7 +864,7 @@ impl TradingSystemWorkspace {
                                     .text_size(px(16.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .font_family("monospace")
-                                    .text_color(rgb(0x38bdf8))
+                                    .text_color(rgb(theme::LEDGER_ACCENT))
                                     .child(format_ratio(metrics.sharpe_ratio)),
                             ),
                     ),
@@ -865,9 +878,9 @@ impl TradingSystemWorkspace {
         div()
             .p_3()
             .rounded_md()
-            .bg(rgb(0x111114))
+            .bg(rgb(theme::LEDGER_ROW_B))
             .border_1()
-            .border_color(rgb(0x222227))
+            .border_color(rgb(theme::BORDER_MUTED))
             .flex_col()
             .gap_1()
             .child(
@@ -875,7 +888,7 @@ impl TradingSystemWorkspace {
                     .text_size(px(9.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .font_family("monospace")
-                    .text_color(rgb(0x94a3b8))
+                    .text_color(rgb(theme::LABEL_EMPHASIS))
                     .child("Position Ledger"),
             )
             .child(
@@ -884,11 +897,11 @@ impl TradingSystemWorkspace {
                     .justify_between()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child("Cash")
                     .child(
                         div()
-                            .text_color(rgb(0xe4e4e7))
+                            .text_color(rgb(theme::TEXT_PRIMARY))
                             .child(format_currency(metrics.cash)),
                     ),
             )
@@ -898,11 +911,11 @@ impl TradingSystemWorkspace {
                     .justify_between()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child("Active Positions")
                     .child(
                         div()
-                            .text_color(rgb(0xe4e4e7))
+                            .text_color(rgb(theme::TEXT_PRIMARY))
                             .child(format!("{:.4}", metrics.position_qty)),
                     ),
             )
@@ -912,11 +925,11 @@ impl TradingSystemWorkspace {
                     .justify_between()
                     .text_size(px(9.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child("Mark Price")
                     .child(
                         div()
-                            .text_color(rgb(0xe4e4e7))
+                            .text_color(rgb(theme::TEXT_PRIMARY))
                             .child(format_currency(metrics.mark_price)),
                     ),
             )
@@ -969,20 +982,20 @@ impl TradingSystemWorkspace {
             .child(
                 div()
                     .text_size(px(9.0))
-                    .text_color(rgb(0xa1a1aa))
+                    .text_color(rgb(theme::TEXT_SECONDARY))
                     .child(archetype_summary(&config)),
             )
             .child(
                 div()
                     .text_size(px(9.0))
-                    .text_color(rgb(0x71717a))
+                    .text_color(rgb(theme::TEXT_MUTED))
                     .child("Ports are fixed for this archetype; adjust hyperparameters below."),
             )
             .child(
                 div()
                     .text_size(px(9.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xd4d4d8))
+                    .text_color(rgb(theme::BODY_EMPHASIS))
                     .child("Algorithm"),
             )
             .child(algorithm_row);

@@ -1,5 +1,7 @@
 //! MarketLab integrated UI pipeline binary entry point.
 
+#![allow(dead_code)]
+
 use std::path::Path as StdPath;
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -13,14 +15,18 @@ use pulsar_marketlab::fix_engine::{spawn_mock_fix_bridge, FixPlayheadClock};
 
 use ui::telemetry_bridge::MetricsTelemetryBridge;
 
+mod asset_chart_bitmap;
 mod asset_path_input;
 mod canvas_compose;
 mod canvas_hydrate;
+mod canvas_stage_sync;
 mod graph_compiler;
 mod ohlc_chart_pane;
 mod portfolio_analytics;
 mod portfolio_integrator_ledger;
 mod portfolio_wealth_chart;
+mod canvas_graph_snapshot;
+mod graph_ui_snapshot;
 mod session_autosave;
 mod ui;
 mod workspace_state;
@@ -29,7 +35,8 @@ use graph_compiler::{portfolio_wired_ta_node_ids, SharedCsvAssetPaths, SharedPip
 use workspace_state::{
     csv_playback_is_active, finalize_csv_playback_at_eof, format_multivector_scalar,
     hot_swap_csv_playback, init_csv_playback_from_path, market_window_from_yahoo_rows,
-    restart_csv_playback, send_chart_series_preload, send_playhead_set, send_playhead_set_to_last_bar,
+    restart_csv_playback, send_bar_count_update, send_chart_series_preload,
+    send_playhead_set_to_last_bar,
     ta_tick_messages_for_asset, CsvAssetPlayback, PipelineSystemMessage,
     TradingSystemWorkspace, ticker_from_csv_path,
 };
@@ -216,12 +223,7 @@ fn spawn_csv_asset_feeder(
                     }
                 }
 
-                send_playhead_set(
-                    &tx,
-                    playback.cursor,
-                    playback.rows.len(),
-                    Some(row.date.clone()),
-                );
+                send_bar_count_update(&tx, playback.rows.len());
 
                 let next_cursor = playback.cursor + 1;
                 if next_cursor >= playback.rows.len() {
@@ -269,6 +271,7 @@ fn main() {
 
     Application::new().with_assets(NoAssets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        pulsar_marketlab_ui::init_otl_inspector(cx);
         MetricsTelemetryBridge::set_global(cx, MetricsTelemetryBridge::default());
 
         let options = WindowOptions {
@@ -286,6 +289,7 @@ fn main() {
 
         cx.open_window(options, move |window, cx| {
             Theme::change(ThemeMode::Dark, Some(window), cx);
+            pulsar_marketlab_ui::theme::apply_chart_candle_accents(cx);
             let workspace = cx.new(|cx| {
                 TradingSystemWorkspace::new(
                     pipeline_rx,

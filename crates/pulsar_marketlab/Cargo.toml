@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 csv = { workspace = true }
 unicode-segmentation = "1.12"
 gpui = "0.2.2"
+image = { version = "0.25", default-features = false }
 gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
 num-traits = "0.2"
 ordered-float = "4.2"
@@ -24,7 +25,8 @@ pulsar_marketlab_ui = { path = "../pulsar_marketlab_ui" }
 rfd = "0.15"
 
 [dev-dependencies]
-
-# Directly links to the underlying Pulsar UI framework crates
+pulsar_marketlab_core = { path = "../pulsar_marketlab_core" }
+pulsar_marketlab_ui = { path = "../pulsar_marketlab_ui" }
+tempfile = "3"
 # without triggering a nested workspace collision:
 # pulsar-ui = { path = "../../external/Pulsar-Native/crates/pulsar-ui" }

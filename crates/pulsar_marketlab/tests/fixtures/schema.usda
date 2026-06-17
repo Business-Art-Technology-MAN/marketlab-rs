@@ -9,7 +9,7 @@ over "Plugins"
 
 class "FinancialAsset" (
     inherits = </Typed>
-    doc = "A schema defining an institutional financial instrument or derivative contract."
+    doc = "Core asset specification enhanced with FinanceDatabase metadata taxonomy tags."
 ) {
     bool inputs:active = 1
     token inputs:symbol = ""
@@ -19,9 +19,23 @@ class "FinancialAsset" (
     token inputs:provider = "yahoo" (
         allowedTokens = ["yahoo", "bloomberg", "synth"]
     )
+    token inputs:exchange_mic = ""
     string inputs:category = ""
     string inputs:sub_category = ""
     rel inputs:underlying
+
+    string info:sector = ""
+    string info:industry_group = ""
+    string info:industry = ""
+    string info:market_cap_class = ""
+    string info:currency = ""
+    string info:isin = ""
+    string info:cusip = ""
+    string info:figi = ""
+    string info:composite_figi = ""
+    string info:country = ""
+    string info:state = ""
+    string info:zipcode = ""
 }
 
 class "OtlOperator" (
@@ -71,4 +85,5 @@ class "PortfolioIntegrator" (
     double inputs:max_volatility_cap = 1.0
     rel inputs:sources
     token outputs:portfolio_wealth
+    string outputs:weights = ""
 }

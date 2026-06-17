@@ -53,6 +53,50 @@ fn stepper_button_variant(cx: &App) -> ButtonCustomVariant {
         .active(control_hover())
 }
 
+/// Recessed multiline inspector field (OTL script, notes).
+pub fn dcc_multiline_input(input: &Entity<InputState>) -> impl IntoElement {
+    div()
+        .w_full()
+        .min_h(px(72.0))
+        .rounded(px(4.0))
+        .bg(control_bg())
+        .border_1()
+        .border_color(control_border())
+        .overflow_hidden()
+        .child(
+            Input::new(input)
+                .appearance(false)
+                .bordered(false)
+                .focus_bordered(false)
+                .w_full()
+                .h(px(72.0))
+                .text_size(px(11.0))
+                .font_family("monospace")
+                .text_color(control_text()),
+        )
+}
+
+/// DCC recessed single-line field for inspector rows.
+pub fn dcc_singleline_input(input: &Entity<InputState>) -> impl IntoElement {
+    div()
+        .w_full()
+        .rounded(px(4.0))
+        .bg(control_bg())
+        .border_1()
+        .border_color(control_border())
+        .overflow_hidden()
+        .child(
+            Input::new(input)
+                .appearance(false)
+                .bordered(false)
+                .focus_bordered(false)
+                .w_full()
+                .text_size(px(11.0))
+                .font_family("monospace")
+                .text_color(control_text()),
+        )
+}
+
 /// DCC recessed dropdown trigger for node-body parameter menus.
 pub fn node_dropdown_trigger(
     id: impl Into<gpui::ElementId>,

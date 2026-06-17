@@ -4,6 +4,7 @@ use super::*;
 fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
     VisualNode {
         id,
+        stable_prim_leaf: super::test_visual_node_fields(id),
         name: "SPY".into(),
         node_type: NodeType::asset_adaptor(prim_path),
         grade: NodeGradeType::Scalar,
@@ -22,6 +23,7 @@ fn sample_asset_node(id: usize, prim_path: &str) -> VisualNode {
 fn sample_ta_node(id: usize) -> VisualNode {
     let mut node = VisualNode {
         id,
+        stable_prim_leaf: super::test_visual_node_fields(id),
         name: "RSI".into(),
         node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("rsi", 14)),
         grade: NodeGradeType::Scalar,
@@ -42,6 +44,7 @@ fn sample_ta_node(id: usize) -> VisualNode {
 fn sample_otl_shader_node(id: usize) -> VisualNode {
     VisualNode {
         id,
+        stable_prim_leaf: super::test_visual_node_fields(id),
         name: "Formula".into(),
         node_type: NodeType::otl_shader(String::new()),
         grade: NodeGradeType::Scalar,
@@ -60,6 +63,7 @@ fn sample_otl_shader_node(id: usize) -> VisualNode {
 fn sample_portfolio_node(id: usize) -> VisualNode {
     VisualNode {
         id,
+        stable_prim_leaf: super::test_visual_node_fields(id),
         name: "Portfolio".into(),
         node_type: NodeType::portfolio(),
         grade: NodeGradeType::Scalar,
@@ -221,6 +225,7 @@ fn validate_graph_wiring_reports_invalid_connections() {
 fn ta_compute_prefers_dsl_formula_over_uber_compose() {
     let node = VisualNode {
         id: 2,
+        stable_prim_leaf: super::test_visual_node_fields(2),
         name: "Custom".into(),
         node_type: NodeType::ta_uber_signal(ta_uber_from_legacy_indicator("sma", 14)),
         grade: NodeGradeType::Scalar,
@@ -246,6 +251,7 @@ fn ta_compute_prefers_dsl_formula_over_uber_compose() {
 fn ta_compute_uses_otl_shader_script_when_dsl_formula_missing() {
     let node = VisualNode {
         id: 2,
+        stable_prim_leaf: super::test_visual_node_fields(2),
         name: "Custom".into(),
         node_type: NodeType::otl_shader("close"),
         grade: NodeGradeType::Scalar,

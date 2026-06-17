@@ -64,6 +64,10 @@ impl AssetPathInput {
         }
     }
 
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
     pub fn set_content(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         let content = text.into();
         let len = content.len();

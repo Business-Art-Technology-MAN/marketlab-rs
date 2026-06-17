@@ -8,23 +8,19 @@ mod registry;
 mod tests;
 
 pub use otl_stdlib_catalog::{OtlStdlibPreset, OTL_STDLIB_PRESETS};
-pub use otl_registry::{
-    otl_object_kind_for_node, otl_object_registry_snapshot, register_otl_object,
-    register_otl_object_from_source, OtlObjectRegistry, RegistryError,
-};
 pub use registry::{
     apply_canonical_ta_ports, connection_is_valid, effective_otl_script, input_port_kind,
-    output_port_kind, otl_script_context, resolved_otl_script, sync_otl_shader_aov_ports,
-    apply_compiled_otc_asset_to_node, sync_otl_shader_ports_from_manifest,
+    output_port_kind, resolved_otl_script, sync_otl_shader_aov_ports,
+    apply_compiled_otc_asset_to_node,
     sync_otl_shader_ports_from_script, ta_uber_from_legacy_indicator, validate_graph_wiring,
     validated_connections, NodeType, PortWireKind, WireValidationError,
 };
 pub use pulsar_marketlab_core::{
-    algorithm_display_label, hyperparameter_visibility, node_display_name, TaArchetype,
-    TaHyperparamVisibility, TaUberSignalConfig,
+    TaArchetype, TaUberSignalConfig,
 };
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use pulsar_marketlab::execution_engine::ExecutionGraph;
 use pulsar_marketlab::signal_dsl::evaluate_formula;
 use pulsar_marketlab::technical_analysis::{
-    clamp_ta_lookback, MarketSeriesWindow,
+    clamp_ta_lookback, ta_indicator_label, MarketSeriesWindow,
 };
 
 pub(crate) fn is_price_source_node(node: &VisualNode) -> bool {
@@ -246,6 +242,15 @@ impl SharedPipelineGraph {
             .unwrap_or(0)
     }
 
+    /// Clone the snapshot only when revision differs from `last_revision`.
+    pub fn snapshot_if_revision(&self, last_revision: u64) -> Option<(u64, PipelineGraphSnapshot)> {
+        let guard = self.0.lock().ok()?;
+        if guard.revision == last_revision {
+            return None;
+        }
+        Some((guard.revision, guard.snapshot.clone()))
+    }
+
     pub fn snapshot(&self) -> PipelineGraphSnapshot {
         self.0
             .lock()
@@ -310,20 +315,23 @@ impl SharedCsvAssetPaths {
 }
 
 pub const NODE_CHART_HEIGHT: f32 = 52.0;
+/// Vertical padding around the sparkline block (`px_2` + `pb_1`).
+pub(crate) const NODE_CHART_PADDING: f32 = 12.0;
 
 pub(crate) const NODE_WIDTH: f32 = 220.0;
 pub(crate) const NODE_HEADER_HEIGHT: f32 = 36.0;
-const NODE_GRADE_HEIGHT: f32 = 32.0;
+const NODE_GRADE_HEIGHT: f32 = 28.0;
 const NODE_OTL_PARAM_ROW_HEIGHT: f32 = 26.0;
 const NODE_OTL_PARAM_HEADER_HEIGHT: f32 = 18.0;
 pub(crate) const NODE_TA_LABEL_HEIGHT: f32 = 20.0;
 pub(crate) const NODE_PORTFOLIO_METRICS_HEIGHT: f32 = 72.0;
 pub(crate) const NODE_PORTS_PADDING: f32 = 8.0;
-pub(crate) const PORT_ROW_HEIGHT: f32 = 24.0;
+pub(crate) const PORT_ROW_HEIGHT: f32 = 22.0;
+pub(crate) const NODE_COLUMN_GAP: f32 = 20.0;
 pub(crate) const WIRE_PORT_HIT_RADIUS: f32 = 22.0;
 pub(crate) const CONNECTION_STROKE_WIDTH: f32 = 2.0;
-pub(crate) const MIN_ZOOM: f32 = 0.15;
-pub(crate) const MAX_ZOOM: f32 = 3.0;
+pub(crate) const MIN_ZOOM: f32 = 0.08;
+pub(crate) const MAX_ZOOM: f32 = 2.5;
 pub(crate) const ZOOM_WHEEL_SENSITIVITY: f32 = 0.002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,9 +348,114 @@ pub enum AssetSourceType {
     Csv { path: String },
 }
 
+static STABLE_PRIM_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate an immutable prim leaf (`node_7f89bc`) assigned once at node creation.
+pub fn allocate_stable_prim_leaf() -> String {
+    let n = STABLE_PRIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("node_{n:06x}")
+}
+
+/// Resolve the persistent prim leaf for a canvas node (never derived from display name).
+pub fn stable_prim_leaf_for(node: &VisualNode) -> String {
+    node.stable_prim_leaf
+        .clone()
+        .unwrap_or_else(|| format!("node_{:08x}", node.id as u32))
+}
+
+/// Sanitize a display label into a valid USD prim token (lowercase alphanumeric + underscores).
+pub fn sanitize_usd_token(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_underscore = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_underscore = false;
+        } else if !last_underscore && !out.is_empty() {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "node".to_string()
+    } else {
+        out
+    }
+}
+
+fn upstream_asset_token(
+    node: &VisualNode,
+    nodes: &[VisualNode],
+    connections: &[NodeConnection],
+) -> Option<String> {
+    let asset_id = upstream_price_source_node_id_parts(node.id, 0, nodes, connections)?;
+    let asset = nodes.iter().find(|candidate| candidate.id == asset_id)?;
+    if !asset.node_type.is_asset_adaptor() {
+        return None;
+    }
+    let stem = asset
+        .name
+        .trim_end_matches(".csv")
+        .trim_end_matches(".CSV");
+    Some(sanitize_usd_token(stem))
+}
+
+/// Human-readable prim leaf derived from node title, indicator type, and upstream asset context.
+pub fn semantic_prim_leaf_for(
+    node: &VisualNode,
+    nodes: &[VisualNode],
+    connections: &[NodeConnection],
+) -> String {
+    if let Some(stable) = node.stable_prim_leaf.as_deref() {
+        if !stable.starts_with("node_") {
+            return stable.to_string();
+        }
+    }
+
+    match &node.node_type {
+        NodeType::AssetAdaptor { .. } => {
+            let stem = node
+                .name
+                .trim_end_matches(".csv")
+                .trim_end_matches(".CSV");
+            sanitize_usd_token(stem)
+        }
+        NodeType::TaUberSignal { config } => {
+            let indicator = ta_indicator_label(&config.algorithm)
+                .unwrap_or(config.algorithm.as_str());
+            let signal_token = if node.name.trim().is_empty() {
+                format!("{}_signal", sanitize_usd_token(indicator))
+            } else {
+                sanitize_usd_token(&node.name)
+            };
+            if let Some(asset) = upstream_asset_token(node, nodes, connections) {
+                format!("{asset}_{signal_token}")
+            } else {
+                signal_token
+            }
+        }
+        _ if node.node_type.is_portfolio() => sanitize_usd_token(&node.name),
+        NodeType::OtlShader { .. } | NodeType::TerminalIntegrator { .. } => {
+            sanitize_usd_token(&node.name)
+        }
+    }
+}
+
+/// Test / fixture helper filling `stable_prim_leaf` when omitted from literals.
+#[cfg(test)]
+pub fn test_visual_node_fields(id: usize) -> Option<String> {
+    Some(format!("node_{:08x}", id as u32))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualNode {
     pub id: usize,
+    /// Immutable OpenUSD prim leaf under `/MarketLab/{Universe|Signals|Portfolios}/`.
+    #[serde(default)]
+    pub stable_prim_leaf: Option<String>,
     pub name: String,
     pub node_type: NodeType,
     pub grade: NodeGradeType,
@@ -501,9 +614,66 @@ pub(crate) fn node_body_height_world(node: &VisualNode, include_chart: bool) -> 
         height += NODE_PORTFOLIO_METRICS_HEIGHT;
     }
     if include_chart && node_shows_price_chart(node) {
-        height += NODE_CHART_HEIGHT;
+        height += NODE_CHART_HEIGHT + NODE_CHART_PADDING;
     }
     height
+}
+
+/// Full expanded card height including the stacked port rows.
+pub(crate) fn node_total_height_world(node: &VisualNode, include_chart: bool) -> f32 {
+    let port_rows = node.inputs.len() + node.outputs.len();
+    let ports_height = if port_rows == 0 {
+        0.0
+    } else {
+        NODE_PORTS_PADDING + port_rows as f32 * PORT_ROW_HEIGHT + NODE_PORTS_PADDING * 0.5
+    };
+    node_body_height_world(node, include_chart) + ports_height
+}
+
+fn port_row_world_y(
+    node: &VisualNode,
+    row_index: usize,
+    include_chart: bool,
+) -> f32 {
+    node.y
+        + node_body_height_world(node, include_chart)
+        + NODE_PORTS_PADDING
+        + row_index as f32 * PORT_ROW_HEIGHT
+        + PORT_ROW_HEIGHT * 0.5
+}
+
+/// Push apart vertically stacked nodes that share a Blender column.
+pub fn deoverlap_canvas_columns(nodes: &mut [VisualNode]) {
+    use pulsar_marketlab_ui::workspace::{BLENDER_COLUMN_WIDTH, BLENDER_ORIGIN_X, BLENDER_ORIGIN_Y};
+
+    for tier in 0u8..3 {
+        let column_x = BLENDER_ORIGIN_X + tier as f32 * BLENDER_COLUMN_WIDTH;
+        let mut indices: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| (node.x - column_x).abs() < BLENDER_COLUMN_WIDTH * 0.45)
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            continue;
+        }
+        indices.sort_by(|left, right| {
+            nodes[*left]
+                .y
+                .partial_cmp(&nodes[*right].y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut cursor_y = BLENDER_ORIGIN_Y;
+        for index in indices {
+            let include_chart = node_shows_price_chart(&nodes[index]);
+            let height = node_total_height_world(&nodes[index], include_chart);
+            if nodes[index].y < cursor_y {
+                nodes[index].y = cursor_y;
+            }
+            cursor_y = nodes[index].y + height + NODE_COLUMN_GAP;
+        }
+    }
 }
 
 pub(crate) fn input_port_world_center(
@@ -535,11 +705,7 @@ pub(crate) fn input_port_world_center(
             1,
         );
     }
-    let y = node.y
-        + node_body_height_world(node, include_chart)
-        + NODE_PORTS_PADDING
-        + port_idx as f32 * PORT_ROW_HEIGHT
-        + PORT_ROW_HEIGHT * 0.5;
+    let y = port_row_world_y(node, port_idx, include_chart);
     (node.x + 12.0, y)
 }
 
@@ -572,11 +738,8 @@ pub(crate) fn output_port_world_center(
             1,
         );
     }
-    let y = node.y
-        + node_body_height_world(node, include_chart)
-        + NODE_PORTS_PADDING
-        + port_idx as f32 * PORT_ROW_HEIGHT
-        + PORT_ROW_HEIGHT * 0.5;
+    let row_index = node.inputs.len() + port_idx;
+    let y = port_row_world_y(node, row_index, include_chart);
     (node.x + NODE_WIDTH - 12.0, y)
 }
 

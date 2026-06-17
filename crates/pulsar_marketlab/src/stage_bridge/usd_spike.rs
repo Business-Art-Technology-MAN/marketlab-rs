@@ -4,99 +4,63 @@
 //! LIVRPS layer composition, prim activation, and session metadata via
 //! [`openusd::Stage`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openusd::sdf::schema::FieldKey;
-use openusd::sdf::PathListOp;
 use crate::trading_stage::{
-    is_legacy_bucket_path, is_schema_template_prim, prim_type_name, should_show_prim_in_stage_tree,
+    is_legacy_bucket_path, prim_type_name, should_show_prim_in_stage_tree,
     MARKETLAB_ROOT,
 };
 use openusd::Stage;
 use pulsar_marketlab_core::financial_schema_defaults;
+use pulsar_marketlab_ui::workspace::ManagedUsdStage;
 
 use crate::signal_dsl::Vector;
 use crate::trading_stage::MarketStage;
 
-/// Send + Sync handle to a composed OpenUSD root layer.
+/// Unified structural-plane handle wrapping [`ManagedUsdStage`].
 ///
-/// `openusd::Stage` uses interior mutability and is `!Send` / `!Sync` in 0.3.0.
-/// Structural queries reopen the root layer per call (infrequent vs temporal sweeps).
+/// Milestone 1: one Send+Sync authority with full overlay maps. Application code
+/// should prefer [`ManagedUsdStage`] via [`WorkspaceContext`]; this newtype remains
+/// for hydration, save/export, and [`ProductionStageProvider`].
 #[derive(Clone, Debug)]
-pub struct UsdStageBridge {
-    root_layer_path: Arc<String>,
-    active_overrides: Arc<Mutex<HashMap<String, bool>>>,
+pub struct UsdStageBridge(ManagedUsdStage);
+
+impl Deref for UsdStageBridge {
+    type Target = ManagedUsdStage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl UsdStageBridge {
-    /// Open and validate a composed stage from a root `.usda` / `.usd` path.
     pub fn open(root_layer_path: impl AsRef<Path>) -> io::Result<Self> {
-        let path_ref = root_layer_path.as_ref();
-        pulsar_marketlab_core::ensure_schema_sidecar_for_document(path_ref)?;
-        let path = path_ref.to_string_lossy().into_owned();
-        Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        Ok(Self {
-            root_layer_path: Arc::new(path),
-            active_overrides: Arc::new(Mutex::new(HashMap::new())),
-        })
+        ManagedUsdStage::open(root_layer_path).map(Self)
     }
 
-    /// Write inline USDA text to a temp file, then open it as a composed stage.
     pub fn open_from_usda_text(content: &str) -> io::Result<Self> {
-        let path = write_inline_usda(content)?;
-        Self::open(path)
+        ManagedUsdStage::open_from_usda_text(content).map(Self)
     }
 
-    pub fn root_layer_path(&self) -> &str {
-        &self.root_layer_path
+    pub fn inner(&self) -> &ManagedUsdStage {
+        &self.0
     }
 
-    /// Run a callback against a freshly opened native [`Stage`].
-    pub fn with_stage<R>(
-        &self,
-        f: impl FnOnce(&Stage) -> Result<R, io::Error>,
-    ) -> Result<R, io::Error> {
-        let stage = Stage::open(&self.root_layer_path)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        f(&stage)
+    pub fn into_inner(self) -> ManagedUsdStage {
+        self.0
     }
 
-    /// LIVRPS-composed `active` metadata for a prim path (defaults to `true`).
-    pub fn prim_active(&self, prim_path: &str) -> bool {
-        if let Some(active) = self
-            .active_overrides
-            .lock()
-            .ok()
-            .and_then(|overrides| overrides.get(prim_path).copied())
-        {
-            return active;
-        }
-        self.read_prim_active_from_stage(prim_path)
+    /// Cheap clone wrapper for call sites holding [`ManagedUsdStage`].
+    pub fn borrow(stage: &ManagedUsdStage) -> Self {
+        Self(stage.clone())
     }
-
-    /// Mutate composed `FieldKey::Active` for a prim path in the bridge overlay.
-    pub fn set_prim_active(&self, prim_path: &str, active: bool) {
-        if let Ok(mut overrides) = self.active_overrides.lock() {
-            overrides.insert(prim_path.to_string(), active);
-        }
-    }
-
-    fn read_prim_active_from_stage(&self, prim_path: &str) -> bool {
-        self.with_stage(|stage| {
-            Ok(stage
-                .field::<bool>(prim_path, FieldKey::Active)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                .unwrap_or(true))
-        })
-        .unwrap_or(true)
-    }
-
     /// Typed composed field lookup on a prim or property path.
     pub fn field_f32(&self, path: &str, field: impl AsRef<str>) -> Option<f32> {
         self.with_stage(|stage| {
@@ -129,60 +93,12 @@ impl UsdStageBridge {
         .flatten()
     }
 
-    /// Read a composed string/token attribute default.
-    pub fn field_string(&self, prim_path: &str, attribute: &str) -> Option<String> {
-        let property_path = format!("{prim_path}.{attribute}");
-        self.with_stage(|stage| {
-            Ok(stage
-                .field::<String>(property_path.as_str(), FieldKey::Default)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?)
-        })
-        .ok()
-        .flatten()
-    }
-
-    /// Composed `typeName` metadata for a prim path.
-    pub fn prim_type_name(&self, prim_path: &str) -> Option<String> {
-        self.with_stage(|stage| Ok(prim_type_name(stage, prim_path)))
-            .ok()
-            .flatten()
-    }
-
-    /// Composed relationship targets for a prim (e.g. `inputs:underlying`).
-    pub fn relationship_targets(&self, prim_path: &str, relationship: &str) -> Vec<String> {
-        let property_path = format!("{prim_path}.{relationship}");
-        self.with_stage(|stage| {
-            Ok(stage
-                .field::<PathListOp>(property_path.as_str(), FieldKey::TargetPaths)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                .map(path_list_op_targets)
-                .unwrap_or_default())
-        })
-        .unwrap_or_default()
-    }
-
-    /// Replace the root layer path and clear runtime overlays.
-    pub fn reload_from_path(&mut self, root_layer_path: impl AsRef<Path>) -> io::Result<()> {
-        let path = root_layer_path.as_ref().to_string_lossy().into_owned();
-        Stage::open(&path).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        self.root_layer_path = Arc::new(path);
-        if let Ok(mut overrides) = self.active_overrides.lock() {
-            overrides.clear();
-        }
-        Ok(())
-    }
-
     /// Write the composed stage hierarchy to a USDA text stream on disk.
     pub fn dump_to_path(&self, target: impl AsRef<Path>) -> io::Result<()> {
-        let overrides = self
-            .active_overrides
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
-        let content = if overrides.is_empty() {
-            fs::read_to_string(self.root_layer_path.as_str())?
-        } else {
+        let content = if self.has_runtime_overlays() {
             self.export_usda_text()?
+        } else {
+            fs::read_to_string(self.root_layer_path())?
         };
         fs::write(target.as_ref(), content)
     }
@@ -210,7 +126,7 @@ impl UsdStageBridge {
 
     /// Property grid rows for the Stage Ledger Explorer (four parsing tracks).
     pub fn stage_ledger_entries(&self) -> io::Result<Vec<StageLedgerEntrySnapshot>> {
-        let layer_text = fs::read_to_string(self.root_layer_path.as_str()).unwrap_or_default();
+        let layer_text = fs::read_to_string(self.root_layer_path()).unwrap_or_default();
         let schema_defaults = financial_schema_defaults();
         self.with_stage(|stage| {
             let mut entries = Vec::new();
@@ -229,11 +145,9 @@ impl UsdStageBridge {
 
     fn prim_override_layer(&self, prim_path: &str, layer_text: &str) -> bool {
         let runtime_overlay = self
+            .snapshot_runtime_overlays()
             .active_overrides
-            .lock()
-            .ok()
-            .and_then(|overrides| overrides.get(prim_path).copied())
-            .is_some();
+            .contains_key(prim_path);
         runtime_overlay
             || layer_contains_override_for_prim(layer_text, prim_path)
             || (layer_text.contains("subLayers") && !self.prim_active(prim_path))
@@ -272,29 +186,6 @@ pub fn fixture_path(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-fn path_list_op_targets(list_op: PathListOp) -> Vec<String> {
-    list_op
-        .iter()
-        .map(|path| path.to_string())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-static INLINE_USDA_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn write_inline_usda(content: &str) -> io::Result<String> {
-    let dir = std::env::temp_dir().join("marketlab_openusd");
-    fs::create_dir_all(&dir)?;
-    let unique = INLINE_USDA_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!(
-        "inline_{}_{unique}.usda",
-        std::process::id()
-    ));
-    fs::write(&path, content)?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
 fn prim_def_type(path_str: &str, stage: &Stage) -> &'static str {
     if let Some(type_name) = prim_type_name(stage, path_str) {
         return match type_name.as_str() {
@@ -312,10 +203,14 @@ fn prim_def_type(path_str: &str, stage: &Stage) -> &'static str {
     "Scope"
 }
 
-fn stage_tree_label(stage: &Stage, path_str: &str, child_name: &str) -> String {
-    prim_type_name(stage, path_str)
-        .map(|type_name| format!("{child_name} ({type_name})"))
-        .unwrap_or_else(|| child_name.to_string())
+fn stage_tree_label(bridge: &UsdStageBridge, path_str: &str, child_name: &str) -> String {
+    let user_label = bridge.field_string(path_str, pulsar_marketlab_core::USER_LABEL_ATTR);
+    let display =
+        pulsar_marketlab_core::prim_display_label(child_name, user_label.as_deref());
+    bridge
+        .prim_type_name(path_str)
+        .map(|type_name| format!("{display} ({type_name})"))
+        .unwrap_or(display)
 }
 
 fn export_prim_tree(
@@ -336,8 +231,8 @@ fn export_prim_tree(
         if !should_show_prim_in_stage_tree(stage, &path_str) {
             continue;
         }
-        let label = stage_tree_label(stage, &path_str, child_name.as_str());
-        let active = bridge.prim_active(&path_str);
+        let _label = stage_tree_label(bridge, &path_str, child_name.as_str());
+        let active = bridge.0.prim_active(&path_str);
         let indent = "    ".repeat(depth + 1);
         let inner = "    ".repeat(depth + 2);
         let def_type = prim_def_type(&path_str, stage);
@@ -473,7 +368,7 @@ fn collect_ledger_entries(
             .append_path(child_name.as_str())
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let path_str = child_path.to_string();
-        let active = bridge.prim_active(&path_str);
+        let active = bridge.0.prim_active(&path_str);
         let override_layer = bridge.prim_override_layer(&path_str, layer_text);
 
         let inputs_active = read_inputs_active(stage, &path_str).unwrap_or(active);
@@ -633,9 +528,7 @@ fn collect_prim_rows(
         {
             continue;
         }
-        let label = bridge
-            .with_stage(|stage| Ok(stage_tree_label(stage, &path_str, child_name.as_str())))
-            .unwrap_or_else(|_| child_name.clone());
+        let label = stage_tree_label(bridge, &path_str, child_name.as_str());
         rows.push(StagePrimRowSnapshot {
             path: path_str.clone(),
             label,

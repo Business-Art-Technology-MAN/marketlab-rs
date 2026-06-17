@@ -1,0 +1,84 @@
+#usda 1.0
+(
+    doc = "MarketLab core taxonomy and exchange metadata library"
+    subLayers = [
+        @./schema.usda@
+    ]
+)
+
+# ==============================================================================
+# 1. CORE ASSET CLASS BASELINES
+# ==============================================================================
+
+class "MlabEquityBase" (
+    inherits = </FinancialAsset>
+) {
+    token inputs:asset_class = "Equity"
+    token inputs:provider = "yahoo"
+}
+
+class "MlabEtfBase" (
+    inherits = </FinancialAsset>
+) {
+    token inputs:asset_class = "ETF"
+    token inputs:provider = "yahoo"
+}
+
+# ==============================================================================
+# 2. GICS SECTOR & INDUSTRY TAXONOMY (For Equities)
+# ==============================================================================
+
+class "Sector_Technology" (inherits = </MlabEquityBase>) {
+    string inputs:category = "Information Technology"
+}
+class "Industry_Software" (inherits = </Sector_Technology>) {
+    string inputs:sub_category = "Software Application & Systems"
+}
+class "Industry_Semiconductors" (inherits = </Sector_Technology>) {
+    string inputs:sub_category = "Semiconductors & Equipment"
+}
+
+class "Sector_Financials" (inherits = </MlabEquityBase>) {
+    string inputs:category = "Financials"
+}
+class "Industry_Banks" (inherits = </Sector_Financials>) {
+    string inputs:sub_category = "Diversified Banks"
+}
+class "Industry_Capital_Markets" (inherits = </Sector_Financials>) {
+    string inputs:sub_category = "Capital Markets & Asset Management"
+}
+
+# ==============================================================================
+# 3. INVESTMENT OBJECTIVE TAXONOMY (For ETFs)
+# ==============================================================================
+
+class "Etf_Equity_LargeCap" (inherits = </MlabEtfBase>) {
+    string inputs:category = "Equity"
+    string inputs:sub_category = "Large Cap Blend"
+}
+class "Etf_FixedIncome_Treasury" (inherits = </MlabEtfBase>) {
+    string inputs:category = "Fixed Income"
+    string inputs:sub_category = "Government US Treasury"
+}
+
+# ==============================================================================
+# 4. GLOBAL EXCHANGE REGISTRARS (Mix-in inheritance targets)
+# ==============================================================================
+
+class "Exchange_NASDAQ" {
+    string inputs:exchange_mic = "XNAS"
+    string inputs:exchange_region = "US"
+    string inputs:trading_currency = "USD"
+}
+
+class "Exchange_NYQ" {
+    string inputs:exchange_mic = "XNYS"
+    string inputs:exchange_region = "US"
+    string inputs:trading_currency = "USD"
+}
+
+class "Exchange_FRA" {
+    string inputs:exchange_mic = "XFRA"
+    string inputs:exchange_region = "Germany"
+    string inputs:trading_currency = "EUR"
+}

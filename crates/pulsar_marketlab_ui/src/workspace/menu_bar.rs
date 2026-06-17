@@ -1,8 +1,11 @@
 //! Global workstation menu bar with File actions.
 
 use gpui::*;
-use gpui_component::button::{Button, DropdownButton};
+use gpui_component::button::DropdownButton;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
+
+use crate::theme;
+use crate::theme::buttons::dcc_toolbar_button;
 
 /// Host callbacks for menu bar file operations.
 pub trait MenuBarHost: Sized {
@@ -20,7 +23,7 @@ impl MenuBar {
         view: Entity<H>,
         _host: &H,
         _window: &mut Window,
-        _cx: &mut Context<H>,
+        cx: &mut Context<H>,
     ) -> impl IntoElement {
         let file_menu = move |menu: PopupMenu, _window: &mut Window, _cx: &mut Context<PopupMenu>| {
             let view = view.clone();
@@ -71,21 +74,20 @@ impl MenuBar {
             .gap_2()
             .px_3()
             .py_1()
-            .bg(rgb(0x050506))
+            .bg(rgb(theme::TOOLBAR_BG))
             .border_b_1()
-            .border_color(rgb(0x27272a))
+            .border_color(rgb(theme::TOOLBAR_BORDER))
             .child(
                 DropdownButton::new("menu-file")
                     .compact()
-                    .outline()
-                    .button(Button::new("menu-file-trigger").label("File"))
+                    .button(dcc_toolbar_button("menu-file-trigger", "File", cx))
                     .dropdown_menu(file_menu),
             )
             .child(
                 div()
                     .text_size(px(10.0))
                     .font_family("monospace")
-                    .text_color(rgb(0x52525b))
+                    .text_color(rgb(theme::TEXT_HINT))
                     .child("Ctrl+N New · Ctrl+O Open · Ctrl+S Save"),
             )
     }

@@ -11,6 +11,8 @@ pub enum SplitHandle {
     StageCanvas,
     /// Node canvas vs param inspector.
     CanvasInspector,
+    /// Main workstation row vs bottom topology dopesheet.
+    MainBottom,
 }
 
 /// Persisted flex shares for the horizontal workstation row.
@@ -18,32 +20,27 @@ pub enum SplitHandle {
 pub struct WorkstationSplitLayout {
     pub stage_share: f32,
     pub inspector_share: f32,
+    /// Fraction of the vertical split container allocated to the bottom dopesheet.
+    pub bottom_share: f32,
 }
 
 impl Default for WorkstationSplitLayout {
     fn default() -> Self {
         Self {
-            stage_share: 0.22,
+            stage_share: 0.0,
             inspector_share: 0.30,
+            bottom_share: 0.28,
         }
     }
 }
 
 impl WorkstationSplitLayout {
     pub fn clamp(self) -> Self {
-        let mut stage_share = self.stage_share.clamp(0.12, 0.45);
-        let mut inspector_share = self.inspector_share.clamp(0.12, 0.45);
-        let mut canvas = 1.0 - stage_share - inspector_share;
-        if canvas < 0.15 {
-            let deficit = 0.15 - canvas;
-            stage_share = (stage_share - deficit * 0.5).max(0.12);
-            inspector_share = (inspector_share - deficit * 0.5).max(0.12);
-            canvas = 1.0 - stage_share - inspector_share;
-        }
-        let _ = canvas;
+        let inspector_share = self.inspector_share.clamp(0.12, 0.45);
         Self {
-            stage_share,
+            stage_share: 0.0,
             inspector_share,
+            bottom_share: self.bottom_share.clamp(0.12, 0.72),
         }
     }
 }
@@ -81,6 +78,7 @@ pub fn render_split_handle<H: SplitLayoutHost>(
     let handle_id = match handle {
         SplitHandle::StageCanvas => 0usize,
         SplitHandle::CanvasInspector => 1usize,
+        SplitHandle::MainBottom => 2usize,
     };
 
     div()
@@ -89,8 +87,8 @@ pub fn render_split_handle<H: SplitLayoutHost>(
         .when(axis.is_horizontal(), |this| this.w(px(6.0)).h_full())
         .when(axis.is_vertical(), |this| this.h(px(6.0)).w_full())
         .cursor(cursor)
-        .bg(rgb(0x27272a))
-        .hover(|style| style.bg(rgb(0x3f3f46)))
+        .bg(rgb(crate::theme::SPLIT_HANDLE))
+        .hover(|style| style.bg(rgb(crate::theme::SPLIT_HANDLE_HOVER)))
         .on_mouse_down(
             MouseButton::Left,
             {

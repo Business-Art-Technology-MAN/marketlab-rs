@@ -7,13 +7,17 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::FINANCIAL_SCHEMA_USDA;
+use crate::{FINANCIAL_SCHEMA_USDA, taxonomy::METADATA_LIBRARY_USDA};
 
 /// Filename written beside saved stage documents.
 pub const SCHEMA_SIDECAR_FILENAME: &str = "schema.usda";
 
 /// Relative sublayer anchor written in saved stage root metadata.
 pub const SCHEMA_SUBLAYER_REF: &str = "@./schema.usda@";
+
+pub use crate::taxonomy::{
+    METADATA_LIBRARY_SIDECAR_FILENAME, METADATA_SUBLAYER_REF,
+};
 
 const SCHEMA_CLASS_BODY_MARKER: &str = "over \"Plugins\"";
 
@@ -83,5 +87,23 @@ pub fn ensure_schema_sidecar_for_document(document_path: &Path) -> io::Result<()
         fs::create_dir_all(parent)?;
     }
     fs::write(&sidecar, schema_sidecar_usda())?;
+    Ok(())
+}
+
+/// Absolute path to the taxonomy metadata sidecar for a saved stage document.
+pub fn metadata_sidecar_path_for_document(document_path: &Path) -> PathBuf {
+    schema_sidecar_directory(document_path).join(METADATA_LIBRARY_SIDECAR_FILENAME)
+}
+
+/// Write bundled taxonomy library text next to a document when the sidecar is missing.
+pub fn ensure_metadata_library_sidecar_for_document(document_path: &Path) -> io::Result<()> {
+    let sidecar = metadata_sidecar_path_for_document(document_path);
+    if sidecar.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = sidecar.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&sidecar, METADATA_LIBRARY_USDA)?;
     Ok(())
 }

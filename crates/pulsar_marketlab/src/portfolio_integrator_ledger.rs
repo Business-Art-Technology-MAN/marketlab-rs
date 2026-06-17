@@ -3,25 +3,14 @@
 use std::sync::Arc;
 
 use gpui::*;
-use gpui::prelude::FluentBuilder;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::Selectable;
 use pulsar_marketlab_core::{PortfolioIntegrationResult, PortfolioTrackingFrame};
+use pulsar_marketlab_ui::theme;
+use pulsar_marketlab_ui::theme::buttons::{dcc_chip_button, dcc_secondary_button};
 
 use crate::workspace_state::{format_percent_signed, format_tick_label};
 
 const ROW_HEIGHT: f32 = 22.0;
-const HEADER_BG: u32 = 0x1c1c21;
-const ROW_A: u32 = 0x141417;
-const ROW_B: u32 = 0x111114;
-const ROW_RISK: u32 = 0x1a1520;
-const ROW_PORTFOLIO: u32 = 0x102018;
-const BORDER: u32 = 0x222227;
-const TEXT: u32 = 0xcbd5e1;
-const TEXT_MUTED: u32 = 0x71717a;
-const TEXT_ACCENT: u32 = 0x38bdf8;
-const TEXT_PORTFOLIO: u32 = 0x34d399;
 
 /// Asset column label for aggregate portfolio NAV / return rows.
 pub const PORTFOLIO_LEDGER_ASSET: &str = "PORTFOLIO";
@@ -292,6 +281,7 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
     ledger: Arc<PortfolioIntegratorLedger>,
     filter: IntegratorLedgerFilter,
     view: Entity<H>,
+    cx: &mut Context<H>,
 ) -> impl IntoElement {
     let filtered = ledger.filtered_indices(&filter);
     let row_count = filtered.len();
@@ -313,7 +303,7 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
                         .text_size(px(9.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .font_family("monospace")
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(theme::TEXT_PRIMARY))
                         .child("Integrator Ledger"),
                 )
                 .child(
@@ -325,10 +315,10 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
                             ledger.clone(),
                             filter.clone(),
                             view.clone(),
+                            cx,
                         ))
                         .child(
-                            Button::new("export-integrator-ledger")
-                                .label("Export CSV")
+                            dcc_secondary_button("export-integrator-ledger", "Export CSV", cx)
                                 .on_click({
                                     let view = view.clone();
                                     move |_, _, cx| {
@@ -344,7 +334,7 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
             div()
                 .text_size(px(8.0))
                 .font_family("monospace")
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(format!(
                     "{} rows · filter: {}",
                     row_count,
@@ -358,8 +348,8 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
                 .min_h(px(180.0))
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(0x0f0f12))
+                .border_color(rgb(theme::LEDGER_BORDER))
+                .bg(rgb(theme::LEDGER_SURFACE))
                 .overflow_hidden()
                 .child(render_ledger_header_row())
                 .child(if row_count == 0 {
@@ -370,7 +360,7 @@ pub fn render_integrator_ledger_spreadsheet<H: IntegratorLedgerHost>(
                         .justify_center()
                         .text_size(px(10.0))
                         .font_family("monospace")
-                        .text_color(rgb(TEXT_MUTED))
+                        .text_color(rgb(theme::TEXT_MUTED))
                         .child("No integrator records for this filter.")
                         .into_any_element()
                 } else {
@@ -400,9 +390,11 @@ fn render_filter_chips<H: IntegratorLedgerHost>(
     ledger: Arc<PortfolioIntegratorLedger>,
     active: IntegratorLedgerFilter,
     view: Entity<H>,
+    cx: &mut Context<H>,
 ) -> impl IntoElement {
     let mut row = div().flex().flex_wrap().gap_1().max_w(px(180.0));
     row = row.child(filter_chip(
+        cx,
         0,
         "All",
         active == IntegratorLedgerFilter::AllAssets,
@@ -416,6 +408,7 @@ fn render_filter_chips<H: IntegratorLedgerHost>(
         },
     ));
     row = row.child(filter_chip(
+        cx,
         1,
         "Risk Δ",
         active == IntegratorLedgerFilter::RiskModifiedOnly,
@@ -432,6 +425,7 @@ fn render_filter_chips<H: IntegratorLedgerHost>(
         },
     ));
     row = row.child(filter_chip(
+        cx,
         2,
         "NAV",
         active == IntegratorLedgerFilter::PortfolioNav,
@@ -452,7 +446,7 @@ fn render_filter_chips<H: IntegratorLedgerHost>(
             IntegratorLedgerFilter::Asset(symbol) if symbol == asset
         );
         let view = view.clone();
-        row = row.child(filter_chip(index + 3, &chip_label, is_active, move |cx| {
+        row = row.child(filter_chip(cx, index + 3, &chip_label, is_active, move |cx| {
             view.update(cx, |host, cx| {
                 host.set_integrator_ledger_filter(
                     IntegratorLedgerFilter::Asset(asset_id.clone()),
@@ -464,17 +458,16 @@ fn render_filter_chips<H: IntegratorLedgerHost>(
     row
 }
 
-fn filter_chip(
+fn filter_chip<H: IntegratorLedgerHost>(
+    cx: &mut Context<H>,
     id: usize,
     label: &str,
     active: bool,
     on_click: impl Fn(&mut App) + 'static,
 ) -> impl IntoElement {
     let label_text = label.to_string();
-    Button::new(("integrator-filter", id))
-        .label(label_text)
+    dcc_chip_button(("integrator-filter", id), label_text, active, cx)
         .on_click(move |_, _, cx| on_click(cx))
-        .when(active, |button| button.selected(true))
 }
 
 fn render_ledger_header_row() -> impl IntoElement {
@@ -482,9 +475,9 @@ fn render_ledger_header_row() -> impl IntoElement {
         .flex()
         .flex_none()
         .h(px(24.0))
-        .bg(rgb(HEADER_BG))
+        .bg(rgb(theme::LEDGER_HEADER))
         .border_b_1()
-        .border_color(rgb(BORDER))
+        .border_color(rgb(theme::LEDGER_BORDER))
         .children(header_cells(&[
             ("Date", COL_DATE),
             ("Asset", COL_ASSET),
@@ -507,7 +500,7 @@ fn header_cells(columns: &[(&str, Pixels)]) -> Vec<impl IntoElement> {
                 .text_size(px(8.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .font_family("monospace")
-                .text_color(rgb(TEXT_MUTED))
+                .text_color(rgb(theme::TEXT_MUTED))
                 .child(label.to_string())
         })
         .collect()
@@ -515,23 +508,23 @@ fn header_cells(columns: &[(&str, Pixels)]) -> Vec<impl IntoElement> {
 
 fn render_ledger_data_row(row: &IntegratorLedgerRow, visible_ix: usize) -> impl IntoElement {
     let bg = if row.is_portfolio_summary {
-        ROW_PORTFOLIO
+        theme::LEDGER_ROW_PORTFOLIO
     } else if row.risk_modified {
-        ROW_RISK
+        theme::LEDGER_ROW_RISK
     } else if visible_ix % 2 == 0 {
-        ROW_A
+        theme::LEDGER_ROW_A
     } else {
-        ROW_B
+        theme::LEDGER_ROW_B
     };
     let return_color = if row.investment_return >= 0.0 {
-        rgb(0x10b981)
+        rgb(theme::PNL_POSITIVE)
     } else {
-        rgb(0xf87171)
+        rgb(theme::PNL_NEGATIVE)
     };
     let asset_color = if row.is_portfolio_summary {
-        rgb(TEXT_PORTFOLIO)
+        rgb(theme::WIRE_PORTFOLIO)
     } else {
-        rgb(TEXT_ACCENT)
+        rgb(theme::LEDGER_ACCENT)
     };
     let raw_label = if row.is_portfolio_summary {
         "1.0000".to_string()
@@ -555,21 +548,21 @@ fn render_ledger_data_row(row: &IntegratorLedgerRow, visible_ix: usize) -> impl 
         .h(px(ROW_HEIGHT))
         .bg(rgb(bg))
         .border_b_1()
-        .border_color(rgb(BORDER))
-        .child(cell(&row.timestamp_label, COL_DATE, rgb(TEXT)))
+        .border_color(rgb(theme::LEDGER_BORDER))
+        .child(cell(&row.timestamp_label, COL_DATE, rgb(theme::TEXT_PRIMARY)))
         .child(cell(&row.asset_id, COL_ASSET, asset_color))
-        .child(cell(&raw_label, COL_RAW, rgb(TEXT)))
+        .child(cell(&raw_label, COL_RAW, rgb(theme::TEXT_PRIMARY)))
         .child(cell(
             &format_weight(row.altered_portfolio_weight),
             COL_ALTERED,
             if row.risk_modified {
-                rgb(0xf59e0b)
+                rgb(theme::RISK_WEIGHT_HIGHLIGHT)
             } else {
-                rgb(TEXT)
+                rgb(theme::TEXT_PRIMARY)
             },
         ))
-        .child(cell(&nominal_label, COL_PRICE, rgb(TEXT)))
-        .child(cell(&units_label, COL_UNITS, rgb(TEXT)))
+        .child(cell(&nominal_label, COL_PRICE, rgb(theme::TEXT_PRIMARY)))
+        .child(cell(&units_label, COL_UNITS, rgb(theme::TEXT_PRIMARY)))
         .child(cell(
             &format_percent_signed(row.investment_return),
             COL_RETURN,

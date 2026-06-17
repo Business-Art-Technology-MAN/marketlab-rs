@@ -5,5 +5,21 @@ edition = "2021"
 
 [dependencies]
 petgraph = "0.6"
+rayon = { workspace = true }
 serde = { workspace = true }
 thiserror = "1.0"
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+nalgebra = { workspace = true }
+csv = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bin]]
+name = "ingest_universe"
+path = "src/bin/ingest_universe.rs"
+
+[[bench]]
+name = "tier_sweep"
+harness = false

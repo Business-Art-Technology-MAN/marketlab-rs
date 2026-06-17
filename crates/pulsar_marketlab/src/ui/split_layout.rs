@@ -51,16 +51,24 @@ impl SplitLayoutHost for TradingSystemWorkspace {
         let normalized = ((x - origin_x) / width).clamp(0.12, 0.88);
         match handle {
             SplitHandle::StageCanvas => {
-                layout.stage_share = normalized;
-                layout.inspector_share = (layout.inspector_share)
-                    .min(1.0 - layout.stage_share - 0.15);
+                layout.stage_share = 0.0;
+                layout.inspector_share = (1.0 - normalized).clamp(0.12, 0.45);
             }
             SplitHandle::CanvasInspector => {
                 layout.inspector_share = (1.0 - normalized).clamp(0.12, 0.45);
-                layout.stage_share = layout.stage_share.min(1.0 - layout.inspector_share - 0.15);
+                layout.stage_share = 0.0;
+            }
+            SplitHandle::MainBottom => {
+                let height: f32 = container.size.height.into();
+                if height <= f32::EPSILON {
+                    return;
+                }
+                let origin_y: f32 = container.origin.y.into();
+                let y: f32 = position.y.into();
+                let bottom_h = (origin_y + height - y).max(0.0);
+                layout.bottom_share = (bottom_h / height).clamp(0.12, 0.72);
             }
         }
-        let _ = container;
         self.split_layout = layout.clamp();
         cx.notify();
     }

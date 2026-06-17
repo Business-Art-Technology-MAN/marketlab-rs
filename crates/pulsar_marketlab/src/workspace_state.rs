@@ -8,12 +8,10 @@ use std::time::Duration;
 
 use gpui::*;
 use gpui_component::input::InputState;
-use openusd::sdf::Value;
 
 use crate::asset_path_input::{AssetPathInput, PathInputEvent};
 use crate::graph_compiler::{
-    upstream_price_source_node_id_parts,
-    ta_compute_for_node,
+    deoverlap_canvas_columns, upstream_price_source_node_id_parts, ta_compute_for_node,
     AssetSourceType, NodeConnection, NodeType, PipelineGraphSnapshot, SharedCsvAssetPaths,
     SharedPipelineGraph, VisualNode,
 };
@@ -22,14 +20,22 @@ use pulsar_marketlab::trading_stage::{
     analytics_prim_path, asset_prim_path, stage_time_from_bar_date, MarketStage,
 };
 use pulsar_marketlab_core::ComputedAttributeStream;
-use pulsar_marketlab::stage_bridge::usd_spike::UsdStageBridge;
+use crate::asset_chart_bitmap::build_asset_chart_bitmaps;
 use crate::canvas_compose::{blank_stage_usda, compose_pipeline_usda};
+use crate::canvas_hydrate::hydrate_canvas_from_stage;
+use crate::canvas_stage_sync::{
+    apply_incremental_canvas_sync, needs_full_stage_recompose, published_node_paths,
+};
 use crate::session_autosave::{
     compose_session_usda, load_session_snapshot, SessionAutosaveHandle, SessionSnapshot,
 };
 use pulsar_marketlab::technical_analysis::{
     ta_indicator_label, MarketSeriesWindow,
 };
+use pulsar_marketlab_core::TimelineExecutionResult;
+
+/// Debounce window before OTL compile, USD stage sync, and graph-engine sweeps.
+pub(crate) const PIPELINE_DEBOUNCE_MS: u64 = 500;
 
 pub const DEFAULT_CSV_ASSET_PATH: &str = "data/SPY.csv";
 pub(crate) const CHART_Y_PADDING_RATIO: f32 = 0.08;
@@ -60,12 +66,9 @@ pub enum PipelineSystemMessage {
         values: Vec<f32>,
         ohlc_bars: Vec<OhlcBar>,
     },
-    /// Global synchronized chart playhead index (0-based bar into the active OHLC series).
-    PlayheadSet {
-        index: usize,
+    /// Bar count for the active OHLC series (full historical length).
+    ChartBarCount {
         total_bars: usize,
-        #[allow(dead_code)]
-        tick_label: Option<String>,
     },
     /// Hydrate UI `market_stage` from simulation-thread ledger or FIX bridge writes.
     StageSample {
@@ -195,7 +198,7 @@ pub fn restart_csv_playback(
         .filter(|playback| !playback.rows.is_empty())
         .count();
     if let Some(playback) = playbacks.iter().find(|p| !p.rows.is_empty()) {
-        send_playhead_set_to_last_bar(tx, playback.rows.len());
+        send_bar_count_update(tx, playback.rows.len());
     }
     let _ = tx.send(PipelineSystemMessage::StatusAlert {
         text: format!(
@@ -213,17 +216,15 @@ pub fn finalize_csv_playback_at_eof(
     for playback in playbacks.iter_mut() {
         if !playback.rows.is_empty() {
             playback.reader_paused = true;
-            let last_index = playback.rows.len().saturating_sub(1);
-            let _ = tx.send(PipelineSystemMessage::PlayheadSet {
-                index: last_index,
+            let _last_index = playback.rows.len().saturating_sub(1);
+            let _ = tx.send(PipelineSystemMessage::ChartBarCount {
                 total_bars: playback.rows.len(),
-                tick_label: last_label.clone(),
             });
         }
     }
     let _ = tx.send(PipelineSystemMessage::StatusAlert {
         text: format!(
-            "CSV playback complete — scrub playhead or change graph to replay{}",
+            "CSV playback complete — change graph to replay{}",
             last_label
                 .map(|date| format!(" (last bar {date})"))
                 .unwrap_or_default()
@@ -231,26 +232,13 @@ pub fn finalize_csv_playback_at_eof(
     });
 }
 
-pub fn send_playhead_set(
-    tx: &Sender<PipelineSystemMessage>,
-    index: usize,
-    total_bars: usize,
-    tick_label: Option<String>,
-) {
-    let _ = tx.send(PipelineSystemMessage::PlayheadSet {
-        index,
-        total_bars,
-        tick_label,
-    });
+pub fn send_bar_count_update(tx: &Sender<PipelineSystemMessage>, total_bars: usize) {
+    let _ = tx.send(PipelineSystemMessage::ChartBarCount { total_bars });
 }
 
-/// Position the feeder/UI playhead at the final bar of a loaded CSV series.
+/// Notify the UI of loaded CSV bar count (terminal-bar display uses `total_bars - 1`).
 pub fn send_playhead_set_to_last_bar(tx: &Sender<PipelineSystemMessage>, total_bars: usize) {
-    if total_bars == 0 {
-        send_playhead_set(tx, 0, 0, None);
-    } else {
-        send_playhead_set(tx, total_bars - 1, total_bars, None);
-    }
+    send_bar_count_update(tx, total_bars);
 }
 
 /// Non-realtime CSV sources stay parked on the last bar until replay is requested.
@@ -361,7 +349,33 @@ pub fn yahoo_rows_from_ohlc_bars(bars: &[OhlcBar]) -> Vec<YahooCsvRow> {
         .collect()
 }
 
-pub fn preload_asset_charts_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, ChartHistoryBuffer> {
+#[derive(Debug, Clone)]
+pub struct AssetCsvBundle {
+    pub chart: ChartHistoryBuffer,
+    pub ohlc_bars: Vec<OhlcBar>,
+    pub close_series: std::sync::Arc<[f64]>,
+}
+
+pub fn close_series_from_bars(bars: &[OhlcBar]) -> std::sync::Arc<[f64]> {
+    bars.iter()
+        .map(|bar| bar.close)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+        .into()
+}
+
+pub fn load_asset_csv_bundle(path: &str) -> Result<AssetCsvBundle, String> {
+    let (_, rows) = load_yahoo_finance_csv(path)?;
+    let ohlc_bars = ohlc_bars_from_csv_rows(&rows);
+    let close_series = close_series_from_bars(&ohlc_bars);
+    Ok(AssetCsvBundle {
+        chart: chart_buffer_from_csv_rows(&rows),
+        ohlc_bars,
+        close_series,
+    })
+}
+
+pub fn preload_asset_csv_bundles_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, AssetCsvBundle> {
     let mut history = HashMap::new();
     for node in nodes {
         if !node.node_type.displays_price_chart() {
@@ -370,30 +384,31 @@ pub fn preload_asset_charts_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, C
         let Some(AssetSourceType::Csv { path }) = &node.asset_source else {
             continue;
         };
-        if let Ok((_, rows)) = load_yahoo_finance_csv(path) {
-            history.insert(node.id, chart_buffer_from_csv_rows(&rows));
+        if let Ok(bundle) = load_asset_csv_bundle(path) {
+            history.insert(node.id, bundle);
         }
     }
     history
 }
 
+pub fn preload_asset_charts_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, ChartHistoryBuffer> {
+    preload_asset_csv_bundles_from_nodes(nodes)
+        .into_iter()
+        .map(|(id, bundle)| (id, bundle.chart))
+        .collect()
+}
+
 pub fn preload_asset_ohlc_from_nodes(nodes: &[VisualNode]) -> HashMap<usize, Vec<OhlcBar>> {
-    let mut history = HashMap::new();
-    for node in nodes {
-        if !node.node_type.displays_price_chart() {
-            continue;
-        }
-        let Some(AssetSourceType::Csv { path }) = &node.asset_source else {
-            continue;
-        };
-        if let Ok((_, rows)) = load_yahoo_finance_csv(path) {
-            let bars = ohlc_bars_from_csv_rows(&rows);
-            if !bars.is_empty() {
-                history.insert(node.id, bars);
+    preload_asset_csv_bundles_from_nodes(nodes)
+        .into_iter()
+        .filter_map(|(id, bundle)| {
+            if bundle.ohlc_bars.is_empty() {
+                None
+            } else {
+                Some((id, bundle.ohlc_bars))
             }
-        }
-    }
-    history
+        })
+        .collect()
 }
 
 fn analytics_indicator_id(node: &VisualNode) -> String {
@@ -411,13 +426,7 @@ fn stream_value_at_bar(
     streams
         .iter()
         .find(|stream| stream.prim_path == prim_path && stream.attribute == attribute)
-        .and_then(|stream| {
-            stream
-                .samples
-                .iter()
-                .find(|(bar, _)| *bar as usize == bar_index)
-                .map(|(_, value)| *value)
-        })
+        .and_then(|stream| stream.values.get(bar_index).copied())
 }
 
 fn build_inspector_rows_from_streams(
@@ -569,11 +578,25 @@ pub struct TradingSystemWorkspace {
     pub csv_path_registry: SharedCsvAssetPaths,
     pub pipeline_graph: SharedPipelineGraph,
     pub asset_chart_history: HashMap<usize, ChartHistoryBuffer>,
+    pub(crate) asset_chart_bitmaps: HashMap<usize, Arc<gpui::RenderImage>>,
     pub asset_ohlc_history: HashMap<usize, Vec<OhlcBar>>,
+    pub(crate) asset_close_series: HashMap<usize, std::sync::Arc<[f64]>>,
     /// Phase B Layer 1 market stage (path-addressable time-sampled attributes).
     pub(crate) market_stage: MarketStage,
     pub selected_node_id: Option<usize>,
     pub active_drag_node_id: Option<usize>,
+    /// Inspector/stage selection refresh deferred until node drag completes.
+    pub(crate) defer_inspector_sync_after_drag: bool,
+    /// Coalesce canvas pan/drag repaints to one defer tick per frame.
+    pub(crate) canvas_interaction_repaint_pending: bool,
+    /// Coalesce FIX/CSV ingestion repaints to one defer tick per frame.
+    pub(crate) pipeline_ingestion_repaint_pending: bool,
+    /// OTL inline uniform inputs need (re)binding after graph edits.
+    pub(crate) otl_shader_inputs_stale: bool,
+    /// Coalesce post-sweep inspector/metrics sync to the next frame.
+    pub(crate) view_window_sync_pending: bool,
+    /// Debounce portfolio weight overlay writes after sweeps.
+    pub(crate) portfolio_weights_overlay_pending: bool,
     pub drag_offset: Point<Pixels>,
     pub canvas_origin: Point<Pixels>,
     pub active_wire_source: Option<(usize, usize)>,
@@ -581,6 +604,8 @@ pub struct TradingSystemWorkspace {
     pub context_menu_pos: Option<Point<Pixels>>,
     pub pan_offset: Point<Pixels>,
     pub zoom_scale: f32,
+    /// Last measured node-canvas viewport (for fit-to-graph).
+    pub(crate) canvas_viewport_size: Size<Pixels>,
     pub is_panning: bool,
     pub last_pan_mouse_pos: Point<Pixels>,
     /// Active category shelf tab in the TA indicator picker.
@@ -589,26 +614,22 @@ pub struct TradingSystemWorkspace {
     pub(crate) portfolio_diagnostics: Option<PortfolioDiagnosticsSnapshot>,
     /// Ignore stale portfolio metric frames from prior CSV playback epochs.
     pub(crate) portfolio_metrics_epoch: u64,
-    /// Global synchronized OHLC playhead (0-based bar index).
-    pub(crate) playhead_current: usize,
-    /// Continuous stage coordinate for the active playhead (derived from bar date).
-    pub(crate) playhead_time: f64,
-    pub(crate) playhead_total_bars: usize,
-    pub(crate) playhead_scrubbing: bool,
-    pub(crate) ohlc_chart_bounds: Option<Bounds<Pixels>>,
+    /// Number of OHLC bars in the active historical series.
+    pub(crate) historical_bar_count: usize,
     /// Editable CSV path field for the selected asset node.
     pub(crate) asset_path_input: Entity<AssetPathInput>,
     /// Cached bounds for the TA lookback slider track (inspector sidebar).
     pub(crate) ta_lookback_slider_bounds: Option<Bounds<Pixels>>,
     /// True while dragging the TA lookback slider (USD commits deferred to mouse-up).
     pub(crate) ta_lookback_scrubbing: bool,
-    /// Native OpenUSD structural plane for the stage composer.
-    pub(crate) usd_stage: Entity<UsdStageBridge>,
-    /// Shared MVU context powering the stage ledger explorer grid.
+    /// Shared MVU context powering the stage ledger explorer grid (unified USD stage).
     pub(crate) workspace_context: Entity<pulsar_marketlab_ui::workspace::WorkspaceContext>,
     /// Lazily initialized OTL script editor bound to the selected shader node.
     pub(crate) otl_script_input: Option<Entity<InputState>>,
     pub(crate) otl_script_node_id: Option<usize>,
+    /// Editable display name (`info:user_label`) for the selected canvas node.
+    pub(crate) node_label_input: Option<Entity<InputState>>,
+    pub(crate) node_label_node_id: Option<usize>,
     pub(crate) otl_shader_param_inputs: HashMap<(usize, String), Entity<InputState>>,
     /// Dedicated OTL editor tab buffer (commits on compile, not per keystroke).
     pub(crate) otl_editor_input: Option<Entity<InputState>>,
@@ -616,8 +637,6 @@ pub struct TradingSystemWorkspace {
     pub(crate) otl_compile_status: String,
     pub(crate) otl_compile_inflight: bool,
     pub(crate) active_workspace_tab: pulsar_marketlab_ui::workspace::WorkspaceTab,
-    /// Bounds of the render-viewport playhead slider track.
-    pub(crate) playhead_slider_bounds: Option<Bounds<Pixels>>,
     /// Persisted workstation splitter shares.
     pub(crate) split_layout: pulsar_marketlab_ui::workspace::WorkstationSplitLayout,
     pub(crate) split_container_bounds: Option<Bounds<Pixels>>,
@@ -645,6 +664,14 @@ pub struct TradingSystemWorkspace {
     pub(crate) last_node_header_click: Option<(usize, std::time::Instant)>,
     /// Collapsed branches in the stage hierarchy tree-table.
     pub(crate) collapsed_tree_paths: HashSet<String>,
+    /// Collapsible shelf state for Context Tower and Stage Composer panels.
+    pub(crate) workstation_shelves: pulsar_marketlab_ui::workspace::WorkstationShelfState,
+    /// Persistent topology dopesheet disclosure layout (isolated from engine sweeps).
+    pub(crate) dopesheet_ui_state: pulsar_marketlab_ui::workspace::DopesheetUiState,
+    /// Cached logical strategy tree — refreshed only when stage topology or sweep generation changes.
+    pub(crate) topology_tree_cache: Vec<pulsar_marketlab_ui::workspace::LogicalTreeNode>,
+    pub(crate) topology_tree_cache_stage_generation: u64,
+    pub(crate) topology_tree_cache_sweep_generation: u64,
     /// Last observed unified selection generation from [`WorkspaceContext`].
     pub(crate) last_ui_selection_generation: u64,
     /// Inline lookback [`NumberInput`] states keyed by OTL node id.
@@ -653,6 +680,11 @@ pub struct TradingSystemWorkspace {
     pub(crate) node_lookback_inputs_ready: bool,
     /// Pre-computed portfolio wealth timelines keyed by USD prim path.
     pub(crate) portfolio_timeline_cache: HashMap<String, crate::portfolio_wealth_chart::PortfolioWealthChartSeries>,
+    /// Stacked allocation weights keyed by portfolio prim path.
+    pub(crate) portfolio_allocation_cache:
+        HashMap<String, crate::portfolio_wealth_chart::PortfolioAllocationChartSeries>,
+    /// Token streams (`outputs:weights`) from the last graph sweep.
+    pub(crate) graph_engine_token_streams: Vec<pulsar_marketlab_core::ComputedTokenStream>,
     /// Graph-engine portfolio integration keyed by stage prim path.
     pub(crate) graph_engine_portfolio_results:
         HashMap<String, pulsar_marketlab_core::PortfolioIntegrationResult>,
@@ -672,10 +704,36 @@ pub struct TradingSystemWorkspace {
     pub(crate) session_autosave_revision: u64,
     /// Graph-engine metrics cache needs publishing to [`MetricsTelemetryBridge`].
     pub(crate) metrics_telemetry_dirty: bool,
-}
-
-fn blank_usd_stage_bridge() -> UsdStageBridge {
-    UsdStageBridge::open_from_usda_text(&blank_stage_usda()).expect("blank stage USDA must parse")
+    /// Resolved prim paths after the last successful canvas → USD publish.
+    pub(crate) last_published_node_paths: HashMap<usize, String>,
+    /// Debounce coalescing for incremental stage sync (Milestone 3).
+    pub(crate) canvas_stage_sync_revision: u64,
+    pub(crate) canvas_stage_sync_debounce_scheduled: bool,
+    /// Debounce TA hyperparameter edits before USD/engine invalidation.
+    pub(crate) ta_hyperparam_revision: u64,
+    pub(crate) ta_hyperparam_debounce_scheduled: bool,
+    /// Stage sync / engine sweep deferred until continuous interaction ends.
+    pub(crate) pipeline_sync_deferred: bool,
+    /// Timeline sweep result held until canvas or slider interaction completes.
+    pub(crate) pending_timeline_result: Option<TimelineExecutionResult>,
+    /// Pre-built UI snapshot paired with [`pending_timeline_result`].
+    pub(crate) pending_ui_snapshot: Option<std::sync::Arc<crate::graph_ui_snapshot::GraphUiSnapshot>>,
+    /// Double-buffer read model for charts, inspector, and telemetry (Arc swap after sweeps).
+    pub(crate) graph_ui_snapshot: Option<std::sync::Arc<crate::graph_ui_snapshot::GraphUiSnapshot>>,
+    /// Cached stage graph snapshot keyed by [`SharedPipelineGraph::revision`].
+    pub(crate) stage_graph_snapshot_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<pulsar_marketlab_core::StageGraphSnapshot>)>>,
+    /// Cached pipeline validation snapshot keyed by graph revision.
+    pub(crate) cached_pipeline_snapshot: Option<(u64, crate::graph_compiler::PipelineGraphSnapshot)>,
+    /// Debounced background ledger rebuild (off hot publish path).
+    pub(crate) ledger_sync_debounce_scheduled: bool,
+    pub(crate) usd_commit_generation: u64,
+    /// Skip rebuilding the historical timeline map when bar labels are unchanged.
+    pub(crate) cached_timeline_map_key: Option<(usize, String, String)>,
+    /// True while a background full-USD recompose is in flight.
+    pub(crate) canvas_stage_full_recompose_inflight: bool,
+    /// Reused across sweeps when graph topology is unchanged.
+    pub(crate) graph_engine_cached: Option<pulsar_marketlab_core::MarketLabGraphEngine>,
+    pub(crate) graph_engine_cached_generation: u64,
 }
 
 fn workspace_tab_token(tab: pulsar_marketlab_ui::workspace::WorkspaceTab) -> String {
@@ -715,7 +773,6 @@ impl TradingSystemWorkspace {
         )
         .detach();
 
-        let usd_stage = cx.new(|_| blank_usd_stage_bridge());
 
         let workspace_context = cx.new(|_| blank_workspace_context());
 
@@ -732,10 +789,18 @@ impl TradingSystemWorkspace {
             csv_path_registry,
             pipeline_graph,
             asset_chart_history: HashMap::new(),
+            asset_chart_bitmaps: HashMap::new(),
             asset_ohlc_history,
+            asset_close_series: HashMap::new(),
             market_stage,
             selected_node_id: None,
             active_drag_node_id: None,
+            defer_inspector_sync_after_drag: false,
+            canvas_interaction_repaint_pending: false,
+            pipeline_ingestion_repaint_pending: false,
+            otl_shader_inputs_stale: true,
+            view_window_sync_pending: false,
+            portfolio_weights_overlay_pending: false,
             drag_offset: point(px(0.0), px(0.0)),
             canvas_origin: point(px(0.0), px(0.0)),
             active_wire_source: None,
@@ -743,30 +808,27 @@ impl TradingSystemWorkspace {
             context_menu_pos: None,
             pan_offset: point(px(0.0), px(0.0)),
             zoom_scale: 1.0,
+            canvas_viewport_size: size(px(960.0), px(640.0)),
             is_panning: false,
             last_pan_mouse_pos: point(px(0.0), px(0.0)),
             ta_inspector_category: None,
             portfolio_diagnostics: None,
             portfolio_metrics_epoch: 0,
-            playhead_current: 0,
-            playhead_time: 0.0,
-            playhead_total_bars: 0,
-            playhead_scrubbing: false,
-            ohlc_chart_bounds: None,
+            historical_bar_count: 0,
             asset_path_input,
             ta_lookback_slider_bounds: None,
             ta_lookback_scrubbing: false,
-            usd_stage,
             workspace_context,
             otl_script_input: None,
             otl_script_node_id: None,
+            node_label_input: None,
+            node_label_node_id: None,
             otl_editor_input: None,
             otl_editor_binding: None,
             otl_shader_param_inputs: HashMap::new(),
             otl_compile_status: String::new(),
             otl_compile_inflight: false,
             active_workspace_tab: pulsar_marketlab_ui::workspace::WorkspaceTab::default(),
-            playhead_slider_bounds: None,
             split_layout: pulsar_marketlab_ui::workspace::WorkstationSplitLayout::default(),
             split_container_bounds: None,
             upper_row_bounds: None,
@@ -787,10 +849,28 @@ impl TradingSystemWorkspace {
             active_canvas_tab: 0,
             last_node_header_click: None,
             collapsed_tree_paths: HashSet::new(),
+            workstation_shelves: {
+                let mut shelves = pulsar_marketlab_ui::workspace::WorkstationShelfState::default();
+                shelves.set_expanded(
+                    pulsar_marketlab_ui::workspace::WorkstationShelfId::TowerOtlEditor,
+                    false,
+                );
+                shelves.set_expanded(
+                    pulsar_marketlab_ui::workspace::WorkstationShelfId::TowerStageComposer,
+                    false,
+                );
+                shelves
+            },
+            dopesheet_ui_state: pulsar_marketlab_ui::workspace::DopesheetUiState::default(),
+            topology_tree_cache: Vec::new(),
+            topology_tree_cache_stage_generation: u64::MAX,
+            topology_tree_cache_sweep_generation: u64::MAX,
             last_ui_selection_generation: 0,
             node_lookback_inputs: HashMap::new(),
             node_lookback_inputs_ready: false,
             portfolio_timeline_cache: HashMap::new(),
+            portfolio_allocation_cache: HashMap::new(),
+            graph_engine_token_streams: Vec::new(),
             graph_engine_portfolio_results: HashMap::new(),
             graph_engine_streams: Vec::new(),
             portfolio_diagnostics_cache: HashMap::new(),
@@ -800,24 +880,28 @@ impl TradingSystemWorkspace {
             session_autosave: SessionAutosaveHandle::new(),
             session_autosave_revision: 0,
             metrics_telemetry_dirty: false,
+            last_published_node_paths: HashMap::new(),
+            canvas_stage_sync_revision: 0,
+            canvas_stage_sync_debounce_scheduled: false,
+            ta_hyperparam_revision: 0,
+            ta_hyperparam_debounce_scheduled: false,
+            pipeline_sync_deferred: false,
+            pending_timeline_result: None,
+            pending_ui_snapshot: None,
+            graph_ui_snapshot: None,
+            stage_graph_snapshot_cache: std::sync::Mutex::new(None),
+            cached_pipeline_snapshot: None,
+            ledger_sync_debounce_scheduled: false,
+            usd_commit_generation: 0,
+            cached_timeline_map_key: None,
+            canvas_stage_full_recompose_inflight: false,
+            graph_engine_cached: None,
+            graph_engine_cached_generation: u64::MAX,
         };
 
-        workspace.sync_playhead_bounds();
-        workspace.sync_playhead_time_from_index();
+        workspace.sync_historical_bar_count();
         workspace.sync_pipeline_graph(cx);
         workspace.spawn_pipeline_ingestion_worker(rx, cx);
-        pulsar_marketlab_ui::workspace::install_stage_composition_observer(
-            &workspace.usd_stage,
-            cx,
-        );
-        pulsar_marketlab_ui::workspace::install_workspace_context_observer(
-            &workspace.workspace_context,
-            cx,
-        );
-        pulsar_marketlab_ui::workspace::install_ui_selection_observer(
-            &workspace.workspace_context,
-            cx,
-        );
         pulsar_marketlab_ui::workspace::install_graph_engine_invalidation_worker(
             &workspace.workspace_context,
             cx,
@@ -832,19 +916,11 @@ impl TradingSystemWorkspace {
                 workspace.last_ui_selection_generation = generation;
                 workspace.sync_canvas_selection_from_context(ctx);
                 workspace.sync_inspector_from_selection(cx);
+                cx.notify();
             }
-            workspace.sync_usd_bridge_from_workspace_context(cx);
-            workspace.sync_workspace_ledger(cx);
-            workspace.sync_view_window(cx);
-            cx.notify();
         })
         .detach();
-        cx.observe(&workspace.usd_stage, |workspace, _, cx| {
-            workspace.sync_workspace_ledger(cx);
-            cx.notify();
-        })
-        .detach();
-        workspace.sync_workspace_ledger(cx);
+        workspace.schedule_workspace_ledger_sync_deferred(cx);
         workspace.bootstrapping = false;
         workspace.restore_session_from_autosave_if_present(cx);
         cx.on_app_quit(|workspace, cx| {
@@ -862,7 +938,6 @@ impl TradingSystemWorkspace {
             self.nodes.clone(),
             self.connections.clone(),
             self.selected_node_id,
-            self.playhead_current,
             [f32::from(self.pan_offset.x), f32::from(self.pan_offset.y)],
             self.zoom_scale,
             self.split_layout.stage_share,
@@ -878,8 +953,7 @@ impl TradingSystemWorkspace {
         self.session_autosave_revision = self.session_autosave_revision.saturating_add(1);
         let revision = self.session_autosave_revision;
         let snapshot = self.build_session_snapshot();
-        let usda = compose_session_usda(&snapshot.nodes, &snapshot.connections);
-        self.session_autosave.schedule(revision, snapshot, usda);
+        self.session_autosave.schedule(revision, snapshot);
     }
 
     pub(crate) fn flush_session_autosave_sync(&mut self) {
@@ -910,14 +984,16 @@ impl TradingSystemWorkspace {
 
         self.bootstrapping = true;
         self.nodes = snapshot.nodes;
+        deoverlap_canvas_columns(&mut self.nodes);
         self.connections = snapshot.connections;
         self.selected_node_id = snapshot.selected_node_id;
-        self.playhead_current = snapshot.playhead_current;
         self.pan_offset = point(px(snapshot.pan_offset[0]), px(snapshot.pan_offset[1]));
         self.zoom_scale = snapshot.zoom_scale;
         self.split_layout = pulsar_marketlab_ui::workspace::WorkstationSplitLayout {
             stage_share: snapshot.stage_share,
             inspector_share: snapshot.inspector_share,
+            bottom_share: pulsar_marketlab_ui::workspace::WorkstationSplitLayout::default()
+                .bottom_share,
         }
         .clamp();
         self.active_workspace_tab = workspace_tab_from_token(&snapshot.active_workspace_tab);
@@ -935,83 +1011,159 @@ impl TradingSystemWorkspace {
             self.connections.len()
         ));
 
-        self.sync_playhead_bounds();
-        self.sync_playhead_time_from_index();
+        self.sync_historical_bar_count();
         self.sync_pipeline_graph(cx);
         self.preload_bound_csv_assets(cx);
         self.bootstrapping = false;
         cx.notify();
     }
 
+    /// Rasterize node sparklines off the UI thread after CSV series are loaded.
+    pub(crate) fn rebuild_asset_chart_bitmaps_async(&mut self, cx: &mut Context<Self>) {
+        let history = self.asset_chart_history.clone();
+        cx.spawn(async move |this, cx| {
+            let bitmaps = cx
+                .background_executor()
+                .spawn(async move { build_asset_chart_bitmaps(&history) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.asset_chart_bitmaps = bitmaps;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn apply_asset_csv_bundle(
+        &mut self,
+        node_id: usize,
+        bundle: AssetCsvBundle,
+        cx: &mut Context<Self>,
+    ) {
+        self.asset_chart_history.insert(node_id, bundle.chart);
+        if bundle.ohlc_bars.is_empty() {
+            self.asset_ohlc_history.remove(&node_id);
+            self.asset_close_series.remove(&node_id);
+        } else {
+            self.asset_ohlc_history
+                .insert(node_id, bundle.ohlc_bars.clone());
+            self.asset_close_series
+                .insert(node_id, std::sync::Arc::clone(&bundle.close_series));
+        }
+        self.rebuild_asset_chart_bitmaps_async(cx);
+        self.sync_historical_bar_count();
+        self.request_graph_engine_sweep(cx);
+        self.sync_view_window(cx);
+    }
+
+    /// Load one CSV off the UI thread and merge into caches.
+    pub(crate) fn load_asset_csv_for_node_async(
+        &mut self,
+        node_id: usize,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let path_for_log = path.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { load_asset_csv_bundle(&path).map(|bundle| (path, bundle)) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match loaded {
+                Ok((path, bundle)) => {
+                    workspace.apply_asset_csv_bundle(node_id, bundle, cx);
+                    workspace.push_status_log(format!(
+                        "CSV Asset bound — node {node_id} loaded `{path}`"
+                    ));
+                    cx.notify();
+                }
+                Err(error) => {
+                    workspace.push_status_log(format!(
+                        "Chart reload failed for `{path_for_log}`: {error}"
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Load bound CSV files into chart/OHLC caches and refresh the graph engine sweep.
     pub(crate) fn preload_bound_csv_assets(&mut self, cx: &mut Context<Self>) {
         self.csv_path_registry.replace_from_nodes(&self.nodes);
-        self.asset_chart_history = preload_asset_charts_from_nodes(&self.nodes);
-        self.asset_ohlc_history = preload_asset_ohlc_from_nodes(&self.nodes);
+        let nodes = self.nodes.clone();
+        cx.spawn(async move |this, cx| {
+            let bundles = cx
+                .background_executor()
+                .spawn(async move { preload_asset_csv_bundles_from_nodes(&nodes) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.asset_chart_history = bundles
+                    .iter()
+                    .map(|(id, bundle)| (*id, bundle.chart.clone()))
+                    .collect();
+                workspace.asset_ohlc_history = bundles
+                    .iter()
+                    .filter_map(|(id, bundle)| {
+                        if bundle.ohlc_bars.is_empty() {
+                            None
+                        } else {
+                            Some((*id, bundle.ohlc_bars.clone()))
+                        }
+                    })
+                    .collect();
+                workspace.asset_close_series = bundles
+                    .iter()
+                    .filter_map(|(id, bundle)| {
+                        if bundle.ohlc_bars.is_empty() {
+                            None
+                        } else {
+                            Some((*id, std::sync::Arc::clone(&bundle.close_series)))
+                        }
+                    })
+                    .collect();
+                workspace.rebuild_asset_chart_bitmaps_async(cx);
 
-        let mut loaded = 0usize;
-        let mut failed_paths = Vec::new();
-        for node in &self.nodes {
-            let Some(AssetSourceType::Csv { path }) = &node.asset_source else {
-                continue;
-            };
-            if let Some(bars) = self.asset_ohlc_history.get(&node.id) {
-                hydrate_market_stage_from_ohlc(&mut self.market_stage, &node.name, bars);
-                loaded += 1;
-            } else {
-                failed_paths.push(path.clone());
-            }
-        }
-        for path in &failed_paths {
-            self.push_status_log(format!("CSV preload failed for `{path}`"));
-        }
-
-        if loaded > 0 {
-            let failed_count = failed_paths.len();
-            self.snap_playhead_to_last_bar();
-            self.sync_playhead_bounds();
-            self.sync_playhead_time_from_index();
-            self.request_graph_engine_timeline_refresh(cx);
-            self.sync_view_window(cx);
-            self.push_status_log(format!(
-                "CSV preload — {loaded} asset source(s) loaded{}",
-                if failed_count == 0 {
-                    String::new()
-                } else {
-                    format!(", {failed_count} failed")
+                let mut loaded = 0usize;
+                let mut failed_paths = Vec::new();
+                for node in &workspace.nodes {
+                    let Some(AssetSourceType::Csv { path }) = &node.asset_source else {
+                        continue;
+                    };
+                    if workspace.asset_ohlc_history.contains_key(&node.id) {
+                        loaded += 1;
+                    } else {
+                        failed_paths.push(path.clone());
+                    }
                 }
-            ));
-        }
-    }
+                for path in &failed_paths {
+                    workspace.push_status_log(format!("CSV preload failed for `{path}`"));
+                }
 
-    pub(crate) fn sync_usd_bridge_from_workspace_context(&mut self, cx: &mut Context<Self>) {
-        let prim_paths: Vec<String> = self
-            .usd_stage
-            .read(cx)
-            .stage_prim_rows()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| row.path)
-            .collect();
-        let active_states: Vec<(String, bool)> = {
-            let context = self.workspace_context.read(cx);
-            prim_paths
-                .iter()
-                .map(|path| (path.clone(), context.usd_stage().prim_active(path)))
-                .collect()
-        };
-        self.usd_stage.update(cx, |bridge, cx| {
-            for (path, active) in active_states {
-                bridge.set_prim_active(&path, active);
-            }
-            cx.notify();
-        });
+                if loaded > 0 {
+                    let failed_count = failed_paths.len();
+                    workspace.sync_historical_bar_count();
+                    workspace.request_graph_engine_sweep(cx);
+                    workspace.push_status_log(format!(
+                        "CSV preload — {loaded} asset source(s) loaded{}",
+                        if failed_count == 0 {
+                            String::new()
+                        } else {
+                            format!(", {failed_count} failed")
+                        }
+                    ));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn sync_workspace_ledger(&mut self, cx: &mut Context<Self>) {
-        let entries: Vec<pulsar_marketlab_ui::workspace::StageLedgerEntry> = self
-            .usd_stage
-            .read(cx)
+        let stage = pulsar_marketlab::stage_bridge::UsdStageBridge::borrow(
+            self.workspace_context.read(cx).usd_stage(),
+        );
+        let entries: Vec<pulsar_marketlab_ui::workspace::StageLedgerEntry> = stage
             .stage_ledger_entries()
             .unwrap_or_default()
             .into_iter()
@@ -1027,9 +1179,6 @@ impl TradingSystemWorkspace {
             })
             .collect();
         self.workspace_context.update(cx, |context, cx| {
-            if context.ledger_entries() == entries.as_slice() {
-                return;
-            }
             context.replace_ledger_entries(entries);
             cx.notify();
         });
@@ -1040,8 +1189,8 @@ impl TradingSystemWorkspace {
         prim_path: &str,
         cx: &mut Context<Self>,
     ) {
-        self.usd_stage.update(cx, |bridge, cx| {
-            bridge.set_prim_active(prim_path, true);
+        self.workspace_context.update(cx, |context, cx| {
+            context.usd_stage().set_prim_active(prim_path, true);
             cx.notify();
         });
     }
@@ -1062,7 +1211,7 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn timeline_bar_labels(&self) -> Option<Vec<String>> {
-        let timeline_len = self.playhead_total_bars.max(
+        let timeline_len = self.historical_bar_count.max(
             self.asset_ohlc_history
                 .values()
                 .map(|bars| bars.len())
@@ -1091,20 +1240,27 @@ impl TradingSystemWorkspace {
     ) {
         use crate::portfolio_integrator_ledger::build_integrator_ledger;
         use crate::portfolio_wealth_chart::{
+            build_allocation_chart_from_integration, build_allocation_chart_from_token_streams,
             build_portfolio_wealth_chart_from_streams, build_portfolio_wealth_chart_series,
         };
 
         let bar_labels = self.timeline_bar_labels();
         self.portfolio_timeline_cache.clear();
+        self.portfolio_allocation_cache.clear();
         self.portfolio_ledger_cache.clear();
         self.graph_engine_portfolio_results = result.portfolio_results.clone();
         self.graph_engine_streams = result.streams.clone();
+        self.graph_engine_token_streams = result.token_streams.clone();
         self.refresh_portfolio_diagnostics_cache();
 
         for (prim_path, integration) in &result.portfolio_results {
             self.portfolio_timeline_cache.insert(
                 prim_path.clone(),
                 build_portfolio_wealth_chart_series(integration, bar_labels.clone()),
+            );
+            self.portfolio_allocation_cache.insert(
+                prim_path.clone(),
+                build_allocation_chart_from_integration(integration, bar_labels.clone()),
             );
             self.portfolio_ledger_cache.insert(
                 prim_path.clone(),
@@ -1127,6 +1283,14 @@ impl TradingSystemWorkspace {
                 ) {
                     self.portfolio_timeline_cache.insert(prim_path.clone(), series);
                 }
+                if let Some(allocation) = build_allocation_chart_from_token_streams(
+                    &result.token_streams,
+                    &prim_path,
+                    bar_labels.clone(),
+                    |path| self.prim_display_label_for_path(path),
+                ) {
+                    self.portfolio_allocation_cache.insert(prim_path.clone(), allocation);
+                }
                 if !self.portfolio_ledger_cache.contains_key(&prim_path) {
                     self.portfolio_ledger_cache.insert(
                         prim_path,
@@ -1144,27 +1308,29 @@ impl TradingSystemWorkspace {
     }
 
     pub(crate) fn graph_engine_analytics_active(&self) -> bool {
-        !self.graph_engine_portfolio_results.is_empty()
+        self.ui_read_snapshot()
+            .map(|snapshot| !snapshot.graph_engine_portfolio_results.is_empty())
+            .unwrap_or(false)
     }
 
     pub(crate) fn graph_engine_vectorized_active(&self) -> bool {
-        !self.graph_engine_streams.is_empty()
+        self.ui_read_snapshot()
+            .map(|snapshot| !snapshot.graph_engine_streams.is_empty())
+            .unwrap_or(false)
     }
 
     pub(crate) fn refresh_portfolio_diagnostics_cache(&mut self) {
         use crate::portfolio_analytics::build_portfolio_diagnostics_from_integration;
 
         self.portfolio_diagnostics_cache.clear();
-        let playhead = self
-            .playhead_current
-            .min(self.playhead_total_bars.saturating_sub(1));
-        let tick_label = self.playhead_tick_label();
+        let bar_index = self.terminal_bar_index();
+        let tick_label = self.terminal_tick_label();
         let benchmark = self.primary_asset_benchmark_prices();
 
         for (prim_path, integration) in &self.graph_engine_portfolio_results {
             let snapshot = build_portfolio_diagnostics_from_integration(
                 integration,
-                playhead,
+                bar_index,
                 SIM_INITIAL_CASH,
                 self.portfolio_metrics_epoch,
                 Some(tick_label.clone()),
@@ -1185,19 +1351,21 @@ impl TradingSystemWorkspace {
             return;
         }
 
-        let playhead = self
-            .playhead_current
-            .min(self.playhead_total_bars.saturating_sub(1));
+        let bar_index = self.terminal_bar_index();
         let nodes = self.nodes.clone();
-        let portfolio_results = self.graph_engine_portfolio_results.clone();
-        let diagnostics = self.portfolio_diagnostics_cache.clone();
+        let Some(snapshot) = self.graph_ui_snapshot.clone() else {
+            self.metrics_telemetry_dirty = false;
+            return;
+        };
+        let portfolio_results = &snapshot.graph_engine_portfolio_results;
+        let diagnostics = &snapshot.portfolio_diagnostics_cache;
         let selected_node_id = self.selected_node_id;
         publish_metrics_telemetry(
             cx,
             &nodes,
-            &portfolio_results,
-            &diagnostics,
-            playhead,
+            portfolio_results,
+            diagnostics,
+            bar_index,
             |node| self.stage_prim_path_for_node_in_graph(node),
             selected_node_id,
         );
@@ -1228,13 +1396,17 @@ impl TradingSystemWorkspace {
             return None;
         }
         let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
-        self.portfolio_diagnostics_cache.get(&prim_path)
+        self.ui_read_snapshot()?
+            .portfolio_diagnostics_cache
+            .get(&prim_path)
     }
 
     pub(crate) fn portfolio_diagnostics_for_selection(&self) -> Option<&PortfolioDiagnosticsSnapshot> {
         let node = self.selected_portfolio_node()?;
         let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
-        self.portfolio_diagnostics_cache.get(&prim_path)
+        self.ui_read_snapshot()?
+            .portfolio_diagnostics_cache
+            .get(&prim_path)
     }
 
     pub(crate) fn portfolio_wealth_chart_for_selection(
@@ -1246,7 +1418,44 @@ impl TradingSystemWorkspace {
             .iter()
             .find(|node| node.id == selected_id && node.node_type.is_portfolio())?;
         let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
-        self.portfolio_timeline_cache.get(&prim_path)
+        self.ui_read_snapshot()?
+            .portfolio_timeline_cache
+            .get(&prim_path)
+    }
+
+    pub(crate) fn portfolio_allocation_chart_for_selection(
+        &self,
+    ) -> Option<&crate::portfolio_wealth_chart::PortfolioAllocationChartSeries> {
+        let node = self.selected_portfolio_node()?;
+        let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
+        self.ui_read_snapshot()?
+            .portfolio_allocation_cache
+            .get(&prim_path)
+    }
+
+    pub(crate) fn portfolio_weights_encoded_at_terminal_bar(&self, prim_path: &str) -> Option<String> {
+        let bar = self.terminal_bar_index() as f64;
+        let snapshot = self.ui_read_snapshot()?;
+        let stream = snapshot.graph_engine_token_streams.iter().find(|stream| {
+            stream.prim_path == prim_path && stream.attribute == "outputs:weights"
+        })?;
+        stream
+            .samples
+            .iter()
+            .find(|(sample_bar, _)| (*sample_bar - bar).abs() < f64::EPSILON)
+            .or_else(|| stream.samples.last())
+            .map(|(_, encoded)| encoded.clone())
+    }
+
+    pub(crate) fn prim_display_label_for_path(&self, prim_path: &str) -> String {
+        if let Some(node) = self.nodes.iter().find(|node| {
+            self.stage_prim_path_for_node_in_graph(node)
+                .is_some_and(|path| path == prim_path)
+        }) {
+            return node.name.clone();
+        }
+        let leaf = prim_path.rsplit('/').next().unwrap_or(prim_path);
+        pulsar_marketlab_core::prim_display_label(leaf, None)
     }
 
     pub(crate) fn portfolio_integrator_ledger_for_selection(
@@ -1258,7 +1467,10 @@ impl TradingSystemWorkspace {
             .iter()
             .find(|node| node.id == selected_id && node.node_type.is_portfolio())?;
         let prim_path = self.stage_prim_path_for_node_in_graph(node)?;
-        self.portfolio_ledger_cache.get(&prim_path).cloned()
+        self.ui_read_snapshot()?
+            .portfolio_ledger_cache
+            .get(&prim_path)
+            .cloned()
     }
 
     pub(crate) fn node_id_for_stage_path(&self, prim_path: &str) -> Option<usize> {
@@ -1308,6 +1520,207 @@ impl TradingSystemWorkspace {
             .and_then(|prim_path| self.node_id_for_stage_path(prim_path));
     }
 
+    pub(crate) fn canvas_interaction_active(&self) -> bool {
+        self.active_drag_node_id.is_some() || self.is_panning
+    }
+
+    /// True while continuous pointer interaction should block OTL compile and USD writes.
+    pub(crate) fn pipeline_interaction_active(&self) -> bool {
+        self.canvas_interaction_active() || self.ta_lookback_scrubbing
+    }
+
+    /// Flush debounced pipeline work after drag, pan, or slider scrub completes.
+    pub(crate) fn on_pipeline_interaction_ended(&mut self, cx: &mut Context<Self>) {
+        if self.pipeline_sync_deferred {
+            self.pipeline_sync_deferred = false;
+            self.schedule_canvas_stage_sync(cx);
+        }
+        if let Some(result) = self.pending_timeline_result.take() {
+            let ui_snapshot = self.pending_ui_snapshot.take();
+            self.apply_timeline_result_now(&result, ui_snapshot, cx);
+        }
+        let entity = cx.entity();
+        let needs_sweep = self.graph_engine_recompile_pending
+            || self
+                .workspace_context
+                .read(cx)
+                .is_engine_cache_dirty(self.graph_engine_last_compiled_generation);
+        if needs_sweep {
+            self.graph_engine_recompile_pending = false;
+            pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_timeline_result_now(
+        &mut self,
+        result: &TimelineExecutionResult,
+        prebuilt: Option<std::sync::Arc<crate::graph_ui_snapshot::GraphUiSnapshot>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.graph_engine_compile_error = None;
+        if let Some(ui) = prebuilt {
+            self.apply_graph_ui_snapshot(ui);
+            self.schedule_deferred_view_window_sync(cx);
+            return;
+        }
+        let build_input = self.graph_ui_snapshot_build_input();
+        let result = result.clone();
+        cx.spawn(async move |this, cx| {
+            let ui_snapshot =
+                crate::graph_ui_snapshot::build_graph_ui_snapshot(&result, &build_input);
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.apply_graph_ui_snapshot(std::sync::Arc::new(ui_snapshot));
+                workspace.schedule_deferred_view_window_sync(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Defer inspector/metrics sync to the next frame so sweep completion stays off the hot path.
+    pub(crate) fn schedule_deferred_view_window_sync(&mut self, cx: &mut Context<Self>) {
+        if self.view_window_sync_pending {
+            return;
+        }
+        self.view_window_sync_pending = true;
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(entity) = view.upgrade() else {
+                return;
+            };
+            entity.update(cx, |workspace, cx| {
+                workspace.view_window_sync_pending = false;
+                workspace.sync_view_window(cx);
+            });
+        });
+    }
+
+    pub(crate) fn cached_stage_graph_snapshot(
+        &self,
+    ) -> std::sync::Arc<pulsar_marketlab_core::StageGraphSnapshot> {
+        let revision = self.pipeline_graph.revision();
+        if let Ok(guard) = self.stage_graph_snapshot_cache.lock() {
+            if let Some((cached_rev, snapshot)) = guard.as_ref() {
+                if *cached_rev == revision {
+                    return std::sync::Arc::clone(snapshot);
+                }
+            }
+        }
+        let snapshot = std::sync::Arc::new(
+            crate::canvas_graph_snapshot::build_stage_graph_snapshot_from_graph(
+                &self.nodes,
+                &self.connections,
+            ),
+        );
+        if let Ok(mut guard) = self.stage_graph_snapshot_cache.lock() {
+            *guard = Some((revision, std::sync::Arc::clone(&snapshot)));
+        }
+        snapshot
+    }
+
+    pub(crate) fn store_stage_graph_snapshot_cache(
+        &self,
+        revision: u64,
+        snapshot: std::sync::Arc<pulsar_marketlab_core::StageGraphSnapshot>,
+    ) {
+        if let Ok(mut guard) = self.stage_graph_snapshot_cache.lock() {
+            *guard = Some((revision, snapshot));
+        }
+    }
+
+    pub(crate) fn pipeline_graph_snapshot_cached(
+        &mut self,
+    ) -> &crate::graph_compiler::PipelineGraphSnapshot {
+        let revision = self.pipeline_graph.revision();
+        if self
+            .cached_pipeline_snapshot
+            .as_ref()
+            .map(|(rev, _)| *rev)
+            != Some(revision)
+        {
+            self.cached_pipeline_snapshot =
+                Some((revision, self.pipeline_graph.snapshot()));
+        }
+        &self.cached_pipeline_snapshot.as_ref().unwrap().1
+    }
+
+    pub(crate) fn ui_read_snapshot(&self) -> Option<&crate::graph_ui_snapshot::GraphUiSnapshot> {
+        self.graph_ui_snapshot.as_deref()
+    }
+
+    pub(crate) fn graph_ui_snapshot_build_input(&self) -> crate::graph_ui_snapshot::GraphUiSnapshotBuildInput {
+        use crate::graph_ui_snapshot::GraphUiSnapshotBuildInput;
+
+        let mut node_prim_paths = Vec::new();
+        let mut prim_labels = std::collections::HashMap::new();
+        for node in &self.nodes {
+            let Some(prim_path) = self.stage_prim_path_for_node_in_graph(node) else {
+                continue;
+            };
+            prim_labels.insert(prim_path.clone(), node.name.clone());
+            node_prim_paths.push((node.id, prim_path, node.node_type.is_portfolio()));
+        }
+
+        GraphUiSnapshotBuildInput {
+            bar_labels: self.timeline_bar_labels(),
+            terminal_bar_index: self.terminal_bar_index(),
+            terminal_tick_label: self.terminal_tick_label(),
+            portfolio_metrics_epoch: self.portfolio_metrics_epoch,
+            benchmark_prices: self.primary_asset_benchmark_prices(),
+            node_prim_paths,
+            prim_labels,
+        }
+    }
+
+    pub(crate) fn apply_graph_ui_snapshot(
+        &mut self,
+        ui: std::sync::Arc<crate::graph_ui_snapshot::GraphUiSnapshot>,
+    ) {
+        self.graph_ui_snapshot = Some(ui);
+        self.metrics_telemetry_dirty = true;
+    }
+
+    /// Batch node-canvas pan/drag updates into a single UI frame.
+    pub(crate) fn schedule_canvas_interaction_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.canvas_interaction_repaint_pending {
+            return;
+        }
+        self.canvas_interaction_repaint_pending = true;
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(entity) = view.upgrade() else {
+                return;
+            };
+            entity.update(cx, |workspace, cx| {
+                workspace.canvas_interaction_repaint_pending = false;
+                cx.notify();
+            });
+        });
+    }
+
+    /// Batch FIX/CSV ingestion updates into a single UI frame.
+    pub(crate) fn schedule_pipeline_ingestion_repaint(&mut self, cx: &mut Context<Self>) {
+        if self.pipeline_ingestion_repaint_pending {
+            return;
+        }
+        self.pipeline_ingestion_repaint_pending = true;
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(entity) = view.upgrade() else {
+                return;
+            };
+            entity.update(cx, |workspace, cx| {
+                workspace.pipeline_ingestion_repaint_pending = false;
+                workspace.synchronize_inspector_view();
+                cx.notify();
+            });
+        });
+    }
+
+    pub(crate) fn mark_otl_shader_inputs_stale(&mut self) {
+        self.otl_shader_inputs_stale = true;
+    }
+
     pub(crate) fn toggle_node_collapsed(&mut self, node_id: usize, cx: &mut Context<Self>) {
         if let Some(node) = self.nodes.iter_mut().find(|node| node.id == node_id) {
             node.collapsed = !node.collapsed;
@@ -1317,8 +1730,8 @@ impl TradingSystemWorkspace {
 
     pub(crate) fn ensure_node_lookback_inputs(
         &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
         if self.node_lookback_inputs_ready {
             return;
@@ -1350,8 +1763,9 @@ impl TradingSystemWorkspace {
             execution_slot_for_target_type,
         };
         let slot = self
-            .usd_stage
+            .workspace_context
             .read(cx)
+            .usd_stage()
             .prim_type_name(target_prim_path)
             .as_deref()
             .and_then(execution_slot_for_target_type)
@@ -1393,8 +1807,9 @@ impl TradingSystemWorkspace {
             execution_slot_for_target_type,
         };
         let slot = self
-            .usd_stage
+            .workspace_context
             .read(cx)
+            .usd_stage()
             .prim_type_name(target_prim_path)
             .as_deref()
             .and_then(execution_slot_for_target_type)
@@ -1433,31 +1848,33 @@ impl TradingSystemWorkspace {
         self.portfolio_diagnostics = None;
         self.portfolio_timeline_cache.clear();
         self.portfolio_ledger_cache.clear();
+        self.portfolio_allocation_cache.clear();
         self.graph_engine_portfolio_results.clear();
         self.graph_engine_streams.clear();
+        self.graph_engine_token_streams.clear();
+        self.cached_timeline_map_key = None;
         self.portfolio_diagnostics_cache.clear();
-        self.playhead_current = 0;
-        self.playhead_time = 0.0;
-        self.playhead_scrubbing = false;
+        self.historical_bar_count = 0;
         self.pipeline_status_log =
             vec!["New document — empty canvas and blank USD stage.".to_string()];
         self.node_lookback_inputs.clear();
         self.node_lookback_inputs_ready = false;
         self.otl_shader_param_inputs.clear();
         self.last_ui_selection_generation = 0;
+        self.last_published_node_paths.clear();
+        self.canvas_stage_sync_revision = 0;
+        self.canvas_stage_sync_debounce_scheduled = false;
+        self.canvas_stage_full_recompose_inflight = false;
 
         self.csv_path_registry.replace_from_nodes(&[]);
         self.asset_ohlc_history.clear();
+        self.asset_close_series.clear();
         self.asset_chart_history.clear();
+        self.asset_chart_bitmaps.clear();
         self.market_stage = MarketStage::new();
 
         self.asset_path_input.update(cx, |input, cx| {
             input.set_content(String::new(), cx);
-        });
-
-        self.usd_stage.update(cx, |stage, cx| {
-            *stage = blank_usd_stage_bridge();
-            cx.notify();
         });
 
         self.workspace_context.update(cx, |context, cx| {
@@ -1470,9 +1887,65 @@ impl TradingSystemWorkspace {
         self.reset_otl_editor_input();
         self.otl_compile_status.clear();
         self.otl_compile_inflight = false;
-        self.sync_playhead_bounds();
+        self.sync_historical_bar_count();
         self.sync_pipeline_graph(cx);
         self.sync_view_window(cx);
+        cx.notify();
+        self.schedule_session_autosave();
+    }
+
+    /// Copy a portfolio `.usda` into the active project stack and hydrate the node canvas.
+    pub(crate) fn import_portfolio_layer_from_disk(
+        &mut self,
+        source: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let filename = match self.workspace_context.update(cx, |ctx, cx| {
+            ctx.import_portfolio_layer_into_workspace(&source, cx)
+        }) {
+            Ok(name) => name,
+            Err(err) => {
+                self.push_status_log(format!("Portfolio import failed: {err}"));
+                return;
+            }
+        };
+
+        let stage_path = PathBuf::from(
+            self.workspace_context
+                .read(cx)
+                .usd_stage()
+                .root_layer_path(),
+        );
+        let hydrated = match pulsar_marketlab::stage_bridge::UsdStageBridge::open(&stage_path) {
+            Ok(stage) => hydrate_canvas_from_stage(&stage),
+            Err(error) => {
+                self.push_status_log(format!(
+                    "Portfolio `{filename}` imported but canvas hydration failed: {error}"
+                ));
+                self.topology_tree_cache_stage_generation = u64::MAX;
+                self.request_graph_engine_sweep(cx);
+                cx.notify();
+                return;
+            }
+        };
+
+        self.nodes = hydrated.nodes;
+        self.connections = hydrated.connections;
+        self.selected_node_id = None;
+        self.csv_path_registry.replace_from_nodes(&self.nodes);
+        self.pipeline_graph
+            .replace(self.nodes.clone(), self.connections.clone());
+        self.topology_tree_cache_stage_generation = u64::MAX;
+        self.sync_historical_bar_count();
+        self.preload_bound_csv_assets(cx);
+        self.sync_view_window(cx);
+        self.request_graph_engine_sweep(cx);
+        self.schedule_canvas_stage_sync(cx);
+        self.push_status_log(format!(
+            "Imported portfolio layer `{filename}` from `{}` ({} nodes hydrated)",
+            source.display(),
+            self.nodes.len()
+        ));
         cx.notify();
         self.schedule_session_autosave();
     }
@@ -1493,25 +1966,186 @@ impl TradingSystemWorkspace {
         }
         self.pipeline_graph
             .replace(self.nodes.clone(), self.connections.clone());
-        self.publish_canvas_to_usd_stage(cx);
+        self.mark_otl_shader_inputs_stale();
+        self.schedule_canvas_stage_sync(cx);
     }
 
-    /// Update graph/playhead immediately; defer OpenUSD recompose (immutable TA ports).
+    /// Update graph caches immediately; re-sweep without OpenUSD commit until save/topology idle.
     pub(crate) fn commit_ta_uber_parameter_change(&mut self, cx: &mut Context<Self>) {
         self.pipeline_graph
             .replace(self.nodes.clone(), self.connections.clone());
-        let view = cx.entity().downgrade();
-        cx.defer(move |cx| {
-            let _ = view.update(cx, |this, cx| {
-                this.publish_canvas_to_usd_stage(cx);
-            });
-        });
+        self.ta_hyperparam_revision = self.ta_hyperparam_revision.wrapping_add(1);
+        if self.bootstrapping {
+            self.schedule_canvas_stage_sync(cx);
+        } else {
+            self.schedule_ta_param_resweep(cx);
+        }
         cx.notify();
     }
 
-    /// Recompose the OpenUSD root layer from the current canvas graph and reload both stage handles.
+    /// Coalesce rapid TA hyperparameter edits into one engine re-sweep (no USD write).
+    pub(crate) fn schedule_ta_param_resweep(&mut self, cx: &mut Context<Self>) {
+        if self.ta_hyperparam_debounce_scheduled {
+            return;
+        }
+        self.ta_hyperparam_debounce_scheduled = true;
+        let target_revision = self.ta_hyperparam_revision;
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PIPELINE_DEBOUNCE_MS))
+                .await;
+            let _ = cx.update(|cx| {
+                let Some(entity) = view.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |workspace, cx| {
+                    workspace.ta_hyperparam_debounce_scheduled = false;
+                    if workspace.ta_hyperparam_revision != target_revision {
+                        workspace.schedule_ta_param_resweep(cx);
+                        return;
+                    }
+                    if workspace.pipeline_interaction_active() {
+                        workspace.pipeline_sync_deferred = true;
+                        workspace.graph_engine_recompile_pending = true;
+                        return;
+                    }
+                    workspace.graph_engine_cached = None;
+                    workspace.request_graph_engine_sweep(cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Coalesce rapid TA hyperparameter edits into one stage sync + engine sweep.
+    #[allow(dead_code)]
+    pub(crate) fn schedule_ta_hyperparam_sync(&mut self, cx: &mut Context<Self>) {
+        if self.bootstrapping {
+            self.schedule_canvas_stage_sync(cx);
+            return;
+        }
+        if self.ta_hyperparam_debounce_scheduled {
+            return;
+        }
+        self.ta_hyperparam_debounce_scheduled = true;
+        let target_revision = self.ta_hyperparam_revision;
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PIPELINE_DEBOUNCE_MS))
+                .await;
+            let _ = cx.update(|cx| {
+                let Some(entity) = view.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |workspace, cx| {
+                    workspace.ta_hyperparam_debounce_scheduled = false;
+                    if workspace.ta_hyperparam_revision != target_revision {
+                        workspace.schedule_ta_hyperparam_sync(cx);
+                        return;
+                    }
+                    if workspace.pipeline_interaction_active() {
+                        workspace.pipeline_sync_deferred = true;
+                        return;
+                    }
+                    workspace.schedule_canvas_stage_sync(cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Coalesce rapid canvas edits into a single stage sync after a short debounce window.
+    pub(crate) fn schedule_canvas_stage_sync(&mut self, cx: &mut Context<Self>) {
+        self.canvas_stage_sync_revision = self.canvas_stage_sync_revision.wrapping_add(1);
+        let target_revision = self.canvas_stage_sync_revision;
+        if self.canvas_stage_sync_debounce_scheduled {
+            return;
+        }
+        self.canvas_stage_sync_debounce_scheduled = true;
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PIPELINE_DEBOUNCE_MS))
+                .await;
+            let _ = cx.update(|cx| {
+                let Some(entity) = view.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |workspace, cx| {
+                    workspace.canvas_stage_sync_debounce_scheduled = false;
+                    if workspace.canvas_stage_sync_revision != target_revision {
+                        workspace.schedule_canvas_stage_sync(cx);
+                        return;
+                    }
+                    if workspace.pipeline_interaction_active() {
+                        workspace.pipeline_sync_deferred = true;
+                        return;
+                    }
+                    workspace.sync_graph_after_topology_edit(cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Invalidate topology caches and re-run graph engine sweep without publishing to USD.
+    pub(crate) fn sync_graph_after_topology_edit(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.pipeline_graph_snapshot_cached().clone();
+        if !snapshot.nodes.is_empty() && (!snapshot.wiring_valid || !snapshot.dag_valid) {
+            let mut reasons: Vec<String> = snapshot
+                .wiring_errors
+                .iter()
+                .map(|error| error.message.clone())
+                .collect();
+            if !snapshot.dag_valid {
+                reasons.push("dependency cycle detected in canvas graph".to_string());
+            }
+            self.push_status_log(format!(
+                "Graph sync blocked — fix {} validation issue(s) before engine sweep.",
+                reasons.len()
+            ));
+            for reason in reasons.iter().take(3) {
+                self.push_status_log(format!("  • {reason}"));
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Ok(mut guard) = self.stage_graph_snapshot_cache.lock() {
+            *guard = None;
+        }
+        self.graph_engine_last_compiled_generation = u64::MAX;
+        self.workspace_context.update(cx, |ctx, cx| {
+            ctx.invalidate_engine_topology_cache(cx);
+        });
+
+        if let Some(path) = self
+            .workspace_context
+            .read(cx)
+            .selected_path()
+            .map(str::to_string)
+        {
+            self.selected_node_id = self.node_id_for_stage_path(&path);
+        }
+        self.schedule_workspace_ledger_sync_deferred(cx);
+        if self.pipeline_interaction_active() {
+            self.pipeline_sync_deferred = true;
+            self.graph_engine_recompile_pending = true;
+            self.schedule_session_autosave();
+            cx.notify();
+            return;
+        }
+        let entity = cx.entity();
+        pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+        self.schedule_session_autosave();
+        cx.notify();
+    }
+
+    /// Sync canvas graph to the unified USD stage (incremental overlays or background full recompose).
     pub(crate) fn publish_canvas_to_usd_stage(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.pipeline_graph.snapshot();
+        let snapshot = self.pipeline_graph_snapshot_cached().clone();
         if !snapshot.nodes.is_empty() && (!snapshot.wiring_valid || !snapshot.dag_valid) {
             let mut reasons: Vec<String> = snapshot
                 .wiring_errors
@@ -1532,16 +2166,42 @@ impl TradingSystemWorkspace {
             return;
         }
 
-        let usda = if self.nodes.is_empty() {
-            blank_stage_usda()
-        } else {
-            compose_pipeline_usda(&self.nodes, &self.connections)
-        };
+        let stage = self.workspace_context.read(cx).usd_stage().clone();
+        let nodes = self.nodes.clone();
+        let connections = self.connections.clone();
+        let last_paths = self.last_published_node_paths.clone();
 
-        let bridge = UsdStageBridge::open_from_usda_text(&usda)
-            .unwrap_or_else(|_| blank_usd_stage_bridge());
-        let context = pulsar_marketlab_ui::workspace::WorkspaceContext::from_usda_text(&usda)
-            .unwrap_or_else(|_| blank_workspace_context());
+        if !needs_full_stage_recompose(&stage, &nodes, &connections, &last_paths) {
+            let report = apply_incremental_canvas_sync(&stage, &nodes, &connections);
+            let paths = published_node_paths(&nodes, &connections);
+            self.last_published_node_paths = paths.clone();
+            let topology_changed = report.relationships_updated > 0;
+            self.workspace_context.update(cx, |ctx, cx| {
+                for prim_path in paths.values() {
+                    ctx.execution_engine_mut().dirty_graph_node(prim_path);
+                }
+                if topology_changed {
+                    ctx.invalidate_engine_topology_cache(cx);
+                }
+                cx.notify();
+            });
+            if !topology_changed {
+                self.graph_engine_cached = None;
+            }
+            self.usd_commit_generation = self.usd_commit_generation.wrapping_add(1);
+            self.push_status_log(format!(
+                "USD incremental sync — {} prim(s), {} relationship(s), {} attribute(s)",
+                report.prims_touched, report.relationships_updated, report.attributes_updated
+            ));
+            self.finish_canvas_stage_publish(cx, false, topology_changed);
+            return;
+        }
+
+        if self.canvas_stage_full_recompose_inflight {
+            self.canvas_stage_sync_revision = self.canvas_stage_sync_revision.wrapping_add(1);
+            return;
+        }
+
         let preserved_selection = self
             .workspace_context
             .read(cx)
@@ -1552,38 +2212,131 @@ impl TradingSystemWorkspace {
             .read(cx)
             .edit_target_layer()
             .map(str::to_string);
+        let preserved_overlays = self
+            .workspace_context
+            .read(cx)
+            .usd_stage()
+            .snapshot_runtime_overlays();
 
-        self.usd_stage.update(cx, |stage, cx| {
-            *stage = bridge;
-            cx.notify();
-        });
-        self.workspace_context.update(cx, |ctx, cx| {
-            *ctx = context;
-            if let Some(path) = preserved_selection.as_deref() {
-                if ctx.usd_stage().prim_exists(path) {
-                    ctx.set_selected_path(Some(path.to_string()), cx);
+        self.canvas_stage_full_recompose_inflight = true;
+        let context_handle = self.workspace_context.clone();
+        let nodes_for_publish = nodes.clone();
+        let connections_for_publish = connections.clone();
+        cx.spawn(async move |this, cx| {
+            let context = cx
+                .background_executor()
+                .spawn(async move {
+                    let usda = if nodes.is_empty() {
+                        blank_stage_usda()
+                    } else {
+                        compose_pipeline_usda(&nodes, &connections)
+                    };
+                    pulsar_marketlab_ui::workspace::WorkspaceContext::from_usda_text(&usda)
+                        .unwrap_or_else(|_| blank_workspace_context())
+                })
+                .await;
+            let _ = cx.update(|cx| {
+                context_handle.update(cx, |ctx, cx| {
+                    *ctx = context;
+                    ctx.restore_runtime_overlays_from(preserved_overlays);
+                    if let Some(path) = preserved_selection.as_deref() {
+                        if ctx.usd_stage().prim_exists(path) {
+                            ctx.set_selected_path(Some(path.to_string()), cx);
+                        }
+                    }
+                    if let Some(layer) = preserved_edit_target {
+                        if ctx.layer_identifiers().iter().any(|id| id == &layer) {
+                            ctx.set_edit_target_layer(Some(layer), cx);
+                        }
+                    }
+                    ctx.invalidate_engine_topology_cache(cx);
+                    cx.notify();
+                });
+
+                if let Some(workspace) = this.upgrade() {
+                    workspace.update(cx, |ws, cx| {
+                        ws.canvas_stage_full_recompose_inflight = false;
+                        ws.last_published_node_paths =
+                            published_node_paths(&nodes_for_publish, &connections_for_publish);
+                        ws.usd_commit_generation = ws.usd_commit_generation.wrapping_add(1);
+                        ws.push_status_log("USD full stage recompose complete".to_string());
+                        ws.finish_canvas_stage_publish(cx, true, true);
+                    });
                 }
-            }
-            if let Some(layer) = preserved_edit_target {
-                if ctx.layer_identifiers().iter().any(|id| id == &layer) {
-                    ctx.set_edit_target_layer(Some(layer), cx);
-                }
-            }
-            ctx.invalidate_engine_cache(cx);
-            cx.notify();
-        });
-        self.graph_engine_last_compiled_generation = u64::MAX;
-        if let Some(path) = preserved_selection.as_deref() {
-            self.selected_node_id = self.node_id_for_stage_path(path);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_canvas_stage_publish(
+        &mut self,
+        cx: &mut Context<Self>,
+        full_recompose: bool,
+        topology_invalidated: bool,
+    ) {
+        let _ = full_recompose;
+        if topology_invalidated {
+            self.graph_engine_last_compiled_generation = u64::MAX;
         }
-        self.sync_workspace_ledger(cx);
+        if let Some(path) = self
+            .workspace_context
+            .read(cx)
+            .selected_path()
+            .map(str::to_string)
+        {
+            self.selected_node_id = self.node_id_for_stage_path(&path);
+        }
+        self.schedule_workspace_ledger_sync_deferred(cx);
+        if self.pipeline_interaction_active() {
+            self.pipeline_sync_deferred = true;
+            self.graph_engine_recompile_pending = true;
+            self.schedule_session_autosave();
+            cx.notify();
+            return;
+        }
         let entity = cx.entity();
-        pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+        if topology_invalidated || full_recompose {
+            pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
+        } else {
+            self.graph_engine_cached = None;
+            self.request_graph_engine_sweep(cx);
+        }
         self.schedule_session_autosave();
+        cx.notify();
+    }
+
+    /// Debounced off-thread ledger rebuild keyed on USD commit generation.
+    pub(crate) fn schedule_workspace_ledger_sync_deferred(&mut self, cx: &mut Context<Self>) {
+        if self.ledger_sync_debounce_scheduled {
+            return;
+        }
+        self.ledger_sync_debounce_scheduled = true;
+        let target_generation = self.usd_commit_generation;
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PIPELINE_DEBOUNCE_MS))
+                .await;
+            let _ = cx.update(|cx| {
+                let Some(entity) = view.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |workspace, cx| {
+                    workspace.ledger_sync_debounce_scheduled = false;
+                    if workspace.usd_commit_generation != target_generation {
+                        workspace.schedule_workspace_ledger_sync_deferred(cx);
+                        return;
+                    }
+                    workspace.sync_workspace_ledger(cx);
+                });
+            });
+        })
+        .detach();
     }
 
     /// Re-run the background timeline sweep after asset OHLC data changes without a full USD recompose.
-    pub(crate) fn request_graph_engine_timeline_refresh(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn request_graph_engine_sweep(&mut self, cx: &mut Context<Self>) {
         self.graph_engine_asset_data_epoch = self.graph_engine_asset_data_epoch.wrapping_add(1);
         let entity = cx.entity();
         pulsar_marketlab_ui::workspace::begin_graph_engine_timeline_sweep(self, entity, cx);
@@ -1638,7 +2391,7 @@ impl TradingSystemWorkspace {
     }
 
     fn graph_engine_timeline_len(&self) -> usize {
-        self.playhead_total_bars.max(
+        self.historical_bar_count.max(
             self.asset_ohlc_history
                 .values()
                 .map(|bars| bars.len())
@@ -1690,45 +2443,21 @@ impl TradingSystemWorkspace {
             .unwrap_or_default()
     }
 
-    pub(crate) fn sync_playhead_bounds(&mut self) {
+    pub(crate) fn sync_historical_bar_count(&mut self) {
         let bars = self.chart_bars_for_selection();
-        self.playhead_total_bars = bars.len();
-        if self.playhead_total_bars == 0 {
-            self.playhead_current = 0;
-        } else {
-            self.playhead_current = self
-                .playhead_current
-                .min(self.playhead_total_bars - 1);
-        }
-        self.sync_playhead_time_from_index();
+        self.historical_bar_count = bars.len();
     }
 
-    /// Snap the evaluation playhead to the final bar of the active OHLC series.
-    pub(crate) fn snap_playhead_to_last_bar(&mut self) {
-        self.sync_playhead_bounds();
-        if self.playhead_total_bars > 0 {
-            self.playhead_current = self.playhead_total_bars - 1;
-            self.sync_playhead_time_from_index();
-        }
+    pub(crate) fn terminal_bar_index(&self) -> usize {
+        self.historical_bar_count.saturating_sub(1)
     }
 
-    pub(crate) fn sync_playhead_time_from_index(&mut self) {
+    pub(crate) fn terminal_tick_label(&self) -> String {
         let bars = self.chart_bars_for_selection();
         if bars.is_empty() {
-            self.playhead_time = 0.0;
-            return;
+            return "—".to_string();
         }
-        let index = self.playhead_current.min(bars.len() - 1);
-        self.playhead_time =
-            stage_time_for_bar_index(&bars, index).unwrap_or(self.playhead_current as f64);
-    }
-
-    pub(crate) fn playhead_tick_label(&self) -> String {
-        let bars = self.chart_bars_for_selection();
-        if bars.is_empty() {
-            return format!("t={:.2}", self.playhead_time);
-        }
-        let index = self.playhead_current.min(bars.len() - 1);
+        let index = self.terminal_bar_index().min(bars.len() - 1);
         format!(
             "{}/{} · {}",
             index + 1,
@@ -1737,20 +2466,39 @@ impl TradingSystemWorkspace {
         )
     }
 
+    pub(crate) fn take_cached_graph_engine(
+        &mut self,
+        generation: u64,
+    ) -> Option<pulsar_marketlab_core::MarketLabGraphEngine> {
+        if self.graph_engine_cached_generation != generation {
+            self.graph_engine_cached = None;
+            return None;
+        }
+        self.graph_engine_cached.take()
+    }
+
+    pub(crate) fn store_cached_graph_engine(
+        &mut self,
+        generation: u64,
+        engine: pulsar_marketlab_core::MarketLabGraphEngine,
+    ) {
+        self.graph_engine_cached_generation = generation;
+        self.graph_engine_cached = Some(engine);
+    }
+
     /// Rebuild the global inspector register from pre-computed vectorized streams.
     pub(crate) fn synchronize_inspector_view(&mut self) {
-        if self.playhead_total_bars == 0 || self.graph_engine_streams.is_empty() {
+        let Some(snapshot) = self.ui_read_snapshot() else {
+            return;
+        };
+        if self.historical_bar_count == 0 || snapshot.graph_engine_streams.is_empty() {
             return;
         }
-        let bar_index = self
-            .playhead_current
-            .min(self.playhead_total_bars.saturating_sub(1));
-        let tick = self.playhead_tick_label();
-        let nodes = self.nodes.clone();
-        let streams = self.graph_engine_streams.clone();
+        let bar_index = self.terminal_bar_index();
+        let tick = self.terminal_tick_label();
         let rows = build_inspector_rows_from_streams(
-            &streams,
-            &nodes,
+            &snapshot.graph_engine_streams,
+            &self.nodes,
             bar_index,
             &tick,
             |node| self.stage_prim_path_for_node_in_graph(node),
@@ -1760,21 +2508,91 @@ impl TradingSystemWorkspace {
         }
     }
 
-    /// Passive view-window sync: slice pre-computed buffers at the current bar index.
-    pub(crate) fn sync_view_window(&mut self, cx: &mut Context<Self>) {
-        if self.playhead_total_bars == 0 {
+    /// Push terminal-bar portfolio weights onto USD overlay (debounced; never blocks sweeps).
+    pub(crate) fn schedule_portfolio_weights_overlay_sync(&mut self, cx: &mut Context<Self>) {
+        if self.portfolio_weights_overlay_pending {
             return;
         }
-        self.sync_playhead_time_from_index();
+        self.portfolio_weights_overlay_pending = true;
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(entity) = view.upgrade() else {
+                return;
+            };
+            entity.update(cx, |workspace, cx| {
+                workspace.portfolio_weights_overlay_pending = false;
+                workspace.sync_portfolio_weights_stage_overlay(cx);
+            });
+        });
+    }
+
+    /// Push terminal-bar `outputs:weights` onto the session USD overlay for inspector/stage tree.
+    pub(crate) fn sync_portfolio_weights_stage_overlay(&mut self, cx: &mut Context<Self>) {
+        use openusd::sdf::Value;
+
+        let Some(node) = self.selected_portfolio_node() else {
+            return;
+        };
+        let Some(prim_path) = self.stage_prim_path_for_node_in_graph(node) else {
+            return;
+        };
+        let Some(encoded) = self.portfolio_weights_encoded_at_terminal_bar(&prim_path) else {
+            return;
+        };
+        let property_path = format!("{prim_path}.outputs:weights");
+        self.workspace_context.update(cx, |workspace, cx| {
+            let stage = workspace.usd_stage();
+            if stage
+                .field(&property_path, "default")
+                .as_ref()
+                .is_some_and(|value| matches!(value, Value::String(existing) if existing == &encoded))
+            {
+                return;
+            }
+            stage.set_field(&property_path, "default", Value::String(encoded));
+            cx.notify();
+        });
+    }
+
+    /// Passive view-window sync: slice pre-computed buffers at the current bar index.
+    pub(crate) fn sync_historical_timeline_map(&mut self, cx: &mut Context<Self>) {
+        let Some(labels) = self.timeline_bar_labels() else {
+            return;
+        };
+        let len = labels.len();
+        let first = labels.first().cloned().unwrap_or_default();
+        let last = labels.last().cloned().unwrap_or_default();
+        let key = (len, first, last);
+        if self.cached_timeline_map_key.as_ref() == Some(&key) {
+            return;
+        }
+        let map = pulsar_marketlab_core::HistoricalTimelineMap::from_dates(labels);
+        self.workspace_context.update(cx, |ctx, _cx| {
+            ctx.set_historical_timeline_map(map);
+        });
+        self.cached_timeline_map_key = Some(key);
+    }
+
+    pub(crate) fn sync_view_window(&mut self, cx: &mut Context<Self>) {
+        if self.historical_bar_count == 0 {
+            return;
+        }
+        self.sync_historical_timeline_map(cx);
         self.synchronize_inspector_view();
 
         if self.graph_engine_analytics_active() {
-            self.refresh_portfolio_diagnostics_cache();
+            self.schedule_portfolio_weights_overlay_sync(cx);
         }
         self.portfolio_diagnostics = self
             .portfolio_diagnostics_for_selection()
             .cloned()
-            .or_else(|| self.portfolio_diagnostics_cache.values().next().cloned());
+            .or_else(|| {
+                self.ui_read_snapshot()?
+                    .portfolio_diagnostics_cache
+                    .values()
+                    .next()
+                    .cloned()
+            });
 
         if self.graph_engine_analytics_active() {
             self.publish_metrics_telemetry_bridge(cx);
@@ -1915,8 +2733,7 @@ impl TradingSystemWorkspace {
                                                 }
                                             }
                                         }
-                                        workspace.synchronize_inspector_view();
-                                        cx.notify();
+                                        workspace.schedule_pipeline_ingestion_repaint(cx);
                                     });
                                 }
                             });
@@ -1935,25 +2752,22 @@ impl TradingSystemWorkspace {
                                             .entry(node_id)
                                             .or_default()
                                             .replace_series(timestamps, values);
+                                        workspace.rebuild_asset_chart_bitmaps_async(cx);
                                         if ohlc_bars.is_empty() {
                                             workspace.asset_ohlc_history.remove(&node_id);
+                                            workspace.asset_close_series.remove(&node_id);
                                         } else {
                                             workspace
                                                 .asset_ohlc_history
                                                 .insert(node_id, ohlc_bars.clone());
-                                            if let Some(node) =
-                                                workspace.nodes.iter().find(|node| node.id == node_id)
-                                            {
-                                                hydrate_market_stage_from_ohlc(
-                                                    &mut workspace.market_stage,
-                                                    &node.name,
-                                                    &ohlc_bars,
-                                                );
-                                            }
+                                            workspace.asset_close_series.insert(
+                                                node_id,
+                                                close_series_from_bars(&ohlc_bars),
+                                            );
                                         }
-                                        workspace.snap_playhead_to_last_bar();
-                                        workspace.request_graph_engine_timeline_refresh(cx);
-                                        workspace.sync_view_window(cx);
+                                        workspace.sync_historical_bar_count();
+                                        workspace.request_graph_engine_sweep(cx);
+                                        workspace.schedule_pipeline_ingestion_repaint(cx);
                                     });
                                 }
                             });
@@ -1968,22 +2782,12 @@ impl TradingSystemWorkspace {
                                 }
                             });
                         }
-                        PipelineSystemMessage::PlayheadSet {
-                            index,
-                            total_bars,
-                            tick_label: _,
-                        } => {
+                        PipelineSystemMessage::ChartBarCount { total_bars } => {
                             let _ = cx.update(|cx| {
                                 if let Some(view) = this.upgrade() {
                                     view.update(cx, |workspace, cx| {
-                                        workspace.playhead_total_bars = total_bars;
-                                        workspace.playhead_current = if total_bars == 0 {
-                                            0
-                                        } else {
-                                            index.min(total_bars - 1)
-                                        };
-                                        workspace.sync_playhead_time_from_index();
-                                        workspace.sync_view_window(cx);
+                                        workspace.historical_bar_count = total_bars;
+                                        workspace.schedule_pipeline_ingestion_repaint(cx);
                                     });
                                 }
                             });
@@ -2000,8 +2804,7 @@ impl TradingSystemWorkspace {
                                         let _ = workspace
                                             .market_stage
                                             .set_sample(&prim_path, &attribute, time, value);
-                                        workspace.synchronize_inspector_view();
-                                        cx.notify();
+                                        workspace.schedule_pipeline_ingestion_repaint(cx);
                                     });
                                 }
                             });

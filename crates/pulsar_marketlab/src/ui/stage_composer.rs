@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use gpui::*;
 use openusd::sdf::Value;
 use pulsar_marketlab_ui::workspace::{
-    StageComposerPane, StagePrimRow, StageTreeColumnHost, StageTreeColumnLayout,
+    LayerStackPane, StageComposerPane, StagePrimRow, StageTreeColumnHost, StageTreeColumnLayout,
     StageTreeColumnHandle,
 };
 
@@ -39,6 +39,14 @@ fn prim_weight_allocation(
     usd: &pulsar_marketlab_ui::workspace::ManagedUsdStage,
     path: &str,
 ) -> String {
+    let weights_path = format!("{path}.outputs:weights");
+    if let Some(Value::String(encoded)) = usd.field(&weights_path, "default") {
+        let trimmed = encoded.trim();
+        if !trimmed.is_empty() {
+            let leg_count = trimmed.split(',').filter(|part| !part.trim().is_empty()).count();
+            return format!("{leg_count} legs");
+        }
+    }
     let risk_path = format!("{path}.risk_budget");
     if let Some(Value::Float(weight)) = usd.field(&risk_path, "default") {
         return format!("{weight:.2}");
@@ -94,14 +102,14 @@ impl StageComposerPane for TradingSystemWorkspace {
     }
 
     fn stage_prim_rows(&self, cx: &App) -> Vec<StagePrimRow> {
-        let stage = self.usd_stage.read(cx);
         let usd = self.workspace_context.read(cx).usd_stage();
+        let stage = pulsar_marketlab::stage_bridge::UsdStageBridge::borrow(usd);
         let mut rows: Vec<StagePrimRow> = stage
             .stage_prim_rows()
             .unwrap_or_default()
             .into_iter()
             .map(|row| {
-                let type_name = stage.prim_type_name(&row.path);
+                let type_name = usd.prim_type_name(&row.path);
                 let type_class = prim_type_class(&row.path, type_name.as_deref()).to_string();
                 let weight_allocation = prim_weight_allocation(usd, &row.path);
                 let strategy_version = prim_strategy_version(usd, &row.path);
@@ -158,5 +166,35 @@ impl StageTreeColumnHost for TradingSystemWorkspace {
         drag: Option<(StageTreeColumnHandle, f32)>,
     ) {
         self.active_stage_tree_column_drag = drag;
+    }
+}
+
+impl LayerStackPane for TradingSystemWorkspace {
+    fn on_layer_stack_changed(&mut self, cx: &mut Context<Self>) {
+        self.topology_tree_cache_stage_generation = u64::MAX;
+        self.request_graph_engine_sweep(cx);
+        cx.notify();
+    }
+
+    fn prompt_import_portfolio_layer(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("USD Portfolio", &["usda", "usd"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                })
+                .await;
+            let Some(source) = picked else {
+                return;
+            };
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.import_portfolio_layer_from_disk(source, cx);
+            });
+        })
+        .detach();
     }
 }

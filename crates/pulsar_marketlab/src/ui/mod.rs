@@ -9,16 +9,17 @@ mod sidebar_inspector;
 mod ta_uber_inspector;
 mod split_layout;
 mod stage_composer;
+mod topology_dopesheet;
+mod workstation_host;
 pub mod telemetry_bridge;
 
 use gpui::*;
 
 use pulsar_marketlab_ui::workspace::{
-    render_workstation_layout, GraphEngineInvalidationHost, NodeCanvasPane, OtlEditorPane,
-    WorkstationLayoutHost,
+    render_workstation_layout, GraphEngineInvalidationHost, NodeCanvasPane,
 };
 
-use crate::workspace_state::{stage_time_for_bar_index, TradingSystemWorkspace};
+use crate::workspace_state::TradingSystemWorkspace;
 
 impl NodeCanvasPane for TradingSystemWorkspace {
     fn canvas_tabs(&self) -> &[pulsar_marketlab_ui::workspace::CanvasEnvironmentTab] {
@@ -92,9 +93,10 @@ impl NodeCanvasPane for TradingSystemWorkspace {
     }
 }
 
-impl WorkstationLayoutHost for TradingSystemWorkspace {}
-
 impl GraphEngineInvalidationHost for TradingSystemWorkspace {
+    type UiSnapshotBuildInput = crate::graph_ui_snapshot::GraphUiSnapshotBuildInput;
+    type UiSnapshot = crate::graph_ui_snapshot::GraphUiSnapshot;
+
     fn workspace_context(&self) -> &Entity<pulsar_marketlab_ui::workspace::WorkspaceContext> {
         &self.workspace_context
     }
@@ -103,22 +105,32 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
         self.bootstrapping
     }
 
-    fn graph_engine_asset_vectors(&self) -> std::collections::HashMap<String, Vec<f64>> {
+    fn graph_engine_asset_vectors(
+        &self,
+    ) -> std::collections::HashMap<String, pulsar_marketlab_core::SharedPriceColumn> {
+        use pulsar_marketlab_core::SharedPriceColumn;
+
         let mut vectors = std::collections::HashMap::new();
         for node in &self.nodes {
             if !node.node_type.is_asset_adaptor() {
                 continue;
             }
-            if let Some(bars) = self.asset_ohlc_history.get(&node.id) {
-                let symbol = self.asset_quote_symbol_for_node(node);
-                vectors.insert(symbol, bars.iter().map(|bar| bar.close).collect());
-            }
+            let Some(series) = self.asset_close_series.get(&node.id) else {
+                continue;
+            };
+            let Some(prim_path) = self.stage_prim_path_for_node_in_graph(node) else {
+                continue;
+            };
+            vectors.insert(
+                prim_path,
+                SharedPriceColumn::from_series(std::sync::Arc::clone(series)),
+            );
         }
         vectors
     }
 
     fn graph_engine_timeline_len(&self) -> usize {
-        self.playhead_total_bars.max(
+        self.historical_bar_count.max(
             self.asset_ohlc_history
                 .values()
                 .map(|bars| bars.len())
@@ -179,48 +191,137 @@ impl GraphEngineInvalidationHost for TradingSystemWorkspace {
         self.graph_engine_compile_error = error;
     }
 
+    fn graph_engine_pipeline_revision(&self) -> u64 {
+        self.pipeline_graph.revision()
+    }
+
+    fn graph_engine_cached_stage_snapshot(
+        &self,
+    ) -> Option<std::sync::Arc<pulsar_marketlab_core::StageGraphSnapshot>> {
+        let revision = self.pipeline_graph.revision();
+        if let Ok(guard) = self.stage_graph_snapshot_cache.lock() {
+            if let Some((cached_rev, snapshot)) = guard.as_ref() {
+                if *cached_rev == revision {
+                    return Some(std::sync::Arc::clone(snapshot));
+                }
+            }
+        }
+        None
+    }
+
+    fn graph_engine_store_stage_snapshot(
+        &mut self,
+        revision: u64,
+        snapshot: std::sync::Arc<pulsar_marketlab_core::StageGraphSnapshot>,
+    ) {
+        self.store_stage_graph_snapshot_cache(revision, snapshot);
+    }
+
+    fn graph_engine_compose_stage_usda(
+        &self,
+        _stage: &pulsar_marketlab_ui::workspace::ManagedUsdStage,
+        _cx: &gpui::App,
+    ) -> Option<String> {
+        None
+    }
+
+    fn graph_engine_direct_stage_snapshot(
+        &self,
+        _cx: &gpui::App,
+    ) -> Option<pulsar_marketlab_core::StageGraphSnapshot> {
+        Some(crate::canvas_graph_snapshot::build_stage_graph_snapshot_from_graph(
+            &self.nodes,
+            &self.connections,
+        ))
+    }
+
+    fn graph_engine_stage_snapshot(
+        &self,
+        stage: &pulsar_marketlab_ui::workspace::ManagedUsdStage,
+        cx: &gpui::App,
+    ) -> pulsar_marketlab_core::StageGraphSnapshot {
+        if let Some(cached) = self.graph_engine_cached_stage_snapshot() {
+            return (*cached).clone();
+        }
+        if let Some(snapshot) = self.graph_engine_direct_stage_snapshot(cx) {
+            return snapshot;
+        }
+        pulsar_marketlab_ui::workspace::build_stage_graph_snapshot(stage)
+    }
+
+    fn graph_ui_snapshot_build_input(&self, _cx: &gpui::App) -> Self::UiSnapshotBuildInput {
+        self.graph_ui_snapshot_build_input()
+    }
+
+    fn build_graph_ui_snapshot(
+        result: &pulsar_marketlab_core::TimelineExecutionResult,
+        input: &Self::UiSnapshotBuildInput,
+    ) -> Self::UiSnapshot {
+        crate::graph_ui_snapshot::build_graph_ui_snapshot(result, input)
+    }
+
+    fn take_cached_graph_engine(
+        &mut self,
+        generation: u64,
+    ) -> Option<pulsar_marketlab_core::MarketLabGraphEngine> {
+        self.take_cached_graph_engine(generation)
+    }
+
+    fn store_cached_graph_engine(
+        &mut self,
+        generation: u64,
+        engine: pulsar_marketlab_core::MarketLabGraphEngine,
+    ) {
+        self.store_cached_graph_engine(generation, engine);
+    }
+
     fn on_graph_engine_compile_failed(&mut self, error: String, cx: &mut Context<Self>) {
         self.push_status_log(format!("Graph engine compile failed: {error}"));
         cx.notify();
     }
 
+    fn graph_engine_invalidation_deferred(&self) -> bool {
+        self.pipeline_interaction_active()
+    }
+
     fn apply_graph_engine_timeline_result(
         &mut self,
         result: pulsar_marketlab_core::TimelineExecutionResult,
+        ui_snapshot: Option<std::sync::Arc<Self::UiSnapshot>>,
         cx: &mut Context<Self>,
     ) {
-        self.graph_engine_compile_error = None;
-        for stream in &result.streams {
-            for (bar_index, value) in &stream.samples {
-                let bar_idx = *bar_index as usize;
-                let time = self
-                    .asset_ohlc_history
-                    .values()
-                    .find_map(|bars| stage_time_for_bar_index(bars, bar_idx))
-                    .unwrap_or(*bar_index);
-                let _ = self.market_stage.set_sample(
-                    &stream.prim_path,
-                    &stream.attribute,
-                    time,
-                    *value as f32,
-                );
-            }
+        if self.pipeline_interaction_active() {
+            self.pending_timeline_result = Some(result);
+            self.pending_ui_snapshot = ui_snapshot;
+            return;
         }
-
-        self.refresh_portfolio_wealth_chart_cache(&result);
-        self.sync_view_window(cx);
+        self.apply_timeline_result_now(&result, ui_snapshot, cx);
     }
 }
 
 impl Render for TradingSystemWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.flush_metrics_telemetry_if_dirty(cx);
+        if !self.pipeline_interaction_active() && self.metrics_telemetry_dirty {
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                if let Some(entity) = view.upgrade() {
+                    entity.update(cx, |workspace, cx| {
+                        workspace.flush_metrics_telemetry_if_dirty(cx);
+                    });
+                }
+            });
+        }
         if !self.node_lookback_inputs_ready {
             cx.defer_in(window, |this, window, cx| {
                 this.ensure_node_lookback_inputs(window, cx);
             });
         }
-        self.ensure_otl_shader_param_inputs(window, cx);
+        if self.otl_shader_inputs_stale && self.active_drag_node_id.is_none() {
+            cx.defer_in(window, |this, window, cx| {
+                this.ensure_otl_shader_param_inputs(window, cx);
+                this.otl_shader_inputs_stale = false;
+            });
+        }
         render_workstation_layout(self, window, cx)
     }
 }

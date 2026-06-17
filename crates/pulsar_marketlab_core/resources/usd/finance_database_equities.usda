@@ -1,0 +1,11 @@
+#usda 1.0
+(
+    doc = "Hierarchical catalog data compiled from JerBouma/FinanceDatabase master metrics library."
+)
+
+def Scope "MarketLab"
+{
+    def Scope "Universe"
+    {
+    }
+}
