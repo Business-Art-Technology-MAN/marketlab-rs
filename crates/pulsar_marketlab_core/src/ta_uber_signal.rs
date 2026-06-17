@@ -249,7 +249,9 @@ pub fn compose_uber_script_src(config: &TaUberSignalConfig) -> String {
     let period = config.period.max(1);
     let alg = config.algorithm.to_ascii_lowercase();
     match config.archetype {
-        TaArchetype::Trend => format!("ta::{alg}(input, {period})"),
+        TaArchetype::Trend => {
+            format!("ta::cross(input, ta::{alg}(input, {period}))")
+        }
         TaArchetype::Volatility => match alg.as_str() {
             "historical_volatility" => format!(
                 "ta::historical_volatility(input, {period}, {})",
@@ -297,7 +299,10 @@ mod tests {
     #[test]
     fn compose_trend_sma_script() {
         let config = TaUberSignalConfig::trend("sma").with_period(14);
-        assert_eq!(compose_uber_script_src(&config), "ta::sma(input, 14)");
+        assert_eq!(
+            compose_uber_script_src(&config),
+            "ta::cross(input, ta::sma(input, 14))"
+        );
     }
 
     #[test]

@@ -570,7 +570,14 @@ impl MarketLabGraphEngine {
                     ..
                 },
             ) => {
-                let legs = collect_upstream_legs(&self.graph, index, &node_outputs, &self.node_prim_paths);
+                let quotes = build_asset_quotes_from_vectors(&ctx.asset_vectors);
+                let legs = collect_upstream_legs(
+                    &self.graph,
+                    index,
+                    &node_outputs,
+                    &self.node_prim_paths,
+                    &quotes,
+                );
                 let mut closures = closures_from_upstream_legs(&legs, method);
                 for closure in &mut closures {
                     let scale = conviction_scale_from_signal_series(&closure.signal_series);
@@ -1243,7 +1250,13 @@ fn legacy_portfolio_runtime(
 ) -> NodeRuntimeOutput {
     clear_prim_streams(streams, prim_path);
     clear_prim_token_streams(token_streams, prim_path);
-    let legs = collect_upstream_legs(graph, index, node_outputs, node_prim_paths);
+    let legs = collect_upstream_legs(
+        graph,
+        index,
+        node_outputs,
+        node_prim_paths,
+        quotes,
+    );
     let mut closures = closures_from_upstream_legs(&legs, method);
     for closure in &mut closures {
         let scale = conviction_scale_from_signal_series(&closure.signal_series);
@@ -1667,6 +1680,7 @@ fn collect_upstream_legs(
     index: NodeIndex,
     node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
     node_prim_paths: &[Arc<str>],
+    quotes: &HashMap<String, AssetQuote>,
 ) -> Vec<(String, Vec<f64>, ClosureLegKind)> {
     graph
         .neighbors_directed(index, Direction::Incoming)
@@ -1695,9 +1709,106 @@ fn collect_upstream_legs(
                 })
                 .unwrap_or_else(|| format!("leg_{upstream_index:?}"));
             let series = output.map(|o| o.scalar.clone()).unwrap_or_default();
+            let series = if leg_kind == ClosureLegKind::Asset {
+                trade_gate_series_from_ta_upstream(
+                    graph,
+                    upstream_index,
+                    &asset_id,
+                    series,
+                    node_outputs,
+                    quotes,
+                )
+            } else {
+                series
+            };
             (asset_id, series, leg_kind)
         })
         .collect()
+}
+
+/// Convert price-scale TA indicators into {-1,0,1} trade gates for portfolio sweeps.
+fn trade_gate_series_from_ta_upstream(
+    graph: &StableGraph<ExecutionNode, ()>,
+    upstream_index: NodeIndex,
+    asset_id: &str,
+    indicator_series: Vec<f64>,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+    quotes: &HashMap<String, AssetQuote>,
+) -> Vec<f64> {
+    let Some(ExecutionNode::SignalTransform { expression, .. }) =
+        graph.node_weight(upstream_index)
+    else {
+        return indicator_series;
+    };
+    if indicator_series.is_empty() || !expression.contains("ta::") {
+        return indicator_series;
+    }
+
+    if indicator_series.iter().all(|value| {
+        *value == -1.0 || *value == 0.0 || *value == 1.0
+    }) && indicator_series.iter().any(|value| *value != 0.0)
+    {
+        return indicator_series;
+    }
+
+    let price_series = graph
+        .neighbors_directed(upstream_index, Direction::Incoming)
+        .find_map(|neighbor| node_outputs.get(&neighbor).map(|output| output.scalar.clone()))
+        .or_else(|| {
+            quotes
+                .get(asset_id)
+                .map(|quote| quote.price_series.as_ref().to_vec())
+        })
+        .unwrap_or_default();
+    let len = price_series.len().min(indicator_series.len());
+    if len < 2 {
+        return indicator_series;
+    }
+    let price_series = &price_series[..len];
+    let indicator_series = &indicator_series[..len];
+
+    let expression = expression.to_ascii_lowercase();
+    if expression.contains("ta::sma")
+        || expression.contains("ta::ema")
+        || expression.contains("ta::wma")
+        || expression.contains("ta::hma")
+        || expression.contains("ta::tema")
+    {
+        return price_series
+            .iter()
+            .zip(indicator_series.iter())
+            .map(|(price, indicator)| {
+                if !price.is_finite() || !indicator.is_finite() {
+                    0.0
+                } else if *price > *indicator {
+                    1.0
+                } else if *price < *indicator {
+                    -1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+    }
+
+    if expression.contains("ta::rsi") || expression.contains("ta::cci") {
+        return indicator_series
+            .iter()
+            .map(|value| {
+                if !value.is_finite() {
+                    0.0
+                } else if *value > 50.0 {
+                    1.0
+                } else if *value < 50.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+    }
+
+    indicator_series.to_vec()
 }
 
 fn gather_upstream_into(
@@ -1726,6 +1837,23 @@ fn build_asset_quotes_from_window(window: &MarketTimelineWindow) -> HashMap<Stri
         );
     }
     quotes
+}
+
+fn build_asset_quotes_from_vectors(
+    asset_vectors: &HashMap<String, Arc<[f64]>>,
+) -> HashMap<String, AssetQuote> {
+    asset_vectors
+        .iter()
+        .map(|(path, series)| {
+            (
+                path.clone(),
+                AssetQuote {
+                    price_series: Arc::clone(series),
+                    contract_multiplier: 1.0,
+                },
+            )
+        })
+        .collect()
 }
 
 fn asset_vectors_from_window(window: &MarketTimelineWindow) -> HashMap<String, Arc<[f64]>> {

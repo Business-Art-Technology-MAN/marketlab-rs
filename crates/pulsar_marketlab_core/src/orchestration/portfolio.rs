@@ -305,6 +305,45 @@ fn direction_from_series(series: &[f64]) -> DirectionalDistribution {
     }
 }
 
+fn series_looks_like_trade_gate(series: &[f64]) -> bool {
+    !series.is_empty()
+        && series
+            .iter()
+            .all(|value| *value == -1.0 || *value == 0.0 || *value == 1.0)
+        && series.iter().any(|value| *value != 0.0)
+}
+
+fn closures_use_trade_gate_signals(closures: &[SymbolicOtlClosure]) -> bool {
+    closures.iter().any(|closure| {
+        closure.leg_kind == ClosureLegKind::Asset
+            && series_looks_like_trade_gate(&closure.signal_series)
+    })
+}
+
+fn trade_gate_signal_transition(bar_closures: &[SymbolicOtlClosure], bar: usize) -> bool {
+    if bar == 0 {
+        return true;
+    }
+    bar_closures.iter().any(|closure| {
+        if closure.leg_kind != ClosureLegKind::Asset
+            || !series_looks_like_trade_gate(&closure.signal_series)
+        {
+            return false;
+        }
+        let current = closure
+            .signal_series
+            .get(bar)
+            .copied()
+            .unwrap_or(0.0);
+        let previous = closure
+            .signal_series
+            .get(bar - 1)
+            .copied()
+            .unwrap_or(0.0);
+        current.signum() != previous.signum()
+    })
+}
+
 /// Map unitless closure weights to cash and unclipped nominal units at `bar_index`.
 pub fn map_closures_to_base_positions(
     closures: &[SymbolicOtlClosure],
@@ -404,12 +443,14 @@ pub fn integrate_portfolio(
 ) -> PortfolioIntegrationResult {
     let timeline_len = timeline_len.max(1);
     let hook = otl_hook.unwrap_or(&default_portfolio_otl_hook);
+    let trade_gate_mode = closures_use_trade_gate_signals(closures);
 
     let mut wealth = config.initial_capital;
     let mut peak_equity = config.initial_capital;
     let mut wealth_series = Vec::with_capacity(timeline_len);
     let mut tracking_matrix = Vec::new();
     let mut held_asset_units: HashMap<String, f64> = HashMap::new();
+    let mut held_leg_cash: HashMap<String, f64> = HashMap::new();
     let mut sub_portfolio_weights: HashMap<String, f64> = HashMap::new();
     let mut prior_leg_prices: HashMap<String, f64> = HashMap::new();
 
@@ -442,8 +483,12 @@ pub fn integrate_portfolio(
             continue;
         }
 
-        if bar == 0 {
-            let sizing_equity = config.initial_capital;
+        if bar == 0 || (trade_gate_mode && trade_gate_signal_transition(&bar_closures, bar)) {
+            let sizing_equity = if bar == 0 {
+                config.initial_capital
+            } else {
+                wealth
+            };
             let mut positions =
                 map_closures_to_base_positions(&bar_closures, quotes, sizing_equity, bar);
             apply_allocation_weights(
@@ -454,7 +499,11 @@ pub fn integrate_portfolio(
                 sizing_equity,
             );
 
-            let drawdown = 0.0;
+            let drawdown = if peak_equity > f64::EPSILON {
+                (peak_equity - sizing_equity) / peak_equity
+            } else {
+                0.0
+            };
             hook(PortfolioOtlState {
                 bar_index: bar,
                 timestamp,
@@ -466,8 +515,13 @@ pub fn integrate_portfolio(
                 otl_script: config.otl_script.as_str(),
             });
 
-            held_asset_units.clear();
-            sub_portfolio_weights.clear();
+            if bar == 0 {
+                held_asset_units.clear();
+                sub_portfolio_weights.clear();
+                if trade_gate_mode {
+                    held_leg_cash.clear();
+                }
+            }
             for (position, closure) in positions.iter().zip(bar_closures.iter()) {
                 match closure.leg_kind {
                     ClosureLegKind::SubPortfolio => {
@@ -475,8 +529,35 @@ pub fn integrate_portfolio(
                             .insert(position.asset_id.clone(), position.closure_raw_weight);
                     }
                     ClosureLegKind::Asset => {
-                        held_asset_units
-                            .insert(position.asset_id.clone(), position.nominal_units);
+                        if trade_gate_mode
+                            && series_looks_like_trade_gate(&closure.signal_series)
+                        {
+                            let signal = closure
+                                .signal_series
+                                .get(bar)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let quote = resolve_asset_quote(quotes, &closure.asset_id);
+                            let price = quote.price_at(bar).max(f64::MIN_POSITIVE);
+                            let multiplier = quote.contract_multiplier.max(f64::MIN_POSITIVE);
+                            let budget = sizing_equity * position.closure_raw_weight;
+                            if signal > 0.0 {
+                                let cash = held_leg_cash
+                                    .remove(&closure.asset_id)
+                                    .unwrap_or(budget);
+                                let units = cash / (price * multiplier);
+                                held_asset_units.insert(closure.asset_id.clone(), units);
+                            } else {
+                                let units = held_asset_units
+                                    .remove(&closure.asset_id)
+                                    .unwrap_or(0.0);
+                                let cash = units * price * multiplier;
+                                held_leg_cash.insert(closure.asset_id.clone(), cash);
+                            }
+                        } else {
+                            held_asset_units
+                                .insert(position.asset_id.clone(), position.nominal_units);
+                        }
                     }
                 }
             }
@@ -520,8 +601,13 @@ pub fn integrate_portfolio(
                         current_price,
                         quote.contract_multiplier,
                     );
-                    let leg_wealth =
+                    let mut leg_wealth =
                         units * current_price * quote.contract_multiplier.max(f64::MIN_POSITIVE);
+                    if trade_gate_mode {
+                        if let Some(cash) = held_leg_cash.get(&closure.asset_id) {
+                            leg_wealth += *cash;
+                        }
+                    }
                     let weight = if wealth > f64::EPSILON {
                         leg_wealth / wealth
                     } else {

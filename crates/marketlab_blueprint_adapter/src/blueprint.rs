@@ -87,6 +87,24 @@ pub fn finance_property_fields(node_type: &str) -> Vec<FinancePropertyField> {
         .collect()
 }
 
+/// True when a finance property should use a numeric editor.
+pub fn finance_property_is_numeric(node_type: &str, property_id: &str) -> bool {
+    let catalog = finance_node_catalog();
+    let Some(meta) = catalog.get(node_type) else {
+        return false;
+    };
+    meta.property_schema
+        .iter()
+        .find(|schema| schema.id == property_id)
+        .map(|schema| {
+            matches!(
+                schema.ty.to_type_string().as_str(),
+                "u32" | "i32" | "u64" | "i64" | "f32" | "f64"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Default property values when a finance node is placed on the canvas.
 pub fn finance_property_defaults(node_type: &str) -> HashMap<String, String> {
     let catalog = finance_node_catalog();

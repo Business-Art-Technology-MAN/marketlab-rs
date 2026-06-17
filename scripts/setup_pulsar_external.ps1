@@ -22,6 +22,13 @@ function Ensure-Clone($name, $url) {
 Ensure-Clone "Plugin_Blueprints" "https://github.com/Far-Beyond-Pulsar/Plugin_Blueprints.git"
 Ensure-Clone "Graphy" "https://github.com/Far-Beyond-Pulsar/Graphy.git"
 
+$applyPatches = Join-Path $root "scripts\apply_plugin_blueprints_patches.ps1"
+if (Test-Path $applyPatches) {
+    & $applyPatches
+} else {
+    Write-Warning "Patch script not found: $applyPatches — apply finance patches manually."
+}
+
 $pbpCargo = Join-Path $external "Plugin_Blueprints\.cargo"
 $configTemplate = Join-Path $root "scripts\patches\plugin_blueprints_cargo_config.toml"
 if (Test-Path $configTemplate) {
@@ -31,7 +38,8 @@ if (Test-Path $configTemplate) {
 }
 
 Write-Host ""
-Write-Host "Finance editor (after applying patches in scripts/patches/README.md):"
+Write-Host "Finance editor:"
+Write-Host "  .\scripts\run_finance_editor.ps1"
 Write-Host "  cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml"
 Write-Host ""
 Write-Host "Legacy spike example:"

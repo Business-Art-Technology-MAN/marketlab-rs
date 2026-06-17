@@ -573,6 +573,47 @@ mod tests {
     }
 
     #[test]
+    fn ta_trend_period_is_emitted_in_stage_snapshot_script() {
+        let snapshot_with_period = |period: u32| {
+            let mut graph = GraphDescription::new("test");
+            graph.add_node(NodeInstance::new(
+                "spy",
+                type_id::FINANCIAL_ASSET,
+                Position::new(0.0, 0.0),
+            ));
+            let mut trend = NodeInstance::new(
+                "trend",
+                type_id::TA_TREND,
+                Position::new(100.0, 0.0),
+            );
+            trend
+                .properties
+                .insert("period".into(), graphy::JsonValue::Number(period.into()));
+            graph.add_node(trend);
+            graph_description_to_stage_snapshot(&graph)
+        };
+
+        let short = snapshot_with_period(5);
+        let long = snapshot_with_period(120);
+        let short_ta = short
+            .prims
+            .iter()
+            .find(|prim| prim.type_name == "OtlTaUberSignal")
+            .expect("ta prim");
+        let long_ta = long
+            .prims
+            .iter()
+            .find(|prim| prim.type_name == "OtlTaUberSignal")
+            .expect("ta prim");
+        assert_eq!(short_ta.attributes.get("inputs:period"), Some(&"5".to_string()));
+        assert_eq!(long_ta.attributes.get("inputs:period"), Some(&"120".to_string()));
+        assert_ne!(
+            short_ta.attributes.get("inputs:script_src"),
+            long_ta.attributes.get("inputs:script_src")
+        );
+    }
+
+    #[test]
     fn bare_ticker_csv_path_uses_bundled_sample_data() {
         let mut warnings = Vec::new();
         let (prices, loaded, synthetic) = load_asset_close_series(

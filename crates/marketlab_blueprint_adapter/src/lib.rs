@@ -14,6 +14,7 @@ mod blueprint;
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
     finance_primary_output_pin, finance_property_defaults, finance_property_fields,
+    finance_property_is_numeric,
     is_marketlab_finance_node, merge_finance_node_metadata, FinancePropertyField,
     FINANCE_SIGNAL_TYPE,
 };

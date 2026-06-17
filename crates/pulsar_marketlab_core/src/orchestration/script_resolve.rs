@@ -260,6 +260,9 @@ mod tests {
             uber_config: Some(&config),
             ..Default::default()
         };
-        assert_eq!(resolve_otl_script_src(&ctx), "ta::sma(input, 14)");
+        assert_eq!(
+            resolve_otl_script_src(&ctx),
+            "ta::cross(input, ta::sma(input, 14))"
+        );
     }
 }

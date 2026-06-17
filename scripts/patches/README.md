@@ -19,9 +19,25 @@ This folder documents how to run the MarketLab finance blueprint editor on your 
    .\scripts\setup_pulsar_external.ps1
    ```
 
-3. Apply the finance UI patches to `external/Plugin_Blueprints` (see file list below), or copy from a machine that already has them. That folder is not in git.
+3. Apply finance UI patches (automatic if you used setup script):
+
+   ```powershell
+   .\scripts\apply_plugin_blueprints_patches.ps1
+   ```
+
+   Or re-run setup (clone + patch + shared target config):
+
+   ```powershell
+   .\scripts\setup_pulsar_external.ps1
+   ```
 
 4. Run the editor:
+
+   ```powershell
+   .\scripts\run_finance_editor.ps1
+   ```
+
+   Or directly:
 
    ```powershell
    cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml
@@ -45,7 +61,21 @@ python scripts/generate_bundled_sample_csvs.py
 
 ## Finance UI patches (external folder)
 
-After `setup_pulsar_external.ps1`, edit files under `external/Plugin_Blueprints`:
+Tracked patch: `scripts/patches/plugin_blueprints_marketlab_finance.patch`
+
+Apply after `setup_pulsar_external.ps1`:
+
+```powershell
+.\scripts\apply_plugin_blueprints_patches.ps1
+```
+
+To refresh the patch after editing `external/Plugin_Blueprints`:
+
+```powershell
+cd external/Plugin_Blueprints
+git add -A
+git diff --cached HEAD > ../../scripts/patches/plugin_blueprints_marketlab_finance.patch
+```
 
 | Area | Files |
 |------|--------|
@@ -53,12 +83,12 @@ After `setup_pulsar_external.ps1`, edit files under `external/Plugin_Blueprints`
 | Compile + sweep | `src/features/compilation/compiler.rs` |
 | Panel state | `src/editor/panel.rs` |
 | Workspace layout | `src/editor/workspace.rs` |
-| Panels | `src/editor/workspace_panels.rs` |
+| Panels + property flush | `src/editor/workspace_panels.rs` |
 | Properties UI | `src/ui_components/properties.rs` |
 | Wealth chart | `src/ui_components/finance_wealth_chart.rs` |
+| Save / Open | `src/io/save_load.rs`, `src/editor/toolbar.rs` |
 | Pin compatibility | `src/core/types.rs` |
 | Definitions | `src/core/definitions.rs` |
-| Toolbar | `src/editor/toolbar.rs` |
 | Example | `examples/standalone_finance.rs` |
 
 `external/Plugin_Blueprints/Cargo.toml` needs:
