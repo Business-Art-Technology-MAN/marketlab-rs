@@ -1,15 +1,15 @@
 //! Run a timeline sweep from a compiled [`StageGraphSnapshot`].
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use pulsar_marketlab_core::{
     MarketLabGraphEngine, SharedPriceColumn, StageGraphPrim, StageGraphSnapshot,
 };
 
+use crate::asset_data::load_asset_close_series;
+
 const DEFAULT_BAR_COUNT: usize = 252;
-const FLAT_FALLBACK_PRICE: f64 = 100.0;
 
 /// Per-portfolio sweep output for the blueprint editor UI.
 #[derive(Clone, Debug, PartialEq)]
@@ -267,189 +267,6 @@ fn portfolio_label(prim: &StageGraphPrim) -> String {
         .unwrap_or_else(|| "Portfolio".to_string())
 }
 
-fn flat_series(len: usize) -> Vec<f64> {
-    vec![FLAT_FALLBACK_PRICE; len.max(1)]
-}
-
-fn load_asset_close_series(
-    symbol: &str,
-    explicit_csv: Option<&String>,
-    prim_path: &str,
-    warnings: &mut Vec<String>,
-) -> (Vec<f64>, bool, bool) {
-    let mut candidates = resolve_asset_csv_candidates(symbol, explicit_csv);
-    candidates.sort_by_key(|path| path.is_bundled);
-    candidates.dedup_by(|left, right| left.path == right.path);
-
-    for candidate in candidates {
-        match load_close_prices(&candidate.path) {
-            Ok(prices) if prices.len() >= 2 => return (prices, true, false),
-            Ok(_) => warnings.push(format!(
-                "{prim_path}: CSV `{}` has too few price rows",
-                candidate.path.display()
-            )),
-            Err(error) => warnings.push(format!(
-                "{prim_path}: CSV load failed for `{}` ({error})",
-                candidate.path.display()
-            )),
-        }
-    }
-
-    warnings.push(format!(
-        "{prim_path} ({symbol}): using flat synthetic prices — set csv_path to a Yahoo CSV or leave empty for bundled data/{}.csv",
-        symbol.to_ascii_lowercase()
-    ));
-    (flat_series(DEFAULT_BAR_COUNT), false, true)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CsvCandidate {
-    path: std::path::PathBuf,
-    is_bundled: bool,
-}
-
-fn resolve_asset_csv_candidates(symbol: &str, explicit: Option<&String>) -> Vec<CsvCandidate> {
-    let mut candidates = Vec::new();
-
-    if let Some(path) = explicit
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        if !is_bare_ticker_token(path) {
-            if let Some(resolved) = resolve_existing_path(path) {
-                candidates.push(CsvCandidate {
-                    path: resolved,
-                    is_bundled: false,
-                });
-            }
-        }
-    }
-
-    if !symbol.is_empty() {
-        if let Some(bundled) = bundled_data_csv(symbol) {
-            candidates.push(CsvCandidate {
-                path: bundled,
-                is_bundled: true,
-            });
-        }
-        for path in bundled_csv_candidates(symbol) {
-            candidates.push(CsvCandidate {
-                path,
-                is_bundled: true,
-            });
-        }
-    }
-
-    candidates
-}
-
-fn is_bare_ticker_token(value: &str) -> bool {
-    let token = value.trim();
-    !token.contains(['/', '\\'])
-        && !token.contains('.')
-        && !token.is_empty()
-        && token.len() <= 6
-        && token.chars().all(|ch| ch.is_ascii_alphanumeric())
-}
-
-fn bundled_data_csv(symbol: &str) -> Option<std::path::PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../pulsar_marketlab/data")
-        .join(format!("{}.csv", symbol.to_ascii_uppercase()));
-    path.is_file().then_some(path)
-}
-
-fn resolve_existing_path(path: &str) -> Option<std::path::PathBuf> {
-    let resolved = resolve_csv_path(path);
-    resolved.is_file().then_some(resolved)
-}
-
-fn load_close_prices(path: &std::path::Path) -> Result<Vec<f64>, String> {
-    if !path.is_file() {
-        return Err(format!("file not found at {}", path.display()));
-    }
-
-    let mut reader = csv::Reader::from_path(path)
-        .map_err(|error| format!("open {}: {error}", path.display()))?;
-    let headers = reader
-        .headers()
-        .map_err(|error| format!("read header: {error}"))?
-        .clone();
-
-    let close_idx = csv_header_index(&headers, &["Adj Close", "Close"]).ok_or_else(|| {
-        format!(
-            "missing Close/Adj Close column in `{}` (headers: {})",
-            path.display(),
-            headers.iter().collect::<Vec<_>>().join(", ")
-        )
-    })?;
-
-    let mut closes = Vec::new();
-    for (offset, record) in reader.records().enumerate() {
-        let record = record.map_err(|error| format!("row {}: {error}", offset + 2))?;
-        let first = record.get(0).unwrap_or("").trim();
-        if first.eq_ignore_ascii_case("Ticker") || first.eq_ignore_ascii_case("Date") {
-            continue;
-        }
-        let Some(raw) = record.get(close_idx) else {
-            continue;
-        };
-        let trimmed = raw.trim().trim_matches('"');
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = trimmed.parse::<f64>() else {
-            continue;
-        };
-        closes.push(value);
-    }
-
-    if closes.is_empty() {
-        return Err(format!("no numeric close prices parsed from {}", path.display()));
-    }
-    Ok(closes)
-}
-
-fn csv_header_index(headers: &csv::StringRecord, names: &[&str]) -> Option<usize> {
-    for name in names {
-        if let Some(index) = headers.iter().position(|cell| cell.trim() == *name) {
-            return Some(index);
-        }
-    }
-    None
-}
-
-fn resolve_csv_path(path: &str) -> std::path::PathBuf {
-    let candidate = Path::new(path);
-    if candidate.is_file() {
-        return candidate.to_path_buf();
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let joined = cwd.join(candidate);
-        if joined.is_file() {
-            return joined;
-        }
-    }
-    candidate.to_path_buf()
-}
-
-fn bundled_csv_candidates(symbol: &str) -> Vec<std::path::PathBuf> {
-    let rel = format!("crates/pulsar_marketlab/data/{symbol}.csv");
-    let mut candidates = vec![
-        Path::new(&rel).to_path_buf(),
-        Path::new("data").join(format!("{symbol}.csv")),
-    ];
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(&rel));
-        let mut dir = cwd.as_path();
-        while let Some(parent) = dir.parent() {
-            candidates.push(parent.join(&rel));
-            dir = parent;
-        }
-    }
-    candidates
-}
-
 #[cfg(test)]
 mod tests {
     use pulsar_marketlab_core::{GraphCompileWire, StageGraphPrim};
@@ -625,22 +442,5 @@ mod tests {
         assert!(loaded, "warnings: {warnings:?}");
         assert!(!synthetic);
         assert!(prices.len() >= 2);
-    }
-
-    #[test]
-    fn skips_modern_yahoo_ticker_metadata_row() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("modern.csv");
-        std::fs::write(
-            &path,
-            "Price,Close,High,Low,Open,Volume\n\
-             Ticker,SPY,SPY,SPY,SPY,SPY\n\
-             Date,,,,,\n\
-             2024-01-02,472.65,473.67,470.05,472.16,123456000\n",
-        )
-        .expect("write csv");
-        let closes = load_close_prices(&path).expect("parse modern yahoo csv");
-        assert_eq!(closes.len(), 1);
-        assert!((closes[0] - 472.65).abs() < f64::EPSILON);
     }
 }

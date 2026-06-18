@@ -3,6 +3,7 @@
 //! - [`FinanceNodeMetadataProvider`] — Graphy node palette + validation metadata
 //! - [`FinanceGraphAdapter`] — `GraphDescription` → [`StageGraphSnapshot`] (engine input)
 
+mod asset_data;
 mod compile;
 mod metadata;
 mod provider;
@@ -21,6 +22,9 @@ pub use blueprint::{
 
 pub use metadata::finance_node_catalog;
 pub use provider::FinanceNodeMetadataProvider;
+pub use asset_data::{
+    load_finance_asset_preview, FinanceAssetPreview, FinanceOhlcBar,
+};
 pub use compile::{compile_finance_graph, FinanceCompileReport};
 pub use sweep::{
     run_finance_sweep, wealth_sparkline, FinancePortfolioSweepSummary, FinanceSweepResult,
@@ -30,6 +34,4 @@ pub use snapshot::{
     finance_node_prim_paths, graph_description_to_stage_snapshot, FinanceGraphAdapter,
 };
 pub use types::{category, type_id, FinanceNodeKind, PORTFOLIO_ALLOCATION_TOKENS};
-
-pub use graphy::{GraphDescription, NodeMetadata, NodeMetadataProvider};
 pub use pulsar_marketlab_core::StageGraphSnapshot;
