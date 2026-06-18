@@ -57,6 +57,74 @@ pub fn is_marketlab_finance_node(node_type: &str) -> bool {
     node_type.starts_with("marketlab.")
 }
 
+/// Strategy channel property ids (analytics nodes).
+pub const FINANCE_STRATEGY_CHANNELS: &[&str] = &["aggression", "decay", "elasticity"];
+
+/// Extra canvas body height (graph units) for inline strategy sliders.
+pub const FINANCE_STRATEGY_BLOCK_HEIGHT: f32 = 72.0;
+
+/// Analytics / OTL nodes expose unified strategy channels on the node face.
+pub fn finance_has_strategy_channels(definition_id: &str) -> bool {
+    finance_is_analytics_node(definition_id)
+}
+
+pub fn finance_is_analytics_node(definition_id: &str) -> bool {
+    matches!(
+        definition_id,
+        type_id::OTL_OPERATOR
+            | type_id::TA_TREND
+            | type_id::TA_VOLATILITY
+            | type_id::TA_OSCILLATOR
+            | type_id::TA_CHANNEL
+    )
+}
+
+/// GPU header tint by finance namespace (green / blue / violet).
+pub fn finance_node_header_rgba(definition_id: &str) -> Option<[f32; 4]> {
+    if !is_marketlab_finance_node(definition_id) {
+        return None;
+    }
+    if definition_id.starts_with("marketlab.universe.") {
+        return Some([0.22, 0.72, 0.38, 1.0]);
+    }
+    if definition_id.starts_with("marketlab.analytics.") {
+        return Some([0.28, 0.52, 0.92, 1.0]);
+    }
+    if definition_id.starts_with("marketlab.portfolio.") {
+        return Some([0.62, 0.38, 0.88, 1.0]);
+    }
+    None
+}
+
+pub fn finance_node_layout_extra_height(definition_id: &str) -> f32 {
+    if finance_has_strategy_channels(definition_id) {
+        FINANCE_STRATEGY_BLOCK_HEIGHT
+    } else {
+        0.0
+    }
+}
+
+pub fn finance_strategy_channel_fields() -> &'static [FinancePropertyField] {
+    use std::sync::OnceLock;
+    static FIELDS: OnceLock<Vec<FinancePropertyField>> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        FINANCE_STRATEGY_CHANNELS
+            .iter()
+            .map(|id| FinancePropertyField {
+                id: (*id).to_string(),
+                label: match *id {
+                    "aggression" => "Aggression",
+                    "decay" => "Decay",
+                    "elasticity" => "Elasticity",
+                    _ => id,
+                }
+                .to_string(),
+            })
+            .collect()
+    });
+    FIELDS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
 /// Whether two pin type names may connect in the finance graph.
 pub fn finance_data_types_compatible(a: &str, b: &str) -> bool {
     fn is_finance_stream(type_name: &str) -> bool {
@@ -168,9 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn finance_defaults_include_csv_path() {
-        let defaults = finance_property_defaults(type_id::FINANCIAL_ASSET);
-        assert!(defaults.contains_key("csv_path"));
-        assert!(defaults.contains_key("symbol"));
+    fn analytics_nodes_include_strategy_channels() {
+        let fields = finance_property_fields(type_id::TA_TREND);
+        assert!(fields.iter().any(|field| field.id == "aggression"));
+        assert!(fields.iter().any(|field| field.id == "decay"));
+        assert!(fields.iter().any(|field| field.id == "elasticity"));
+    }
+
+    #[test]
+    fn finance_header_colors_by_namespace() {
+        assert!(finance_node_header_rgba(type_id::FINANCIAL_ASSET).is_some());
+        assert!(finance_node_header_rgba(type_id::TA_TREND).is_some());
+        assert!(finance_node_header_rgba(type_id::PORTFOLIO_INTEGRATOR).is_some());
     }
 }

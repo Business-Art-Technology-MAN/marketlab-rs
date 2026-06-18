@@ -32,7 +32,7 @@ pub use orchestration::{
     OslParameter, ScriptCompileContext, ScriptSignature, GraphCompileWire, GraphEngineError,
     MultiSeriesClosure, OtlScriptContext, MarketLabGraphEngine, PortfolioIntegrationResult,
     ComposedAssetMeta, PathBindingIndex, PortfolioTrackingFrame, SeriesClosure, SignalTransformFn,
-    StageGraphPrim, StageGraphSnapshot,
+    StageGraphPrim, StageGraphSnapshot, StageSweepProfile,
     SymbolicOtlClosure, TimelineExecutionResult, Token, AssetQuote, ClosureLegKind,
     DirectionalDistribution, compute_allocation_weights,
 };

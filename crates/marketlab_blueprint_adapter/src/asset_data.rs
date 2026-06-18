@@ -1,6 +1,9 @@
 //! CSV resolution and OHLC loading for finance asset nodes (shared by sweep + UI preview).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use pulsar_marketlab_core::StageGraphSnapshot;
 
 const DEFAULT_BAR_COUNT: usize = 252;
 const FLAT_FALLBACK_PRICE: f64 = 100.0;
@@ -76,6 +79,33 @@ pub fn load_finance_asset_preview(
         warnings,
         bars: flat_ohlc_series(DEFAULT_BAR_COUNT),
     }
+}
+
+/// OHLC previews keyed by graph node id (post-compile cache for the finance editor).
+pub fn finance_asset_previews_for_snapshot(
+    snapshot: &StageGraphSnapshot,
+    node_prim_paths: &HashMap<String, String>,
+) -> HashMap<String, FinanceAssetPreview> {
+    let mut previews = HashMap::new();
+    for (node_id, prim_path) in node_prim_paths {
+        let Some(prim) = snapshot.prims.iter().find(|prim| &prim.path == prim_path) else {
+            continue;
+        };
+        if prim.type_name != "FinancialAsset" {
+            continue;
+        }
+        let symbol = prim
+            .attributes
+            .get("inputs:symbol")
+            .map(|value| value.as_str())
+            .unwrap_or("SPY");
+        let csv_path = prim.attributes.get("inputs:csv_path").map(|value| value.as_str());
+        previews.insert(
+            node_id.clone(),
+            load_finance_asset_preview(symbol, csv_path),
+        );
+    }
+    previews
 }
 
 /// Close prices for engine sweep (same resolver as [`load_finance_asset_preview`]).
@@ -308,6 +338,28 @@ mod tests {
         let preview = load_finance_asset_preview("SPY", None);
         let closes: Vec<f64> = preview.bars.iter().map(|bar| bar.close).collect();
         assert_eq!(preview.close_series(), closes);
+    }
+
+    #[test]
+    fn finance_asset_previews_for_snapshot_reads_prim_attributes() {
+        use pulsar_marketlab_core::{StageGraphPrim, StageGraphSnapshot};
+
+        let mut paths = HashMap::new();
+        paths.insert("node-1".to_string(), "/MarketLab/Universe/SPY".to_string());
+        let mut snapshot = StageGraphSnapshot::default();
+        snapshot.prims.push(StageGraphPrim {
+            path: "/MarketLab/Universe/SPY".to_string(),
+            type_name: "FinancialAsset".to_string(),
+            attributes: HashMap::from([
+                ("inputs:symbol".to_string(), "SPY".to_string()),
+                ("inputs:active".to_string(), "true".to_string()),
+            ]),
+        });
+
+        let previews = finance_asset_previews_for_snapshot(&snapshot, &paths);
+        let preview = previews.get("node-1").expect("preview");
+        assert!(preview.loaded_from_csv, "{:?}", preview.warnings);
+        assert!(!preview.bars.is_empty());
     }
 
     #[test]

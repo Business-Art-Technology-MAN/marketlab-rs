@@ -110,6 +110,17 @@ pub struct StageGraphSnapshot {
     pub asset_registry: HashMap<String, ComposedAssetMeta>,
 }
 
+/// Runtime sweep overrides from the Hydra stage tree (mute / solo / variants).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StageSweepProfile {
+    /// Absolute prim paths whose OTL/transform step is bypassed (passthrough or skip).
+    pub muted_prim_paths: std::collections::HashSet<String>,
+    /// When set, only this prim executes on its topological level; siblings are masked.
+    pub solo_prim_path: Option<String>,
+    /// Portfolio allocation method overrides keyed by absolute prim path.
+    pub allocation_overrides: HashMap<String, String>,
+}
+
 /// Declarative compile spec with explicit node payloads and wires.
 #[derive(Debug, Default)]
 pub struct GraphCompileSpec {
@@ -672,6 +683,7 @@ impl MarketLabGraphEngine {
         timeline_len: usize,
         indices: &[NodeIndex],
         tier_workspace: &mut TimelineTierWorkspace,
+        profile: &StageSweepProfile,
     ) -> HashSet<NodeIndex> {
         let mut completed = HashSet::new();
         let parallel_ctx = ParallelSweepContext {
@@ -683,6 +695,22 @@ impl MarketLabGraphEngine {
 
         let mut jobs = Vec::new();
         for &index in indices {
+            if !should_execute_on_level(self, index, indices, profile) {
+                continue;
+            }
+            let prim_path = self.prim_path_for_index(index).to_string();
+            if profile.muted_prim_paths.contains(&prim_path) {
+                if let Some(runtime) = passthrough_upstream_runtime(
+                    &self.graph,
+                    index,
+                    timeline_len,
+                    &self.sweep_scratch.node_outputs,
+                ) {
+                    self.sweep_scratch.node_outputs.insert(index, runtime);
+                    completed.insert(index);
+                }
+                continue;
+            }
             let Some(node) = self.graph.node_weight(index) else {
                 continue;
             };
@@ -781,6 +809,14 @@ impl MarketLabGraphEngine {
     ///
     /// Closure trees and OTL tiers must already be baked (see [`Self::compile_otl_scripts`]).
     pub fn sweep(&mut self, window: &MarketTimelineWindow) -> TimelineExecutionResult {
+        self.sweep_with_profile(window, &StageSweepProfile::default())
+    }
+
+    pub fn sweep_with_profile(
+        &mut self,
+        window: &MarketTimelineWindow,
+        profile: &StageSweepProfile,
+    ) -> TimelineExecutionResult {
         let timeline_len = window.timeline_len();
         if timeline_len == 0 || self.execution_order.is_empty() {
             return TimelineExecutionResult::default();
@@ -813,22 +849,40 @@ impl MarketLabGraphEngine {
             let run_parallel_batch = parallel_eligible.len() >= 2;
             let parallel_set: HashSet<NodeIndex> = parallel_eligible.iter().copied().collect();
 
-            for index in level {
-                if run_parallel_batch && parallel_set.contains(&index) {
+            for index in level.iter().copied() {
+                if !should_execute_on_level(self, index, &level, profile) {
                     continue;
                 }
+
                 let prim_path = self
                     .node_prim_paths
                     .get(index.index())
                     .map(|path| path.to_string())
                     .filter(|path| !path.is_empty())
                     .unwrap_or_else(|| "node".to_string());
+
+                if profile.muted_prim_paths.contains(&prim_path) {
+                    if let Some(runtime) = muted_node_runtime(
+                        &self.graph,
+                        index,
+                        timeline_len,
+                        &self.sweep_scratch.node_outputs,
+                    ) {
+                        self.sweep_scratch.node_outputs.insert(index, runtime);
+                    }
+                    continue;
+                }
+
+                if run_parallel_batch && parallel_set.contains(&index) {
+                    continue;
+                }
                 let runtime = self.execute_timeline_node(
                     index,
                     &prim_path,
                     timeline_len,
                     window,
                     &mut tier_workspace,
+                    profile,
                 );
                 self.sweep_scratch.node_outputs.insert(index, runtime);
             }
@@ -838,6 +892,7 @@ impl MarketLabGraphEngine {
                     timeline_len,
                     &parallel_eligible,
                     &mut tier_workspace,
+                    profile,
                 );
             }
         }
@@ -849,14 +904,27 @@ impl MarketLabGraphEngine {
         }
     }
 
-    /// Convenience: activate window then sweep (allocates once at the boundary).
+    /// Convenience: activate window then sweep (allocations permitted at the boundary).
     pub fn execute_timeline(
         &mut self,
         asset_vectors: HashMap<String, SharedPriceColumn>,
         timeline_len: usize,
     ) -> TimelineExecutionResult {
+        self.execute_timeline_with_profile(
+            asset_vectors,
+            timeline_len,
+            &StageSweepProfile::default(),
+        )
+    }
+
+    pub fn execute_timeline_with_profile(
+        &mut self,
+        asset_vectors: HashMap<String, SharedPriceColumn>,
+        timeline_len: usize,
+        profile: &StageSweepProfile,
+    ) -> TimelineExecutionResult {
         let window = Self::activate_timeline(asset_vectors, timeline_len);
-        self.sweep(&window)
+        self.sweep_with_profile(&window, profile)
     }
 
     fn prim_path_for_index(&self, index: NodeIndex) -> &str {
@@ -874,6 +942,7 @@ impl MarketLabGraphEngine {
         timeline_len: usize,
         window: &MarketTimelineWindow,
         tier_workspace: &mut TimelineTierWorkspace,
+        profile: &StageSweepProfile,
     ) -> NodeRuntimeOutput {
         match self.graph.node_weight(index) {
                 Some(ExecutionNode::DataInput { symbol }) => {
@@ -955,6 +1024,11 @@ impl MarketLabGraphEngine {
                     tier_kind,
                     tier_program,
                 }) => {
+                    let effective_method = profile
+                        .allocation_overrides
+                        .get(prim_path)
+                        .map(String::as_str)
+                        .unwrap_or(method.as_str());
                     if let (Some(kind), Some(_program)) = (tier_kind, tier_program.as_ref()) {
                         if *kind == OtlObjectKind::Allocator {
                             let upstream_indices: Vec<NodeIndex> = self
@@ -974,7 +1048,7 @@ impl MarketLabGraphEngine {
                                     tier_workspace.run_allocator_node(
                                         &prim_path,
                                         tier,
-                                        method,
+                                        effective_method,
                                         *initial_capital,
                                         &upstream_indices,
                                     )
@@ -997,7 +1071,7 @@ impl MarketLabGraphEngine {
                                     index,
                                     &self.sweep_scratch.node_outputs,
                                     &self.node_prim_paths,
-                                    method,
+                                    effective_method,
                                     *initial_capital,
                                     otl_script,
                                     otl_hook.as_deref(),
@@ -1027,7 +1101,7 @@ impl MarketLabGraphEngine {
                                     tier_workspace.run_portfolio_node(
                                         &prim_path,
                                         tier,
-                                        method,
+                                        effective_method,
                                         *initial_capital,
                                         &upstream_indices,
                                     )
@@ -1069,7 +1143,7 @@ impl MarketLabGraphEngine {
                                     index,
                                     &self.sweep_scratch.node_outputs,
                                     &self.node_prim_paths,
-                                    method,
+                                    effective_method,
                                     *initial_capital,
                                     otl_script,
                                     otl_hook.as_deref(),
@@ -1087,7 +1161,7 @@ impl MarketLabGraphEngine {
                                 index,
                                 &self.sweep_scratch.node_outputs,
                                 &self.node_prim_paths,
-                                method,
+                                effective_method,
                                 *initial_capital,
                                 otl_script,
                                 otl_hook.as_deref(),
@@ -1105,7 +1179,7 @@ impl MarketLabGraphEngine {
                             index,
                             &self.sweep_scratch.node_outputs,
                             &self.node_prim_paths,
-                            method,
+                            effective_method,
                             *initial_capital,
                             otl_script,
                             otl_hook.as_deref(),
@@ -1821,6 +1895,68 @@ fn gather_upstream_into(
     for upstream_index in graph.neighbors_directed(index, Direction::Incoming) {
         if let Some(output) = node_outputs.get(&upstream_index) {
             scratch.extend_from_slice(&output.scalar);
+        }
+    }
+}
+
+fn solo_target_on_level(
+    engine: &MarketLabGraphEngine,
+    level: &[NodeIndex],
+    profile: &StageSweepProfile,
+) -> Option<NodeIndex> {
+    let solo_path = profile.solo_prim_path.as_ref()?;
+    level
+        .iter()
+        .copied()
+        .find(|index| engine.prim_path_for_index(*index) == solo_path.as_str())
+}
+
+fn should_execute_on_level(
+    engine: &MarketLabGraphEngine,
+    index: NodeIndex,
+    level: &[NodeIndex],
+    profile: &StageSweepProfile,
+) -> bool {
+    let Some(solo_index) = solo_target_on_level(engine, level, profile) else {
+        return true;
+    };
+    index == solo_index
+}
+
+fn passthrough_upstream_runtime(
+    graph: &StableGraph<ExecutionNode, ()>,
+    index: NodeIndex,
+    timeline_len: usize,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+) -> Option<NodeRuntimeOutput> {
+    for upstream_index in graph.neighbors_directed(index, Direction::Incoming) {
+        if let Some(output) = node_outputs.get(&upstream_index) {
+            return Some(NodeRuntimeOutput {
+                scalar: pad_or_trim(output.scalar.clone(), timeline_len),
+                asset_symbol: output.asset_symbol.clone(),
+            });
+        }
+    }
+    Some(NodeRuntimeOutput {
+        scalar: vec![0.0; timeline_len],
+        asset_symbol: None,
+    })
+}
+
+fn muted_node_runtime(
+    graph: &StableGraph<ExecutionNode, ()>,
+    index: NodeIndex,
+    timeline_len: usize,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+) -> Option<NodeRuntimeOutput> {
+    match graph.node_weight(index)? {
+        ExecutionNode::PortfolioSink { .. } => None,
+        ExecutionNode::DataInput { symbol } => Some(NodeRuntimeOutput {
+            scalar: vec![0.0; timeline_len],
+            asset_symbol: Some(symbol.clone()),
+        }),
+        ExecutionNode::SignalTransform { .. } => {
+            passthrough_upstream_runtime(graph, index, timeline_len, node_outputs)
         }
     }
 }

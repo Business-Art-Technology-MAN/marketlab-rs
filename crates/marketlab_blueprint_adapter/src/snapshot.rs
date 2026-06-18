@@ -117,6 +117,7 @@ fn prim_attributes(
             if let Some(path) = property_string(node, "script_compiled_path") {
                 insert("inputs:script_compiled_path", path);
             }
+            insert_strategy_channels(&mut insert, node);
         }
         FinanceNodeKind::OtlTaUberSignal => {
             let archetype = FinanceNodeKind::ta_archetype_token(&node.node_type)
@@ -141,6 +142,7 @@ fn prim_attributes(
             insert("inputs:multiplier", config.multiplier.to_string());
             insert("inputs:annualization", config.annualization.to_string());
             insert("inputs:script_src", compose_uber_script_src(&config));
+            insert_strategy_channels(&mut insert, node);
         }
         FinanceNodeKind::PortfolioIntegrator => {
             let allocation = property_string(node, "allocation_id").unwrap_or_else(|| {
@@ -165,6 +167,17 @@ fn prim_attributes(
     }
 
     attrs
+}
+
+fn insert_strategy_channels(
+    insert: &mut impl FnMut(&str, String),
+    node: &graphy::NodeInstance,
+) {
+    for channel in crate::blueprint::FINANCE_STRATEGY_CHANNELS {
+        if let Some(value) = property_f64(node, channel) {
+            insert(&format!("inputs:{channel}"), value.to_string());
+        }
+    }
 }
 
 fn lineage_wires(

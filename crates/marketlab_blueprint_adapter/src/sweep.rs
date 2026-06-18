@@ -8,6 +8,7 @@ use pulsar_marketlab_core::{
 };
 
 use crate::asset_data::load_asset_close_series;
+use crate::compile_profile::{finance_compile_profile_to_sweep, FinanceCompileProfile};
 
 const DEFAULT_BAR_COUNT: usize = 252;
 
@@ -93,6 +94,23 @@ pub fn wealth_sparkline(values: &[f64], width: usize) -> String {
 
 /// Execute one portfolio timeline sweep from a compiled stage snapshot.
 pub fn run_finance_sweep(snapshot: &StageGraphSnapshot) -> FinanceSweepResult {
+    run_finance_sweep_with_profile(snapshot, &FinanceCompileProfile::default(), &HashMap::new())
+}
+
+/// Execute a sweep with Hydra stage-tree mute / solo overrides.
+pub fn run_finance_sweep_with_profile(
+    snapshot: &StageGraphSnapshot,
+    profile: &FinanceCompileProfile,
+    node_prim_paths: &HashMap<String, String>,
+) -> FinanceSweepResult {
+    let sweep_profile = finance_compile_profile_to_sweep(profile, node_prim_paths);
+    run_finance_sweep_internal(snapshot, &sweep_profile)
+}
+
+fn run_finance_sweep_internal(
+    snapshot: &StageGraphSnapshot,
+    sweep_profile: &pulsar_marketlab_core::StageSweepProfile,
+) -> FinanceSweepResult {
     let (vectors, load_meta) = build_asset_vectors(snapshot);
     if vectors.is_empty() {
         return FinanceSweepResult {
@@ -140,7 +158,7 @@ pub fn run_finance_sweep(snapshot: &StageGraphSnapshot) -> FinanceSweepResult {
     };
 
     let mut engine = engine;
-    let result = engine.execute_timeline(vectors, timeline_len);
+    let result = engine.execute_timeline_with_profile(vectors, timeline_len, sweep_profile);
     let mut portfolios = Vec::new();
 
     for prim in snapshot
@@ -148,6 +166,9 @@ pub fn run_finance_sweep(snapshot: &StageGraphSnapshot) -> FinanceSweepResult {
         .iter()
         .filter(|prim| prim.type_name == "PortfolioIntegrator")
     {
+        if sweep_profile.muted_prim_paths.contains(&prim.path) {
+            continue;
+        }
         let initial_capital = prim
             .attributes
             .get("inputs:initial_capital")
@@ -387,6 +408,43 @@ mod tests {
         assert_eq!(result.portfolios.len(), 1);
         assert!(result.portfolios[0].final_wealth > 0.0);
         assert!(result.assets_loaded >= 1, "{:?}", result);
+    }
+
+    #[test]
+    fn muted_portfolio_prim_skips_portfolio_sweep_output() {
+        use std::collections::HashSet;
+
+        use crate::finance_node_prim_paths;
+
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let paths = finance_node_prim_paths(&graph);
+        let profile = FinanceCompileProfile {
+            muted_node_ids: HashSet::from(["fund".to_string()]),
+            solo_node_id: None,
+            node_variant_overrides: HashMap::new(),
+        };
+        let result = run_finance_sweep_with_profile(&snapshot, &profile, &paths);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.portfolios.is_empty());
     }
 
     #[test]

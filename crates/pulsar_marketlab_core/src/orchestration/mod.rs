@@ -26,7 +26,8 @@ pub use script_resolve::{
 pub use engine::{
     ComposedAssetMeta, ComputedAttributeStream, ComputedTokenStream, EvaluationContext,
     ExecutionNode, GraphCompileSpec, GraphCompileWire, GraphEngineError, MarketLabGraphEngine,
-    PathBindingIndex, SignalTransformFn, StageGraphPrim, StageGraphSnapshot, TimelineExecutionResult,
+    PathBindingIndex, SignalTransformFn, StageGraphPrim, StageGraphSnapshot, StageSweepProfile,
+    TimelineExecutionResult,
 };
 pub use portfolio::{
     compute_allocation_weights, AssetQuote, ClosureLegKind,
