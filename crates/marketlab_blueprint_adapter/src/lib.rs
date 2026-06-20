@@ -18,6 +18,7 @@ mod telemetry;
 mod taxonomy_index;
 mod types;
 mod blueprint;
+mod portfolio_pins;
 mod sparkline_bitmap;
 mod usd_persistence;
 
@@ -76,6 +77,10 @@ pub use cold_path_write::{
 pub use usd_persistence::{
     export_document, import_document, stage_open_counter, FinanceLayerRef, FinanceSessionContext,
     FinanceWorkspaceDocument, UsdPersistenceError, UsdTransaction,
+};
+pub use portfolio_pins::{
+    compact_portfolio_signal_target_pins, is_portfolio_signal_pin,
+    portfolio_signal_pin_count, portfolio_signal_pin_id, portfolio_signal_pin_index,
 };
 pub use sparkline_bitmap::{
     rasterize_asset_preview_sparkline, rasterize_close_sparkline, FinanceSparklineBitmap,

@@ -8,6 +8,7 @@ use graphy::{
 use pulsar_marketlab_core::TaArchetype;
 
 use crate::blueprint::FINANCE_SIGNAL_TYPE;
+use crate::portfolio_pins::portfolio_signal_pin_id;
 use crate::types::{category, type_id, PORTFOLIO_ALLOCATION_TOKENS};
 
 /// Unified strategy channels rendered on analytics node faces (0..1).
@@ -130,9 +131,8 @@ fn ta_uber_metadata(type_id: &'static str, archetype: TaArchetype) -> NodeMetada
 }
 
 fn portfolio_integrator_metadata() -> NodeMetadata {
-    let signal_inputs: Vec<ParamInfo> = (0..8)
-        .map(|idx| signal_series_param(&format!("signal_{idx}")))
-        .collect();
+    let signal_inputs: Vec<ParamInfo> =
+        vec![signal_series_param(&portfolio_signal_pin_id(0))];
 
     NodeMetadata::new(
         type_id::PORTFOLIO_INTEGRATOR,
