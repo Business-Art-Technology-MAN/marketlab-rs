@@ -95,7 +95,38 @@ See `crates/pulsar_marketlab/src/stage_bridge/production_provider.rs`.
 
 ---
 
-## 4. The Declarative Composition Loop (Strength)
+## 4. Cold-Path vs Hot-Path (Finance Editor — June 2026)
+
+The **finance blueprint editor** (`marketlab_finance_editor` / `CompileMode::MarketLabFinance`) keeps OpenUSD **off the interactive loop**:
+
+| Tier | Storage | When it runs |
+|------|---------|----------------|
+| **Hot** | `BlueprintGraph` → Graphy `GraphDescription` → `StageGraphSnapshot` → sweep | Wire edits, slider drags, compile, viewport repaint |
+| **Warm** | `FinanceWorkspaceDocument`, `TaxonomyIndex`, `FinanceDatabaseIndex` in RAM | Once per USD import; symbol autofill on node drop / symbol commit |
+| **Cold** | `.usda` + sidecars on disk | File → Open / Save only (`marketlab_blueprint_adapter::usd_persistence`) |
+
+`Stage::open` is gated behind [`UsdTransaction`](../crates/marketlab_blueprint_adapter/src/usd_persistence.rs) and increments `stage_open_counter()` for tests/telemetry. **No** debounced `publish_canvas_to_usd_stage` on canvas edits in finance mode.
+
+Legacy workstation debounced sync now calls `sync_graph_after_topology_edit` (snapshot invalidation only) — not a USDA round-trip on every wire tweak.
+
+### Finance I/O flow
+
+1. **Open** — `import_document(path)` → `FinanceWorkspaceDocument` (graph + `session_opinions` + `resolved_prim_paths`) → blueprint canvas. Stage handle dropped after hydration.
+2. **Edit** — dirty flag on graph only; disk USDA is stale until Save.
+3. **Save** — flush inspector properties → `export_document` writes root `.usda` + workstation sidecars (`schema.usda`, `metadata_library.usda`, empty `session.usda` / `signals.usda` scaffolds).
+4. **Symbol autofill** — `finance_asset_properties_for_symbol` reads in-memory taxonomy (+ optional `finance_database_equities.usda` index); **no** `Stage::open` per ticker.
+
+### Verification checklist
+
+- [ ] Edit wire / drag slider / orbit Hydra viewport: `stage_open_counter()` unchanged (profile or log).
+- [ ] File → Open `spy_assets.usda`: graph hydrates, Composition Stack shows layer rows, compile succeeds.
+- [ ] File → Save → reopen: round-trip Graphy topology + asset metadata.
+- [ ] Drop Financial Asset / type `AAPL`: `asset_class`, sector fields autofill without compile.
+- [ ] `cargo test -p marketlab_blueprint_adapter usd_persistence` passes.
+
+---
+
+## 5. The Declarative Composition Loop (Legacy Workstation)
 
 MarketLab’s authoring loop is **text-based and recoverable**:
 
@@ -105,7 +136,7 @@ MarketLab’s authoring loop is **text-based and recoverable**:
 4. **Hydrate** — `canvas_hydrate.rs` can rebuild canvas nodes from a stage (`hydrate_canvas_from_stage`).
 5. **Compile** — `build_stage_graph_snapshot` → `MarketLabGraphEngine::compile_from_stage`.
 
-Entry point for live sync: `TradingSystemWorkspace::publish_canvas_to_usd_stage` in `workspace_state.rs` — validates wiring/DAG, composes USDA, reloads **both** stage handles, preserves runtime overlays, invalidates graph cache, kicks timeline sweep.
+Entry point for **legacy** live sync: `TradingSystemWorkspace::publish_canvas_to_usd_stage` in `workspace_state.rs` — used for OTL editor commit and File → Save only; routine topology debounce uses `sync_graph_after_topology_edit` without USDA reload.
 
 **Why this matters:** If the UI process crashes, the **true topology** is whatever was last written to USDA on disk (or session autosave), not ephemeral GPUI widget state.
 
@@ -204,7 +235,7 @@ On-disk saves co-locate `schema.usda` + `metadata_library.usda` sidecars (`Compo
 | Stable topology (same nodes/paths, prims exist on stage) | `apply_incremental_canvas_sync` — relationship + scalar overlays on `ManagedUsdStage` |
 | New/removed node, path change, missing prim, empty graph | Background `compose_pipeline_usda` + `WorkspaceContext::from_usda_text` reload |
 
-**Debouncing:** `schedule_canvas_stage_sync` coalesces rapid `sync_pipeline_graph` calls with a **100 ms** window before running `publish_canvas_to_usd_stage`.
+**Debouncing:** `schedule_canvas_stage_sync` coalesces rapid `sync_pipeline_graph` calls with a **100 ms** window before running `sync_graph_after_topology_edit` (in-memory snapshot invalidation — **not** `publish_canvas_to_usd_stage`).
 
 **Entry points:** `crates/pulsar_marketlab/src/canvas_stage_sync.rs`, `workspace_state.rs` (`schedule_canvas_stage_sync`, `publish_canvas_to_usd_stage`).
 

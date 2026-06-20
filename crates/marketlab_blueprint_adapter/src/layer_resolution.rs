@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use crate::blueprint::{finance_property_defaults, finance_property_fields};
 use crate::stage_variants::format_variant_label;
+use crate::usd_persistence::FinanceSessionContext;
+use crate::types::type_id;
 
 /// Composition layer identifiers (strongest → weakest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,11 +70,43 @@ fn session_layer_value(
     property_id: &str,
     node_id: &str,
     session_variant_overrides: &HashMap<String, String>,
+    session_ctx: Option<&FinanceSessionContext<'_>>,
 ) -> Option<String> {
     if property_id == "allocation_id" {
         return session_variant_overrides.get(node_id).cloned();
     }
-    None
+    let Some(ctx) = session_ctx else {
+        return None;
+    };
+    let prim_path = ctx
+        .resolved_prim_paths
+        .get(node_id)
+        .map(String::as_str)
+        .or_else(|| {
+            if property_id == "prim_path" {
+                ctx.resolved_prim_paths.get(node_id).map(String::as_str)
+            } else {
+                None
+            }
+        })?;
+    let attrs = ctx.opinions.get(prim_path)?;
+    let usd_key = graph_property_to_usd_attr(property_id);
+    attrs.get(usd_key).cloned()
+}
+
+fn graph_property_to_usd_attr(property_id: &str) -> &str {
+    match property_id {
+        "symbol" => "inputs:symbol",
+        "asset_class" => "inputs:asset_class",
+        "csv_path" => "inputs:csv_path",
+        "prim_path" => "inputs:prim_path",
+        "category" => "inputs:category",
+        "sub_category" => "inputs:sub_category",
+        "exchange_mic" => "inputs:exchange_mic",
+        "allocation_id" => "inputs:id",
+        "display_name" => "info:user_label",
+        other => other,
+    }
 }
 
 /// Build layer-resolution rows for every inspector field on a finance node.
@@ -82,8 +116,25 @@ pub fn finance_property_layer_resolutions(
     graph_properties: &HashMap<String, String>,
     session_variant_overrides: &HashMap<String, String>,
 ) -> Vec<FinancePropertyLayerResolution> {
+    finance_property_layer_resolutions_with_session(
+        definition_id,
+        node_id,
+        graph_properties,
+        session_variant_overrides,
+        None,
+    )
+}
+
+/// Same as [`finance_property_layer_resolutions`] with optional session.usda opinions.
+pub fn finance_property_layer_resolutions_with_session(
+    definition_id: &str,
+    node_id: &str,
+    graph_properties: &HashMap<String, String>,
+    session_variant_overrides: &HashMap<String, String>,
+    session_ctx: Option<&FinanceSessionContext<'_>>,
+) -> Vec<FinancePropertyLayerResolution> {
     let schema_defaults = finance_property_defaults(definition_id);
-    finance_property_fields(definition_id)
+    let mut rows: Vec<FinancePropertyLayerResolution> = finance_property_fields(definition_id)
         .into_iter()
         .map(|field| {
             let schema_value = schema_defaults
@@ -94,8 +145,12 @@ pub fn finance_property_layer_resolutions(
                 .get(&field.id)
                 .cloned()
                 .unwrap_or_else(|| schema_value.clone());
-            let session_value =
-                session_layer_value(&field.id, node_id, session_variant_overrides);
+            let session_value = session_layer_value(
+                &field.id,
+                node_id,
+                session_variant_overrides,
+                session_ctx,
+            );
 
             let mut stack = Vec::new();
             if let Some(session) = session_value.clone() {
@@ -154,7 +209,41 @@ pub fn finance_property_layer_resolutions(
                 overridden_layers,
             }
         })
-        .collect()
+        .collect();
+
+    if definition_id == type_id::FINANCIAL_ASSET {
+        if graph_properties
+            .get("prim_path")
+            .map(String::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            if let Some(ctx) = session_ctx {
+                if let Some(resolved) = ctx.resolved_prim_paths.get(node_id) {
+                    rows.push(computed_prim_path_row(resolved));
+                }
+            }
+        }
+    }
+
+    rows
+}
+
+fn computed_prim_path_row(resolved: &str) -> FinancePropertyLayerResolution {
+    FinancePropertyLayerResolution {
+        property_id: "resolved_prim_path".to_string(),
+        property_label: "Resolved prim path".to_string(),
+        active_layer: FinanceCompositionLayer::Schema,
+        active_value: resolved.to_string(),
+        active_display: resolved.to_string(),
+        has_layer_override: false,
+        stack: vec![FinanceLayerContribution {
+            layer: FinanceCompositionLayer::Schema,
+            raw_value: resolved.to_string(),
+            display_value: resolved.to_string(),
+        }],
+        overridden_layers: Vec::new(),
+    }
 }
 
 #[cfg(test)]

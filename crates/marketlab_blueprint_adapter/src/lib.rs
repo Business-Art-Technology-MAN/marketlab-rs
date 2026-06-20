@@ -3,6 +3,7 @@
 //! - [`FinanceNodeMetadataProvider`] — Graphy node palette + validation metadata
 //! - [`FinanceGraphAdapter`] — `GraphDescription` → [`StageGraphSnapshot`] (engine input)
 
+mod cold_path_write;
 mod asset_data;
 mod compile;
 mod compile_profile;
@@ -14,8 +15,10 @@ mod layer_resolution;
 mod stage_variants;
 mod sweep;
 mod telemetry;
+mod taxonomy_index;
 mod types;
 mod blueprint;
+mod usd_persistence;
 
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
@@ -49,8 +52,8 @@ pub use stage_tree::{
     build_finance_stage_tree, filter_stage_tree_model, FinanceStageTreeModel, FinanceStageTreeRow,
 };
 pub use layer_resolution::{
-    finance_property_layer_resolutions, FinanceCompositionLayer, FinanceLayerContribution,
-    FinancePropertyLayerResolution,
+    finance_property_layer_resolutions, finance_property_layer_resolutions_with_session,
+    FinanceCompositionLayer, FinanceLayerContribution, FinancePropertyLayerResolution,
 };
 pub use stage_variants::{
     default_variant_token, finance_stage_variant_options, format_variant_label,
@@ -62,5 +65,16 @@ pub use telemetry::{
     FinanceWorkspaceTelemetry,
 };
 pub use types::{category, type_id, FinanceNodeKind, PORTFOLIO_ALLOCATION_TOKENS};
+pub use taxonomy_index::{
+    finance_asset_properties_for_symbol, FinanceDatabaseIndex, TaxonomyIndex,
+};
+pub use cold_path_write::{
+    prepare_finance_graph_for_cold_write, validate_finance_graph_for_cold_write,
+    verify_cold_write_round_trip, FinanceColdWriteReport,
+};
+pub use usd_persistence::{
+    export_document, import_document, stage_open_counter, FinanceLayerRef, FinanceSessionContext,
+    FinanceWorkspaceDocument, UsdPersistenceError, UsdTransaction,
+};
 pub use pulsar_marketlab_core::StageGraphSnapshot;
 pub use pulsar_marketlab_core::StageSweepProfile;

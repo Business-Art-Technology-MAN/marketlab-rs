@@ -90,6 +90,7 @@ pub fn build_finance_stage_tree(graph: &GraphDescription) -> FinanceStageTreeMod
     }
 
     // Nest wired upstream nodes under their portfolio parent.
+    // Financial assets stay in Universe; portfolios get lightweight AssetRef stub rows.
     for connection in &graph.connections {
         let Some(&target_row) = node_row_by_id.get(&connection.target_node) else {
             continue;
@@ -103,6 +104,32 @@ pub fn build_finance_stage_tree(graph: &GraphDescription) -> FinanceStageTreeMod
         if target_kind != FinanceNodeKind::PortfolioIntegrator {
             continue;
         }
+        let Some(source_node) = graph.nodes.get(&connection.source_node) else {
+            continue;
+        };
+        let Some(source_kind) = FinanceNodeKind::from_graphy_type_id(&source_node.node_type) else {
+            continue;
+        };
+
+        if source_kind == FinanceNodeKind::FinancialAsset {
+            let source_path = paths.get(&connection.source_node).cloned();
+            let ref_label = node_display_label(source_node, source_kind, source_path.as_deref().unwrap_or(""));
+            let ref_row = rows.len();
+            rows.push(FinanceStageTreeRow {
+                row_index: ref_row,
+                node_id: Some(connection.source_node.clone()),
+                label: ref_label,
+                type_label: "AssetRef".to_string(),
+                prim_path: source_path,
+                children: Vec::new(),
+                is_scope_folder: false,
+            });
+            if !rows[target_row].children.contains(&ref_row) {
+                rows[target_row].children.push(ref_row);
+            }
+            continue;
+        }
+
         let Some(&source_row) = node_row_by_id.get(&connection.source_node) else {
             continue;
         };
@@ -110,16 +137,9 @@ pub fn build_finance_stage_tree(graph: &GraphDescription) -> FinanceStageTreeMod
             continue;
         }
 
-        let source_scope = graph
-            .nodes
-            .get(&connection.source_node)
-            .and_then(|node| FinanceNodeKind::from_graphy_type_id(&node.node_type))
-            .map(scope_for_kind);
-
-        if let Some(scope_key) = source_scope {
-            if let Some(folder_index) = scope_folder_index.get(scope_key).copied() {
-                rows[folder_index].children.retain(|child| *child != source_row);
-            }
+        let source_scope = scope_for_kind(source_kind);
+        if let Some(folder_index) = scope_folder_index.get(source_scope).copied() {
+            rows[folder_index].children.retain(|child| *child != source_row);
         }
 
         if !rows[target_row].children.contains(&source_row) {
@@ -348,15 +368,68 @@ mod tests {
         });
 
         let model = build_finance_stage_tree(&graph);
+        let universe = &model.rows[0];
+        assert_eq!(universe.children.len(), 1);
+        assert_eq!(model.rows[universe.children[0]].label, "SPY");
+
         let portfolio_row = model
             .rows
             .iter()
             .find(|row| row.node_id.as_deref() == Some("fund"))
             .expect("portfolio row");
         assert_eq!(portfolio_row.children.len(), 1);
-        assert_eq!(
-            model.rows[portfolio_row.children[0]].node_id.as_deref(),
-            Some("spy")
-        );
+        let asset_ref = &model.rows[portfolio_row.children[0]];
+        assert_eq!(asset_ref.type_label, "AssetRef");
+        assert_eq!(asset_ref.label, "SPY");
+        assert_eq!(asset_ref.node_id.as_deref(), Some("spy"));
+    }
+
+    #[test]
+    fn stage_tree_asset_ref_stub_per_portfolio_not_shared_row() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "vea",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "equities",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "rates",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(400.0, 0.0),
+        ));
+        for target in ["equities", "rates"] {
+            graph.add_connection(Connection {
+                source_node: "vea".into(),
+                source_pin: "close".into(),
+                target_node: target.into(),
+                target_pin: "signal_0".into(),
+                connection_type: ConnectionType::Data,
+            });
+        }
+
+        let model = build_finance_stage_tree(&graph);
+        let universe = &model.rows[0];
+        assert_eq!(universe.children.len(), 1);
+
+        let equities = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("equities"))
+            .expect("equities portfolio");
+        let rates = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("rates"))
+            .expect("rates portfolio");
+        assert_eq!(equities.children.len(), 1);
+        assert_eq!(rates.children.len(), 1);
+        assert_ne!(equities.children[0], rates.children[0]);
+        assert_eq!(model.rows[equities.children[0]].label, "VEA");
+        assert_eq!(model.rows[rates.children[0]].label, "VEA");
     }
 }

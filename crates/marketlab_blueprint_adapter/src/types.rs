@@ -59,6 +59,16 @@ impl FinanceNodeKind {
         }
     }
 
+    pub fn from_stage_type_name(type_name: &str) -> Option<Self> {
+        match type_name {
+            "FinancialAsset" => Some(Self::FinancialAsset),
+            "OtlOperator" => Some(Self::OtlOperator),
+            "OtlTaUberSignal" => Some(Self::OtlTaUberSignal),
+            "PortfolioIntegrator" => Some(Self::PortfolioIntegrator),
+            _ => None,
+        }
+    }
+
     pub fn ta_archetype_token(type_id: &str) -> Option<&'static str> {
         match type_id {
             type_id::TA_TREND => Some("trend"),

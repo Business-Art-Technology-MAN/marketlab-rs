@@ -109,6 +109,19 @@ fn prim_attributes(
             if let Some(csv) = property_string(node, "csv_path") {
                 insert("inputs:csv_path", csv);
             }
+            if let Some(category) = property_string(node, "category") {
+                insert("inputs:category", category);
+            }
+            if let Some(sub_category) = property_string(node, "sub_category") {
+                insert("inputs:sub_category", sub_category);
+            }
+            if let Some(mic) = property_string(node, "exchange_mic") {
+                insert("inputs:exchange_mic", mic);
+            }
+            if let Some(provider) = property_string(node, "provider") {
+                insert("inputs:provider", provider);
+            }
+            insert_info_attributes(&mut insert, node);
         }
         FinanceNodeKind::OtlOperator => {
             if let Some(script) = property_string(node, "script_src") {
@@ -213,7 +226,8 @@ fn lineage_wires(
             }
             (FinanceNodeKind::FinancialAsset, FinanceNodeKind::PortfolioIntegrator)
             | (FinanceNodeKind::OtlOperator, FinanceNodeKind::PortfolioIntegrator)
-            | (FinanceNodeKind::OtlTaUberSignal, FinanceNodeKind::PortfolioIntegrator) => {
+            | (FinanceNodeKind::OtlTaUberSignal, FinanceNodeKind::PortfolioIntegrator)
+            | (FinanceNodeKind::PortfolioIntegrator, FinanceNodeKind::PortfolioIntegrator) => {
                 LINEAGE_SOURCES
             }
             (FinanceNodeKind::OtlOperator, FinanceNodeKind::OtlOperator)
@@ -305,6 +319,27 @@ fn property_string(node: &NodeInstance, key: &str) -> Option<String> {
         .get(key)
         .and_then(json_to_string)
         .filter(|value| !value.is_empty())
+}
+
+fn insert_info_attributes(
+    insert: &mut impl FnMut(&str, String),
+    node: &NodeInstance,
+) {
+    const INFO_FIELDS: [(&str, &str); 8] = [
+        ("info_sector", "info:sector"),
+        ("info_industry_group", "info:industry_group"),
+        ("info_industry", "info:industry"),
+        ("info_currency", "info:currency"),
+        ("info_country", "info:country"),
+        ("info_state", "info:state"),
+        ("info_zipcode", "info:zipcode"),
+        ("info_market_cap_class", "info:market_cap_class"),
+    ];
+    for (prop_key, usd_key) in INFO_FIELDS {
+        if let Some(value) = property_string(node, prop_key) {
+            insert(usd_key, value);
+        }
+    }
 }
 
 fn property_u32(node: &NodeInstance, key: &str) -> Option<u32> {

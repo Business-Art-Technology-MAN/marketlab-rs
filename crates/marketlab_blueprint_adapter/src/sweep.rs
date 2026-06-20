@@ -30,6 +30,8 @@ pub struct FinanceSweepResult {
     pub assets_loaded: usize,
     pub assets_synthetic: usize,
     pub portfolios: Vec<FinancePortfolioSweepSummary>,
+    /// OTL / TA output series keyed by analytics prim path.
+    pub analytics_signals: HashMap<String, Vec<f64>>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
 }
@@ -213,11 +215,30 @@ fn run_finance_sweep_internal(
         warnings.push("Sweep completed but no portfolio wealth streams were produced".to_string());
     }
 
+    let mut analytics_signals = HashMap::new();
+    for stream in &result.streams {
+        let Some(prim) = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path == stream.prim_path)
+        else {
+            continue;
+        };
+        if matches!(
+            prim.type_name.as_str(),
+            "OtlOperator" | "OtlTaUberSignal"
+        ) && !stream.values.is_empty()
+        {
+            analytics_signals.insert(stream.prim_path.clone(), stream.values.clone());
+        }
+    }
+
     FinanceSweepResult {
         timeline_len,
         assets_loaded: load_meta.loaded,
         assets_synthetic: load_meta.synthetic,
         portfolios,
+        analytics_signals,
         warnings,
         error: None,
     }
