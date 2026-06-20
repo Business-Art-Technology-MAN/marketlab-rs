@@ -770,6 +770,7 @@ dependencies = [
  "futures",
  "gpui-ce",
  "graphy",
+ "image",
  "log",
  "marketlab_blueprint_adapter",
  "parking_lot",

@@ -97,10 +97,44 @@ pub fn finance_node_header_rgba(definition_id: &str) -> Option<[f32; 4]> {
 }
 
 pub fn finance_node_layout_extra_height(definition_id: &str) -> f32 {
+    if definition_id == type_id::FINANCIAL_ASSET {
+        return crate::sparkline_bitmap::FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT;
+    }
     if finance_has_strategy_channels(definition_id) {
         FINANCE_STRATEGY_BLOCK_HEIGHT
     } else {
         0.0
+    }
+}
+
+/// EventGraph node header label with finance-specific context (symbol, allocation, etc.).
+pub fn finance_node_graph_title(
+    definition_id: &str,
+    properties: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let base = finance_display_label(definition_id)?;
+    match definition_id {
+        type_id::FINANCIAL_ASSET => {
+            let symbol = properties
+                .get("symbol")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("SPY");
+            Some(format!("{base} · {symbol}"))
+        }
+        type_id::PORTFOLIO_INTEGRATOR => {
+            let name = properties
+                .get("name")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Fund");
+            let allocation = properties
+                .get("allocation_id")
+                .map(|token| crate::format_variant_label(token))
+                .unwrap_or_else(|| "[Default]".to_string());
+            Some(format!("{name} · {allocation}"))
+        }
+        _ => Some(base.to_string()),
     }
 }
 
@@ -248,5 +282,29 @@ mod tests {
         assert!(finance_node_header_rgba(type_id::FINANCIAL_ASSET).is_some());
         assert!(finance_node_header_rgba(type_id::TA_TREND).is_some());
         assert!(finance_node_header_rgba(type_id::PORTFOLIO_INTEGRATOR).is_some());
+    }
+
+    #[test]
+    fn graph_titles_include_symbol_and_allocation() {
+        let asset = finance_node_graph_title(
+            type_id::FINANCIAL_ASSET,
+            &std::collections::HashMap::from([("symbol".to_string(), "QQQ".to_string())]),
+        )
+        .expect("asset title");
+        assert!(asset.contains("QQQ"));
+
+        let portfolio = finance_node_graph_title(
+            type_id::PORTFOLIO_INTEGRATOR,
+            &std::collections::HashMap::from([
+                ("name".to_string(), "Core Fund".to_string()),
+                (
+                    "allocation_id".to_string(),
+                    "Allocation::MeanVariance".to_string(),
+                ),
+            ]),
+        )
+        .expect("portfolio title");
+        assert!(portfolio.contains("Core Fund"));
+        assert!(portfolio.contains("MeanVariance"));
     }
 }

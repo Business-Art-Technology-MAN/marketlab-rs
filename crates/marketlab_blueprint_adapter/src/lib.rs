@@ -18,12 +18,13 @@ mod telemetry;
 mod taxonomy_index;
 mod types;
 mod blueprint;
+mod sparkline_bitmap;
 mod usd_persistence;
 
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
     finance_has_strategy_channels, finance_is_analytics_node, finance_node_header_rgba,
-    finance_node_layout_extra_height, finance_primary_output_pin, finance_property_defaults,
+    finance_node_layout_extra_height, finance_node_graph_title, finance_primary_output_pin, finance_property_defaults,
     finance_property_fields, finance_property_is_numeric, finance_strategy_channel_fields,
     is_marketlab_finance_node, merge_finance_node_metadata, FinancePropertyField,
     FINANCE_STRATEGY_BLOCK_HEIGHT, FINANCE_STRATEGY_CHANNELS,
@@ -76,5 +77,8 @@ pub use usd_persistence::{
     export_document, import_document, stage_open_counter, FinanceLayerRef, FinanceSessionContext,
     FinanceWorkspaceDocument, UsdPersistenceError, UsdTransaction,
 };
-pub use pulsar_marketlab_core::StageGraphSnapshot;
-pub use pulsar_marketlab_core::StageSweepProfile;
+pub use sparkline_bitmap::{
+    rasterize_asset_preview_sparkline, rasterize_close_sparkline, FinanceSparklineBitmap,
+    FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT, FINANCE_SPARKLINE_HEIGHT, FINANCE_SPARKLINE_WIDTH,
+};
+pub use pulsar_marketlab_core::{StageGraphSnapshot, StageSweepProfile};
