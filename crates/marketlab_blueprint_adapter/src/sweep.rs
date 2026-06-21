@@ -9,6 +9,7 @@ use pulsar_marketlab_core::{
 
 use crate::asset_data::load_asset_close_series;
 use crate::compile_profile::{finance_compile_profile_to_sweep, FinanceCompileProfile};
+use crate::snapshot::snapshot_for_engine_execution;
 
 const DEFAULT_BAR_COUNT: usize = 252;
 
@@ -131,7 +132,8 @@ fn run_finance_sweep_internal(
         .max(1);
 
     let mut warnings = load_meta.warnings;
-    let engine = match MarketLabGraphEngine::compile_from_stage(snapshot) {
+    let execution_snapshot = snapshot_for_engine_execution(snapshot);
+    let engine = match MarketLabGraphEngine::compile_from_stage(&execution_snapshot) {
         Ok(engine) => engine,
         Err(error) => {
             return FinanceSweepResult {

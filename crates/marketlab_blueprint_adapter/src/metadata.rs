@@ -9,6 +9,7 @@ use pulsar_marketlab_core::TaArchetype;
 
 use crate::blueprint::FINANCE_SIGNAL_TYPE;
 use crate::portfolio_pins::portfolio_signal_pin_id;
+use crate::series_pins::{performance_series_pin_id, PERFORMANCE_BENCHMARK_PIN};
 use crate::types::{category, type_id, PORTFOLIO_ALLOCATION_TOKENS};
 
 /// Unified strategy channels rendered on analytics node faces (0..1).
@@ -170,6 +171,49 @@ fn portfolio_integrator_metadata() -> NodeMetadata {
     .with_version(1)
 }
 
+fn performance_analytics_metadata() -> NodeMetadata {
+    NodeMetadata::new(
+        type_id::PERFORMANCE_ANALYTICS,
+        NodeTypes::pure,
+        category::REPORTING,
+    )
+    .with_params(vec![
+        signal_series_param(&performance_series_pin_id(0)),
+        signal_series_param(PERFORMANCE_BENCHMARK_PIN),
+    ])
+    .with_property_schema(vec![
+        PropertySchema::new("name", "Report name", ReflectedType::parse_str("String"))
+            .with_default(PropertyValue::String("Performance Report".into())),
+        PropertySchema::new(
+            "risk_free_rate",
+            "Risk-free rate (annual)",
+            ReflectedType::parse_str("f64"),
+        )
+        .with_default(PropertyValue::Float(0.0)),
+        PropertySchema::new(
+            "rolling_window",
+            "Rolling window (bars)",
+            ReflectedType::parse_str("u32"),
+        )
+        .with_default(PropertyValue::Int(63)),
+        PropertySchema::new(
+            "benchmark_mode",
+            "Benchmark mode",
+            ReflectedType::parse_str("String"),
+        )
+        .with_default(PropertyValue::String("auto".into()))
+        .with_tooltip("auto | wired | symbol"),
+        PropertySchema::new(
+            "benchmark_symbol",
+            "Benchmark symbol",
+            ReflectedType::parse_str("String"),
+        )
+        .with_default(PropertyValue::String("SPY".into())),
+    ])
+    .with_doc("Performance Analytics")
+    .with_version(1)
+}
+
 /// Build the full finance node catalog keyed by Graphy `node_type` id.
 pub fn finance_node_catalog() -> HashMap<String, NodeMetadata> {
     let mut catalog = HashMap::new();
@@ -182,6 +226,7 @@ pub fn finance_node_catalog() -> HashMap<String, NodeMetadata> {
         ta_uber_metadata(type_id::TA_OSCILLATOR, TaArchetype::Oscillator),
         ta_uber_metadata(type_id::TA_CHANNEL, TaArchetype::Channel),
         portfolio_integrator_metadata(),
+        performance_analytics_metadata(),
     ];
 
     for meta in entries {

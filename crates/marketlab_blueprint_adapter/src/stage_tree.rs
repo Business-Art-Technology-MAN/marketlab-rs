@@ -163,6 +163,7 @@ fn scope_for_kind(kind: FinanceNodeKind) -> &'static str {
         FinanceNodeKind::FinancialAsset => category::UNIVERSE,
         FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal => category::ANALYTICS,
         FinanceNodeKind::PortfolioIntegrator => category::PORTFOLIOS,
+        FinanceNodeKind::PerformanceAnalytics => category::REPORTING,
     }
 }
 
@@ -172,6 +173,7 @@ fn type_display_label(kind: FinanceNodeKind) -> String {
         FinanceNodeKind::OtlOperator => "OtlOperator".to_string(),
         FinanceNodeKind::OtlTaUberSignal => "SignalTransform".to_string(),
         FinanceNodeKind::PortfolioIntegrator => "Portfolio".to_string(),
+        FinanceNodeKind::PerformanceAnalytics => "PerformanceAnalytics".to_string(),
     }
 }
 
@@ -197,6 +199,8 @@ fn node_display_label(node: &NodeInstance, kind: FinanceNodeKind, prim_path: &st
             "algorithm",
         )
         .unwrap_or_else(|| node.id.clone()),
+        FinanceNodeKind::PerformanceAnalytics => property_string(node, "name")
+            .unwrap_or_else(|| "Performance Report".to_string()),
     }
 }
 

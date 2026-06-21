@@ -13,6 +13,8 @@ use crate::types::{FinanceNodeKind, PORTFOLIO_ALLOCATION_TOKENS};
 
 const LINEAGE_UNDERLYING: &str = "inputs:underlying";
 const LINEAGE_SOURCES: &str = "inputs:sources";
+const LINEAGE_SERIES: &str = "inputs:series";
+const LINEAGE_BENCHMARK: &str = "inputs:benchmark";
 
 /// Converts a Graphy graph into an engine snapshot (no live USD stage).
 pub fn graph_description_to_stage_snapshot(
@@ -47,6 +49,46 @@ pub fn graph_description_to_stage_snapshot(
     }
 }
 
+/// Strip terminal reporting prims before handing a snapshot to [`MarketLabGraphEngine`].
+///
+/// Performance Analytics nodes are post-sweep sinks: they stay in the authored snapshot for
+/// USD/stage-tree wiring but must not participate in timeline execution.
+pub fn snapshot_for_engine_execution(snapshot: &StageGraphSnapshot) -> StageGraphSnapshot {
+    let reporting_paths: std::collections::HashSet<String> = snapshot
+        .prims
+        .iter()
+        .filter(|prim| prim.type_name == "PerformanceAnalytics")
+        .map(|prim| prim.path.clone())
+        .collect();
+
+    if reporting_paths.is_empty() {
+        return snapshot.clone();
+    }
+
+    let prims = snapshot
+        .prims
+        .iter()
+        .filter(|prim| prim.type_name != "PerformanceAnalytics")
+        .cloned()
+        .collect();
+    let wires = snapshot
+        .wires
+        .iter()
+        .filter(|wire| {
+            !reporting_paths.contains(&wire.source_prim_path)
+                && !reporting_paths.contains(&wire.target_prim_path)
+        })
+        .cloned()
+        .collect();
+
+    StageGraphSnapshot {
+        prims,
+        wires,
+        path_bindings: snapshot.path_bindings.clone(),
+        asset_registry: snapshot.asset_registry.clone(),
+    }
+}
+
 /// Graph node id → USD prim path for finance nodes (used to map sweep output back to canvas nodes).
 pub fn finance_node_prim_paths(graph: &GraphDescription) -> HashMap<String, String> {
     resolve_prim_paths(graph)
@@ -74,6 +116,10 @@ fn resolve_prim_paths(graph: &GraphDescription) -> HashMap<String, String> {
                     "/MarketLab/Portfolios/{}",
                     sanitize_leaf(&leaf)
                 )
+            }
+            FinanceNodeKind::PerformanceAnalytics => {
+                let leaf = property_string(node, "name").unwrap_or_else(|| "report".into());
+                format!("/MarketLab/Reporting/{}", sanitize_leaf(&leaf))
             }
         };
         paths.insert(id.clone(), path);
@@ -173,6 +219,32 @@ fn prim_attributes(
                 property_string(node, "rebalance_frequency").unwrap_or_else(|| "monthly".into()),
             );
         }
+        FinanceNodeKind::PerformanceAnalytics => {
+            insert(
+                "inputs:name",
+                property_string(node, "name").unwrap_or_else(|| "Performance Report".into()),
+            );
+            insert(
+                "inputs:risk_free_rate",
+                property_f64(node, "risk_free_rate")
+                    .unwrap_or(0.0)
+                    .to_string(),
+            );
+            insert(
+                "inputs:rolling_window",
+                property_u32(node, "rolling_window")
+                    .unwrap_or(63)
+                    .to_string(),
+            );
+            insert(
+                "inputs:benchmark_mode",
+                property_string(node, "benchmark_mode").unwrap_or_else(|| "auto".into()),
+            );
+            insert(
+                "inputs:benchmark_symbol",
+                property_string(node, "benchmark_symbol").unwrap_or_else(|| "SPY".into()),
+            );
+        }
     }
 
     if let Some(label) = property_string(node, "display_name") {
@@ -227,8 +299,15 @@ fn lineage_wires(
             (FinanceNodeKind::FinancialAsset, FinanceNodeKind::PortfolioIntegrator)
             | (FinanceNodeKind::OtlOperator, FinanceNodeKind::PortfolioIntegrator)
             | (FinanceNodeKind::OtlTaUberSignal, FinanceNodeKind::PortfolioIntegrator)
-            | (FinanceNodeKind::PortfolioIntegrator, FinanceNodeKind::PortfolioIntegrator) => {
+            |             (FinanceNodeKind::PortfolioIntegrator, FinanceNodeKind::PortfolioIntegrator) => {
                 LINEAGE_SOURCES
+            }
+            (_, FinanceNodeKind::PerformanceAnalytics) => {
+                if connection.target_pin == crate::series_pins::PERFORMANCE_BENCHMARK_PIN {
+                    LINEAGE_BENCHMARK
+                } else {
+                    LINEAGE_SERIES
+                }
             }
             (FinanceNodeKind::OtlOperator, FinanceNodeKind::OtlOperator)
             | (FinanceNodeKind::OtlOperator, FinanceNodeKind::OtlTaUberSignal)
@@ -430,5 +509,38 @@ mod tests {
         assert_eq!(snapshot.prims.len(), 2);
         assert_eq!(snapshot.wires.len(), 1);
         assert_eq!(snapshot.wires[0].relationship, LINEAGE_SOURCES);
+    }
+
+    #[test]
+    fn engine_execution_snapshot_drops_reporting_prims() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "report",
+            type_id::PERFORMANCE_ANALYTICS,
+            Position::new(200.0, 0.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "report".into(),
+            target_pin: "series_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        assert_eq!(snapshot.prims.len(), 2);
+
+        let execution = snapshot_for_engine_execution(&snapshot);
+        assert_eq!(execution.prims.len(), 1);
+        assert_eq!(execution.prims[0].type_name, "FinancialAsset");
+        assert!(execution.wires.is_empty());
+
+        pulsar_marketlab_core::MarketLabGraphEngine::compile_from_stage(&execution)
+            .expect("reporting prim should not block engine compile");
     }
 }

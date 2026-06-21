@@ -18,13 +18,18 @@ mod telemetry;
 mod taxonomy_index;
 mod types;
 mod blueprint;
+mod performance_analytics;
+mod performance_export;
+mod performance_report;
 mod portfolio_pins;
+mod series_pins;
 mod sparkline_bitmap;
 mod usd_persistence;
 
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
-    finance_has_strategy_channels, finance_is_analytics_node, finance_node_header_rgba,
+    finance_has_strategy_channels, finance_is_analytics_node, finance_is_reporting_node,
+    finance_node_header_rgba,
     finance_node_layout_extra_height, finance_node_graph_title, finance_primary_output_pin, finance_property_defaults,
     finance_property_fields, finance_property_is_numeric, finance_strategy_channel_fields,
     is_marketlab_finance_node, merge_finance_node_metadata, FinancePropertyField,
@@ -35,8 +40,8 @@ pub use blueprint::{
 pub use metadata::finance_node_catalog;
 pub use provider::FinanceNodeMetadataProvider;
 pub use asset_data::{
-    finance_asset_previews_for_snapshot, load_finance_asset_preview, FinanceAssetPreview,
-    FinanceOhlcBar,
+    finance_asset_previews_for_snapshot, load_finance_asset_preview, normalize_finance_file_path,
+    FinanceAssetPreview, FinanceOhlcBar,
 };
 pub use compile::{compile_finance_graph, FinanceCompileReport};
 pub use compile_profile::{
@@ -48,7 +53,8 @@ pub use sweep::{
 };
 
 pub use snapshot::{
-    finance_node_prim_paths, graph_description_to_stage_snapshot, FinanceGraphAdapter,
+    finance_node_prim_paths, graph_description_to_stage_snapshot, snapshot_for_engine_execution,
+    FinanceGraphAdapter,
 };
 pub use stage_tree::{
     build_finance_stage_tree, filter_stage_tree_model, FinanceStageTreeModel, FinanceStageTreeRow,
@@ -78,9 +84,23 @@ pub use usd_persistence::{
     export_document, import_document, stage_open_counter, FinanceLayerRef, FinanceSessionContext,
     FinanceWorkspaceDocument, UsdPersistenceError, UsdTransaction,
 };
+pub use performance_analytics::{
+    compare_to_benchmark, compute_performance_bundle, cumulative_return_index,
+    drawdown_series_pct, summarize_performance, FinanceBenchmarkComparison,
+    FinancePerformanceSeriesBundle, FinancePerformanceSummary,
+};
+pub use performance_export::{performance_report_html, performance_summary_csv};
+pub use performance_report::{
+    build_finance_performance_reports, FinancePerformanceBuildContext, FinancePerformanceReport,
+};
 pub use portfolio_pins::{
     compact_portfolio_signal_target_pins, is_portfolio_signal_pin,
     portfolio_signal_pin_count, portfolio_signal_pin_id, portfolio_signal_pin_index,
+};
+pub use series_pins::{
+    compact_performance_series_target_pins, is_performance_series_pin,
+    performance_series_pin_count, performance_series_pin_id, performance_series_pin_index,
+    PERFORMANCE_BENCHMARK_PIN,
 };
 pub use sparkline_bitmap::{
     rasterize_asset_preview_sparkline, rasterize_close_sparkline, FinanceSparklineBitmap,

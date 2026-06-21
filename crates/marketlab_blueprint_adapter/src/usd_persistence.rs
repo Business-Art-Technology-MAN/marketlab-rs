@@ -22,6 +22,7 @@ use pulsar_marketlab_core::{
     WORKSTATION_LAYER_STACK, SIGNALS_SCOPE,
 };
 
+use crate::asset_data::normalize_finance_file_path;
 use crate::blueprint::finance_primary_output_pin;
 use crate::cold_path_write::{
     prepare_finance_graph_for_cold_write, validate_finance_graph_for_cold_write,
@@ -288,6 +289,7 @@ fn graph_from_stage_prims(
     }
 
     let mut portfolio_port_cursor: HashMap<String, usize> = HashMap::new();
+    let mut performance_series_cursor: HashMap<String, usize> = HashMap::new();
     for wire in wires {
         let Some(source_id) = path_to_id.get(&wire.source_prim_path) else {
             continue;
@@ -309,6 +311,13 @@ fn graph_from_stage_prims(
             let idx = *port;
             *port += 1;
             format!("signal_{idx}")
+        } else if wire.relationship == "inputs:series" {
+            let port = performance_series_cursor.entry(target_id.clone()).or_insert(0);
+            let idx = *port;
+            *port += 1;
+            format!("series_{idx}")
+        } else if wire.relationship == "inputs:benchmark" {
+            crate::series_pins::PERFORMANCE_BENCHMARK_PIN.to_string()
         } else if FinanceNodeKind::from_graphy_type_id(&target_node.node_type)
             == Some(FinanceNodeKind::OtlOperator)
             || FinanceNodeKind::from_graphy_type_id(&target_node.node_type)
@@ -369,6 +378,7 @@ fn graphy_type_for_prim(kind: FinanceNodeKind, attrs: &HashMap<String, String>) 
         FinanceNodeKind::FinancialAsset => type_id::FINANCIAL_ASSET.to_string(),
         FinanceNodeKind::OtlOperator => type_id::OTL_OPERATOR.to_string(),
         FinanceNodeKind::PortfolioIntegrator => type_id::PORTFOLIO_INTEGRATOR.to_string(),
+        FinanceNodeKind::PerformanceAnalytics => type_id::PERFORMANCE_ANALYTICS.to_string(),
         FinanceNodeKind::OtlTaUberSignal => {
             let token = attrs
                 .get("info:archetype")
@@ -418,7 +428,9 @@ fn apply_prim_properties(
             insert(
                 node,
                 "csv_path",
-                attrs.get("inputs:csv_path").cloned().unwrap_or_default(),
+                normalize_finance_file_path(
+                    &attrs.get("inputs:csv_path").cloned().unwrap_or_default(),
+                ),
             );
             insert(
                 node,
@@ -535,6 +547,29 @@ fn apply_prim_properties(
             }
             if let Some(value) = attrs.get("inputs:rebalance_frequency") {
                 insert(node, "rebalance_frequency", value.clone());
+            }
+        }
+        FinanceNodeKind::PerformanceAnalytics => {
+            insert(
+                node,
+                "name",
+                attrs
+                    .get("inputs:name")
+                    .or_else(|| attrs.get(USER_LABEL_ATTR))
+                    .cloned()
+                    .unwrap_or_else(|| prim_leaf(prim_path).to_string()),
+            );
+            if let Some(value) = attrs.get("inputs:risk_free_rate") {
+                insert(node, "risk_free_rate", value.clone());
+            }
+            if let Some(value) = attrs.get("inputs:rolling_window") {
+                insert(node, "rolling_window", value.clone());
+            }
+            if let Some(value) = attrs.get("inputs:benchmark_mode") {
+                insert(node, "benchmark_mode", value.clone());
+            }
+            if let Some(value) = attrs.get("inputs:benchmark_symbol") {
+                insert(node, "benchmark_symbol", value.clone());
             }
         }
     }
@@ -655,22 +690,37 @@ fn write_prim_block(
 }
 
 fn write_attribute(out: &mut String, key: &str, value: &str) {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    let (usd_type, formatted) = if value == "true" || value == "false" {
-        ("bool", value.to_string())
+    let normalized = if key == "inputs:csv_path" {
+        normalize_finance_file_path(value)
+    } else {
+        value.to_string()
+    };
+    let escaped = normalized.replace('\\', "\\\\").replace('"', "\\\"");
+    let (usd_type, formatted) = if normalized == "true" || normalized == "false" {
+        ("bool", normalized.clone())
+    } else if key == "inputs:csv_path" {
+        ("string", format!("\"{escaped}\""))
     } else if key.starts_with("info:")
         || key == "inputs:category"
         || key == "inputs:sub_category"
     {
         ("string", format!("\"{escaped}\""))
-    } else if value.parse::<f64>().is_ok() && !value.is_empty() {
-        ("float", value.to_string())
-    } else if value.parse::<u64>().is_ok() && !value.is_empty() {
-        ("int", value.to_string())
+    } else if normalized.parse::<f64>().is_ok() && !normalized.is_empty() {
+        ("float", normalized.clone())
+    } else if normalized.parse::<u64>().is_ok() && !normalized.is_empty() {
+        ("int", normalized.clone())
     } else {
         ("token", format!("\"{escaped}\""))
     };
     out.push_str(&format!("            {usd_type} {key} = {formatted}\n"));
+}
+
+fn parse_usd_string_attribute(property: &str, value: &str) -> String {
+    if property == "inputs:csv_path" {
+        normalize_finance_file_path(value)
+    } else {
+        value.trim_matches('"').to_string()
+    }
 }
 
 fn prim_in_scope(path: &str, scope: &str) -> bool {
@@ -764,6 +814,7 @@ fn is_schema_template_prim(path: &str) -> bool {
             | "/OtlOperator"
             | "/OtlTaUberSignal"
             | "/PortfolioIntegrator"
+            | "/PerformanceAnalytics"
             | "/Typed"
             | "/Plugins"
             | "/Scope"
@@ -781,9 +832,8 @@ fn prim_type_name(stage: &Stage, path_str: &str) -> Option<String> {
 
 fn classify_type_name(type_name: &str) -> Option<&str> {
     match type_name {
-        "FinancialAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator" => {
-            Some(type_name)
-        }
+        "FinancialAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator"
+        | "PerformanceAnalytics" => Some(type_name),
         _ => None,
     }
 }
@@ -812,7 +862,8 @@ fn read_prim_attributes(stage: &Stage, path_str: &str) -> HashMap<String, String
             let property_path = format!("{path_str}.{property}");
             if let Ok(Some(value)) = stage.field::<String>(property_path.as_str(), FieldKey::Default)
             {
-                attributes.insert(property, value.trim_matches('"').to_string());
+                let parsed = parse_usd_string_attribute(&property, &value);
+                attributes.insert(property, parsed);
             } else if let Ok(Some(value)) =
                 stage.field::<f64>(property_path.as_str(), FieldKey::Default)
             {

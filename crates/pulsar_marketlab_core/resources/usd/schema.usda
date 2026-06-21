@@ -90,3 +90,18 @@ class "PortfolioIntegrator" (
     token outputs:portfolio_wealth
     string outputs:weights = ""
 }
+
+class "PerformanceAnalytics" (
+    inherits = </Typed>
+    doc = "Terminal performance tear-sheet sink; post-sweep reporting only."
+) {
+    string inputs:name = "Performance Report"
+    double inputs:risk_free_rate = 0.0
+    int inputs:rolling_window = 63
+    token inputs:benchmark_mode = "auto" (
+        allowedTokens = ["auto", "wired", "symbol"]
+    )
+    token inputs:benchmark_symbol = "SPY"
+    rel inputs:series
+    rel inputs:benchmark
+}

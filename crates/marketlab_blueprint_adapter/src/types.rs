@@ -5,6 +5,7 @@ pub mod category {
     pub const UNIVERSE: &str = "Universe";
     pub const ANALYTICS: &str = "Analytics";
     pub const PORTFOLIOS: &str = "Portfolios";
+    pub const REPORTING: &str = "Reporting";
 }
 
 /// Graphy `node_type` strings for finance nodes.
@@ -16,6 +17,7 @@ pub mod type_id {
     pub const TA_OSCILLATOR: &str = "marketlab.analytics.ta_oscillator";
     pub const TA_CHANNEL: &str = "marketlab.analytics.ta_channel";
     pub const PORTFOLIO_INTEGRATOR: &str = "marketlab.portfolio.integrator";
+    pub const PERFORMANCE_ANALYTICS: &str = "marketlab.analytics.performance_analytics";
 }
 
 /// Maps to [`pulsar_marketlab_core`] stage prim `type_name` values.
@@ -25,6 +27,7 @@ pub enum FinanceNodeKind {
     OtlOperator,
     OtlTaUberSignal,
     PortfolioIntegrator,
+    PerformanceAnalytics,
 }
 
 impl FinanceNodeKind {
@@ -34,6 +37,7 @@ impl FinanceNodeKind {
             Self::OtlOperator => "OtlOperator",
             Self::OtlTaUberSignal => "OtlTaUberSignal",
             Self::PortfolioIntegrator => "PortfolioIntegrator",
+            Self::PerformanceAnalytics => "PerformanceAnalytics",
         }
     }
 
@@ -43,6 +47,7 @@ impl FinanceNodeKind {
             Self::OtlOperator => type_id::OTL_OPERATOR,
             Self::OtlTaUberSignal => type_id::TA_TREND,
             Self::PortfolioIntegrator => type_id::PORTFOLIO_INTEGRATOR,
+            Self::PerformanceAnalytics => type_id::PERFORMANCE_ANALYTICS,
         }
     }
 
@@ -55,6 +60,7 @@ impl FinanceNodeKind {
             | type_id::TA_OSCILLATOR
             | type_id::TA_CHANNEL => Some(Self::OtlTaUberSignal),
             type_id::PORTFOLIO_INTEGRATOR => Some(Self::PortfolioIntegrator),
+            type_id::PERFORMANCE_ANALYTICS => Some(Self::PerformanceAnalytics),
             _ => None,
         }
     }
@@ -65,6 +71,7 @@ impl FinanceNodeKind {
             "OtlOperator" => Some(Self::OtlOperator),
             "OtlTaUberSignal" => Some(Self::OtlTaUberSignal),
             "PortfolioIntegrator" => Some(Self::PortfolioIntegrator),
+            "PerformanceAnalytics" => Some(Self::PerformanceAnalytics),
             _ => None,
         }
     }

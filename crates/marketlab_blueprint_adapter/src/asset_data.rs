@@ -34,6 +34,52 @@ impl FinanceAssetPreview {
     }
 }
 
+/// Undo USDA string escaping and repair over-escaped Windows file paths.
+pub fn normalize_finance_file_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = unescape_usda_string(trimmed);
+    if normalized.as_bytes().get(1) == Some(&b':') {
+        let (drive, rest) = normalized.split_at(2);
+        let mut fixed_rest = rest.to_string();
+        while fixed_rest.contains("\\\\") {
+            let next = fixed_rest.replace("\\\\", "\\");
+            if next == fixed_rest {
+                break;
+            }
+            fixed_rest = next;
+        }
+        normalized = format!("{drive}{fixed_rest}");
+    }
+    normalized
+}
+
+fn unescape_usda_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Load OHLC bars for a financial asset using the same CSV resolver as sweep.
 pub fn load_finance_asset_preview(
     symbol: &str,
@@ -201,7 +247,8 @@ fn resolve_existing_path(path: &str) -> Option<PathBuf> {
 }
 
 fn resolve_csv_path(path: &str) -> PathBuf {
-    let candidate = Path::new(path);
+    let path = normalize_finance_file_path(path);
+    let candidate = Path::new(&path);
     if candidate.is_file() {
         return candidate.to_path_buf();
     }
@@ -360,6 +407,23 @@ mod tests {
         let preview = previews.get("node-1").expect("preview");
         assert!(preview.loaded_from_csv, "{:?}", preview.warnings);
         assert!(!preview.bars.is_empty());
+    }
+
+    #[test]
+    fn normalize_finance_file_path_repairs_over_escaped_windows_paths() {
+        let corrupted = r"C:\\\\Users\\\\joeff\\\\portfolios\\\\RiskParity_1\\\\VEA.csv";
+        assert_eq!(
+            normalize_finance_file_path(corrupted),
+            r"C:\Users\joeff\portfolios\RiskParity_1\VEA.csv"
+        );
+    }
+
+    #[test]
+    fn normalize_finance_file_path_unescapes_usda_once() {
+        assert_eq!(
+            normalize_finance_file_path(r"C:\\Users\\joeff\\VEA.csv"),
+            r"C:\Users\joeff\VEA.csv"
+        );
     }
 
     #[test]

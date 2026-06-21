@@ -20,6 +20,7 @@ pub fn finance_display_label(node_type: &str) -> Option<&'static str> {
         type_id::TA_OSCILLATOR => Some("TA Oscillator"),
         type_id::TA_CHANNEL => Some("TA Channel"),
         type_id::PORTFOLIO_INTEGRATOR => Some("Portfolio Integrator"),
+        type_id::PERFORMANCE_ANALYTICS => Some("Performance Analytics"),
         _ => None,
     }
 }
@@ -41,6 +42,7 @@ pub fn finance_category_icon(category: &str) -> &'static str {
         crate::types::category::UNIVERSE => "📈",
         crate::types::category::ANALYTICS => "ƒ",
         crate::types::category::PORTFOLIOS => "⚖",
+        crate::types::category::REPORTING => "📊",
         _ => "◆",
     }
 }
@@ -79,6 +81,10 @@ pub fn finance_is_analytics_node(definition_id: &str) -> bool {
     )
 }
 
+pub fn finance_is_reporting_node(definition_id: &str) -> bool {
+    definition_id == type_id::PERFORMANCE_ANALYTICS
+}
+
 /// GPU header tint by finance namespace (green / blue / violet).
 pub fn finance_node_header_rgba(definition_id: &str) -> Option<[f32; 4]> {
     if !is_marketlab_finance_node(definition_id) {
@@ -86,6 +92,9 @@ pub fn finance_node_header_rgba(definition_id: &str) -> Option<[f32; 4]> {
     }
     if definition_id.starts_with("marketlab.universe.") {
         return Some([0.22, 0.72, 0.38, 1.0]);
+    }
+    if definition_id == type_id::PERFORMANCE_ANALYTICS {
+        return Some([0.88, 0.62, 0.18, 1.0]);
     }
     if definition_id.starts_with("marketlab.analytics.") {
         return Some([0.28, 0.52, 0.92, 1.0]);
@@ -133,6 +142,14 @@ pub fn finance_node_graph_title(
                 .map(|token| crate::format_variant_label(token))
                 .unwrap_or_else(|| "[Default]".to_string());
             Some(format!("{name} · {allocation}"))
+        }
+        type_id::PERFORMANCE_ANALYTICS => {
+            let name = properties
+                .get("name")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Performance Report");
+            Some(name.to_string())
         }
         _ => Some(base.to_string()),
     }
