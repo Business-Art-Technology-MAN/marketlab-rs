@@ -123,14 +123,20 @@ fn resolve_series(
 ) -> Option<Vec<f64>> {
     let node = ctx.graph.nodes.get(node_id)?;
     match node.node_type.as_str() {
-        type_id::FINANCIAL_ASSET => {
+        type_id::FINANCIAL_ASSET | type_id::FINANCIAL_RETURN_ASSET => {
             let symbol = property_string(node, "symbol").unwrap_or_else(|| "SPY".into());
             let csv = property_string(node, "csv_path");
             let preview = ctx
                 .asset_previews
                 .get(node_id)
                 .cloned()
-                .unwrap_or_else(|| load_finance_asset_preview(&symbol, csv.as_deref()));
+                .unwrap_or_else(|| {
+                    crate::asset_data::load_finance_asset_preview_for_node(
+                        &node.node_type,
+                        &symbol,
+                        csv.as_deref(),
+                    )
+                });
             let mut series = preview.close_series();
             trim_to_timeline(&mut series, ctx.sweep.timeline_len);
             Some(series)
@@ -289,7 +295,7 @@ fn collect_upstream_lineage(report_node_id: &str, graph: &GraphDescription) -> V
 }
 
 fn lineage_label(node: &graphy::NodeInstance) -> String {
-    if node.node_type == type_id::FINANCIAL_ASSET {
+    if node.node_type == type_id::FINANCIAL_ASSET || node.node_type == type_id::FINANCIAL_RETURN_ASSET {
         return property_string(node, "symbol").unwrap_or_else(|| "Asset".into());
     }
     if node.node_type == type_id::PORTFOLIO_INTEGRATOR {
@@ -316,7 +322,7 @@ fn upstream_financial_assets(report_node_id: &str, graph: &GraphDescription) -> 
             continue;
         }
         if let Some(node) = graph.nodes.get(&id) {
-            if node.node_type == type_id::FINANCIAL_ASSET {
+            if node.node_type == type_id::FINANCIAL_ASSET || node.node_type == type_id::FINANCIAL_RETURN_ASSET {
                 assets.push(id);
                 continue;
             }

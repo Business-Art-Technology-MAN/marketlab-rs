@@ -311,7 +311,7 @@ impl MarketLabGraphEngine {
         let mut nodes = Vec::with_capacity(snapshot.prims.len());
         for prim in &snapshot.prims {
             let node = match prim.type_name.as_str() {
-                "FinancialAsset" => ExecutionNode::DataInput {
+                "FinancialAsset" | "FinancialReturnAsset" => ExecutionNode::DataInput {
                     // Canonical execution key: absolute prim path (matches asset vector map).
                     symbol: prim.path.clone(),
                 },
@@ -641,27 +641,50 @@ impl MarketLabGraphEngine {
                     tier_kind: _,
                     tier_program: _,
                 }) => {
-                    let upstream: Vec<f64> = self
-                        .graph
-                        .neighbors_directed(*index, Direction::Incoming)
-                        .flat_map(|upstream_index| {
-                            node_outputs
-                                .get(&upstream_index)
-                                .map(|output| output.scalar.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    let scalar = passthrough_signal(&upstream, timeline_len, expression);
-                    let asset_symbol = infer_upstream_asset_symbol(&self.graph, *index, &node_outputs);
+                    let mut upstream_scratch = Vec::new();
+                    gather_upstream_into(
+                        &mut upstream_scratch,
+                        &self.graph,
+                        *index,
+                        &node_outputs,
+                    );
+                    let scalar = passthrough_signal(&upstream_scratch, timeline_len, expression);
+                    let asset_symbol = infer_upstream_asset_symbol(&self.graph, *index, &node_outputs)
+                        .or_else(|| Some(self.prim_path_for_index(*index).to_string()));
                     NodeRuntimeOutput {
                         scalar: pad_or_trim(scalar, timeline_len),
                         asset_symbol,
                     }
                 }
-                Some(ExecutionNode::PortfolioSink { .. }) => NodeRuntimeOutput {
-                    scalar: vec![0.0; timeline_len],
-                    asset_symbol: None,
-                },
+                Some(ExecutionNode::PortfolioSink {
+                    method,
+                    initial_capital,
+                    otl_script,
+                    otl_hook,
+                    ..
+                }) => {
+                    let quotes = build_asset_quotes_from_vectors(asset_vectors);
+                    let prim_path = self.prim_path_for_index(*index).to_string();
+                    let mut scratch_streams = Vec::new();
+                    let mut scratch_token_streams = Vec::new();
+                    let mut scratch_portfolio_results = HashMap::new();
+                    legacy_portfolio_runtime(
+                        &self.graph,
+                        *index,
+                        &node_outputs,
+                        &self.node_prim_paths,
+                        method,
+                        *initial_capital,
+                        otl_script,
+                        otl_hook.as_deref(),
+                        timeline_len,
+                        &quotes,
+                        &prim_path,
+                        &mut scratch_streams,
+                        &mut scratch_token_streams,
+                        &mut scratch_portfolio_results,
+                    )
+                }
                 None => NodeRuntimeOutput {
                     scalar: vec![0.0; timeline_len],
                     asset_symbol: None,
@@ -1749,6 +1772,41 @@ fn passthrough_signal(upstream: &[f64], timeline_len: usize, expression: &str) -
     vec![0.0; timeline_len]
 }
 
+/// When a child portfolio's wealth series is wired through analytics into a parent
+/// portfolio, treat the leg as a sub-portfolio NAV stream (not a trade gate on quotes).
+fn upstream_child_portfolio_leg(
+    graph: &StableGraph<ExecutionNode, ()>,
+    upstream_index: NodeIndex,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+    node_prim_paths: &[Arc<str>],
+) -> Option<(String, Vec<f64>)> {
+    if matches!(
+        graph.node_weight(upstream_index),
+        Some(ExecutionNode::PortfolioSink { .. })
+    ) {
+        return None;
+    }
+    for portfolio_index in graph.neighbors_directed(upstream_index, Direction::Incoming) {
+        if !matches!(
+            graph.node_weight(portfolio_index),
+            Some(ExecutionNode::PortfolioSink { .. })
+        ) {
+            continue;
+        }
+        let asset_id = node_prim_paths
+            .get(portfolio_index.index())
+            .filter(|path| !path.is_empty())
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| format!("leg_{portfolio_index:?}"));
+        let series = node_outputs
+            .get(&portfolio_index)
+            .map(|output| output.scalar.clone())
+            .filter(|series| !series.is_empty())?;
+        return Some((asset_id, series));
+    }
+    None
+}
+
 fn collect_upstream_legs(
     graph: &StableGraph<ExecutionNode, ()>,
     index: NodeIndex,
@@ -1759,6 +1817,12 @@ fn collect_upstream_legs(
     graph
         .neighbors_directed(index, Direction::Incoming)
         .map(|upstream_index| {
+            if let Some((asset_id, series)) =
+                upstream_child_portfolio_leg(graph, upstream_index, node_outputs, node_prim_paths)
+            {
+                return (asset_id, series, ClosureLegKind::SubPortfolio);
+            }
+
             let leg_kind = graph
                 .node_weight(upstream_index)
                 .map(|node| match node {
@@ -1767,8 +1831,8 @@ fn collect_upstream_legs(
                 })
                 .unwrap_or(ClosureLegKind::Asset);
             let output = node_outputs.get(&upstream_index);
-            let asset_id = output
-                .and_then(|o| o.asset_symbol.clone())
+            let asset_id = infer_upstream_asset_symbol(graph, upstream_index, node_outputs)
+                .or_else(|| output.and_then(|o| o.asset_symbol.clone()))
                 .or_else(|| {
                     graph.node_weight(upstream_index).and_then(|node| match node {
                         ExecutionNode::DataInput { symbol } => Some(symbol.clone()),
@@ -1814,13 +1878,26 @@ fn trade_gate_series_from_ta_upstream(
     else {
         return indicator_series;
     };
-    if indicator_series.is_empty() || !expression.contains("ta::") {
+    if indicator_series.is_empty()
+        || (!expression.contains("ta::")
+            && !expression.contains("spread_sign")
+            && !expression.contains("step("))
+    {
         return indicator_series;
     }
 
     if indicator_series.iter().all(|value| {
         *value == -1.0 || *value == 0.0 || *value == 1.0
     }) && indicator_series.iter().any(|value| *value != 0.0)
+    {
+        return indicator_series;
+    }
+
+    let expression = expression.to_ascii_lowercase();
+    if expression.contains("spread_sign")
+        || expression.contains("ma_signal")
+        || expression.contains("step(")
+        || expression.contains("ta::cross(")
     {
         return indicator_series;
     }
@@ -1841,7 +1918,6 @@ fn trade_gate_series_from_ta_upstream(
     let price_series = &price_series[..len];
     let indicator_series = &indicator_series[..len];
 
-    let expression = expression.to_ascii_lowercase();
     if expression.contains("ta::sma")
         || expression.contains("ta::ema")
         || expression.contains("ta::wma")
@@ -1892,10 +1968,18 @@ fn gather_upstream_into(
     node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
 ) {
     scratch.clear();
+    let mut best: Option<&[f64]> = None;
     for upstream_index in graph.neighbors_directed(index, Direction::Incoming) {
-        if let Some(output) = node_outputs.get(&upstream_index) {
-            scratch.extend_from_slice(&output.scalar);
+        let Some(output) = node_outputs.get(&upstream_index) else {
+            continue;
+        };
+        let series = output.scalar.as_slice();
+        if best.is_none() || series.len() > best.unwrap().len() {
+            best = Some(series);
         }
+    }
+    if let Some(series) = best {
+        scratch.extend_from_slice(series);
     }
 }
 

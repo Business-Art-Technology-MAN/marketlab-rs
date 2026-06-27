@@ -85,7 +85,7 @@ fn build_report(graph: &GraphDescription, snapshot: &StageGraphSnapshot) -> Fina
 
     for prim in &snapshot.prims {
         match prim.type_name.as_str() {
-            "FinancialAsset" => asset_count += 1,
+            "FinancialAsset" | "FinancialReturnAsset" => asset_count += 1,
             "OtlOperator" | "OtlTaUberSignal" => analytics_count += 1,
             "PortfolioIntegrator" => portfolio_count += 1,
             _ => {}
@@ -116,11 +116,52 @@ fn build_report(graph: &GraphDescription, snapshot: &StageGraphSnapshot) -> Fina
                     ));
                 }
             }
+            FinanceNodeKind::FinancialReturnAsset => {
+                let csv = node
+                    .properties
+                    .get("csv_path")
+                    .and_then(json_to_string)
+                    .unwrap_or_default();
+                if csv.is_empty() {
+                    warnings.push(format!(
+                        "Return asset '{}' requires csv_path (Date,<Name> simple-return CSV)",
+                        node.id
+                    ));
+                }
+            }
             FinanceNodeKind::PortfolioIntegrator => {
                 let wired = graph.connections.iter().any(|wire| wire.target_node == node.id);
                 if !wired {
                     warnings.push(format!(
                         "Portfolio '{}' has no inbound signal wires",
+                        node.id
+                    ));
+                }
+            }
+            FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal => {
+                let wired = graph.connections.iter().any(|wire| wire.target_node == node.id);
+                if !wired {
+                    warnings.push(format!(
+                        "Analytics '{}' has no upstream price wire — TA/OTL will run on zeros until source_stream is connected",
+                        node.id
+                    ));
+                }
+                let price_feeds = graph
+                    .connections
+                    .iter()
+                    .filter(|wire| wire.target_node == node.id)
+                    .filter(|wire| {
+                        graph
+                            .nodes
+                            .get(&wire.source_node)
+                            .and_then(|source| FinanceNodeKind::from_graphy_type_id(&source.node_type))
+                            .map(|kind| kind.is_price_source())
+                            .unwrap_or(false)
+                    })
+                    .count();
+                if price_feeds > 1 {
+                    warnings.push(format!(
+                        "Analytics '{}' has {price_feeds} upstream price wires — only one series is used; wire one asset per TA node",
                         node.id
                     ));
                 }

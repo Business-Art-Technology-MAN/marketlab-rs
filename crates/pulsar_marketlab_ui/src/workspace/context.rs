@@ -1166,16 +1166,6 @@ impl WorkspaceContext {
         None
     }
 
-    fn numeric_stream_display_for_attribute(
-        &self,
-        prim_path: &str,
-        attribute: &str,
-        frame_idx: usize,
-    ) -> Option<String> {
-        self.numeric_stream_value_for_attribute(prim_path, attribute, frame_idx)
-            .map(|value| format!("{value:.2}"))
-    }
-
     fn numeric_stream_value_for_attribute(
         &self,
         prim_path: &str,

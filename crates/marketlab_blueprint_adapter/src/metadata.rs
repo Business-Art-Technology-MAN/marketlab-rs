@@ -62,6 +62,27 @@ fn financial_asset_metadata() -> NodeMetadata {
     .with_version(1)
 }
 
+fn financial_return_asset_metadata() -> NodeMetadata {
+    NodeMetadata::new(
+        type_id::FINANCIAL_RETURN_ASSET,
+        NodeTypes::pure,
+        category::UNIVERSE,
+    )
+    .with_return_type(TypeInfo::new(FINANCE_SIGNAL_TYPE))
+    .with_property_schema(vec![
+        PropertySchema::new("symbol", "Symbol", ReflectedType::parse_str("String"))
+            .with_tooltip("Optional — leave empty to use the CSV column header (e.g. Winton)"),
+        PropertySchema::new("csv_path", "CSV path", ReflectedType::parse_str("String"))
+            .with_tooltip("Required. `Date,<Name>` header row; second column = simple returns"),
+        PropertySchema::new("prim_path", "Stage path", ReflectedType::parse_str("String"))
+            .with_tooltip("Absolute USD prim path, e.g. /MarketLab/Universe/Winton"),
+        PropertySchema::new("asset_class", "Asset class", ReflectedType::parse_str("String"))
+            .with_default(PropertyValue::String("Alternative".into())),
+    ])
+    .with_doc("Return Series Asset")
+    .with_version(1)
+}
+
 fn otl_operator_metadata() -> NodeMetadata {
     NodeMetadata::new(
         type_id::OTL_OPERATOR,
@@ -76,7 +97,10 @@ fn otl_operator_metadata() -> NodeMetadata {
                 "script_src",
                 "OTL source",
                 ReflectedType::parse_str("String"),
-            ),
+            )
+            .with_default(PropertyValue::String(
+                "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))".into(),
+            )),
             PropertySchema::new(
                 "script_compiled_path",
                 "Compiled OTL path",
@@ -112,9 +136,11 @@ fn ta_uber_metadata(type_id: &'static str, archetype: TaArchetype) -> NodeMetada
                 archetype.default_algorithm().to_string(),
             )),
             PropertySchema::new("period", "Period", ReflectedType::parse_str("u32"))
-                .with_default(PropertyValue::Int(archetype.default_period() as i64)),
+                .with_default(PropertyValue::Int(archetype.default_period() as i64))
+                .with_tooltip("Fast MA lookback for crossover signals (shorter of the two MA periods)"),
             PropertySchema::new("signal_period", "Signal period", ReflectedType::parse_str("u32"))
-                .with_default(PropertyValue::Int(9)),
+                .with_default(PropertyValue::Int(archetype.default_signal_period() as i64))
+                .with_tooltip("Slow MA lookback for crossover signals (longer of the two MA periods)"),
             PropertySchema::new("multiplier", "Multiplier", ReflectedType::parse_str("f64"))
                 .with_default(PropertyValue::Float(2.0)),
             PropertySchema::new(
@@ -220,6 +246,7 @@ pub fn finance_node_catalog() -> HashMap<String, NodeMetadata> {
 
     let entries: Vec<NodeMetadata> = vec![
         financial_asset_metadata(),
+        financial_return_asset_metadata(),
         otl_operator_metadata(),
         ta_uber_metadata(type_id::TA_TREND, TaArchetype::Trend),
         ta_uber_metadata(type_id::TA_VOLATILITY, TaArchetype::Volatility),
@@ -244,6 +271,7 @@ mod tests {
     fn catalog_registers_all_finance_archetypes() {
         let catalog = finance_node_catalog();
         assert!(catalog.contains_key(type_id::FINANCIAL_ASSET));
+        assert!(catalog.contains_key(type_id::FINANCIAL_RETURN_ASSET));
         assert!(catalog.contains_key(type_id::OTL_OPERATOR));
         assert!(catalog.contains_key(type_id::TA_OSCILLATOR));
         assert!(catalog.contains_key(type_id::PORTFOLIO_INTEGRATOR));

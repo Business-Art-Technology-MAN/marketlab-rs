@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 
 use pulsar_marketlab_core::StageGraphSnapshot;
 
+use crate::types::{is_finance_price_asset_stage_type, type_id};
+
 const DEFAULT_BAR_COUNT: usize = 252;
 const FLAT_FALLBACK_PRICE: f64 = 100.0;
+/// Synthetic price index base when compounding simple returns on ingestion.
+const RETURN_INDEX_BASE: f64 = 100.0;
 
 /// One OHLC bar for chart preview.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +30,8 @@ pub struct FinanceAssetPreview {
     pub synthetic: bool,
     pub warnings: Vec<String>,
     pub bars: Vec<FinanceOhlcBar>,
+    /// Wall-clock labels aligned 1:1 with [`bars`] (warm UI path only).
+    pub string_timestamps: Vec<String>,
 }
 
 impl FinanceAssetPreview {
@@ -41,7 +47,9 @@ pub fn normalize_finance_file_path(path: &str) -> String {
         return String::new();
     }
 
-    let mut normalized = unescape_usda_string(trimmed);
+    let stripped = strip_windows_verbatim_path_prefix(trimmed);
+    let repaired = repair_windows_path_tab_corruption(&stripped);
+    let mut normalized = unescape_usda_file_path(&repaired);
     if normalized.as_bytes().get(1) == Some(&b':') {
         let (drive, rest) = normalized.split_at(2);
         let mut fixed_rest = rest.to_string();
@@ -57,7 +65,29 @@ pub fn normalize_finance_file_path(path: &str) -> String {
     normalized
 }
 
-fn unescape_usda_string(value: &str) -> String {
+/// Strip Win32 extended-length prefixes (`\\?\`, `\\?\UNC\`) from canonicalized paths.
+fn strip_windows_verbatim_path_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Tabs in `C:\…` paths are almost always `\t` segments that were wrongly unescaped.
+fn repair_windows_path_tab_corruption(path: &str) -> String {
+    if path.as_bytes().get(1) == Some(&b':') && path.contains('\t') {
+        path.replace('\t', "\\t")
+    } else {
+        path.to_string()
+    }
+}
+
+/// USDA file-path unescape — only `\\` and `\"`. Never treat `\t`/`\n`/`\r` as C escapes;
+/// Windows paths contain literal backslash + `t` in segments like `\tmp`.
+fn unescape_usda_file_path(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
     while let Some(ch) = chars.next() {
@@ -65,8 +95,6 @@ fn unescape_usda_string(value: &str) -> String {
             match chars.next() {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -93,14 +121,15 @@ pub fn load_finance_asset_preview(
 
     for candidate in candidates {
         match load_ohlc_bars(&candidate.path) {
-            Ok(bars) if !bars.is_empty() => {
+            Ok(loaded) if !loaded.bars.is_empty() => {
                 return FinanceAssetPreview {
                     symbol,
                     source_path: Some(candidate.path),
                     loaded_from_csv: true,
                     synthetic: false,
                     warnings,
-                    bars,
+                    bars: loaded.bars,
+                    string_timestamps: loaded.timestamps,
                 };
             }
             Ok(_) => warnings.push(format!(
@@ -117,13 +146,99 @@ pub fn load_finance_asset_preview(
     warnings.push(format!(
         "{symbol}: using flat synthetic OHLC — set csv_path or leave empty for bundled data/{symbol}.csv"
     ));
+    let bars = flat_ohlc_series(DEFAULT_BAR_COUNT);
     FinanceAssetPreview {
         symbol,
         source_path: None,
         loaded_from_csv: false,
         synthetic: true,
         warnings,
-        bars: flat_ohlc_series(DEFAULT_BAR_COUNT),
+        string_timestamps: synthetic_preview_timestamps(bars.len()),
+        bars,
+    }
+}
+
+/// Load preview bars for a finance price-source node (OHLC or return-series CSV).
+pub fn load_finance_asset_preview_for_node(
+    node_type: &str,
+    symbol: &str,
+    explicit_csv_path: Option<&str>,
+) -> FinanceAssetPreview {
+    if node_type == type_id::FINANCIAL_RETURN_ASSET {
+        load_finance_return_asset_preview(symbol, explicit_csv_path)
+    } else {
+        load_finance_asset_preview(symbol, explicit_csv_path)
+    }
+}
+
+/// Load a return-series asset (`Date, <Symbol>` CSV) and synthesize an index price path.
+pub fn load_finance_return_asset_preview(
+    symbol_hint: &str,
+    explicit_csv_path: Option<&str>,
+) -> FinanceAssetPreview {
+    let mut warnings = Vec::new();
+    let Some(path) = explicit_csv_path
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(resolve_csv_path)
+        .filter(|path| path.is_file())
+    else {
+        warnings.push(
+            "Return asset requires csv_path — expected `Date,<Name>` header with simple returns"
+                .to_string(),
+        );
+        let bars = flat_ohlc_series(DEFAULT_BAR_COUNT);
+        return FinanceAssetPreview {
+            symbol: fallback_symbol(symbol_hint),
+            source_path: None,
+            loaded_from_csv: false,
+            synthetic: true,
+            warnings,
+            string_timestamps: synthetic_preview_timestamps(bars.len()),
+            bars,
+        };
+    };
+
+    match load_return_series_csv(&path) {
+        Ok(loaded) => {
+            let symbol = if symbol_hint.trim().is_empty() {
+                loaded.header_symbol.clone()
+            } else {
+                symbol_hint.trim().to_string()
+            };
+            let bars = returns_to_ohlc_bars(&loaded.returns);
+            FinanceAssetPreview {
+                symbol,
+                source_path: Some(path),
+                loaded_from_csv: true,
+                synthetic: false,
+                warnings,
+                bars,
+                string_timestamps: loaded.timestamps,
+            }
+        }
+        Err(error) => {
+            warnings.push(format!("CSV load failed for `{}` ({error})", path.display()));
+            let bars = flat_ohlc_series(DEFAULT_BAR_COUNT);
+            FinanceAssetPreview {
+                symbol: fallback_symbol(symbol_hint),
+                source_path: Some(path),
+                loaded_from_csv: false,
+                synthetic: true,
+                warnings,
+                string_timestamps: synthetic_preview_timestamps(bars.len()),
+                bars,
+            }
+        }
+    }
+}
+
+fn fallback_symbol(symbol_hint: &str) -> String {
+    let trimmed = symbol_hint.trim();
+    if trimmed.is_empty() {
+        "RETURN".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -137,21 +252,59 @@ pub fn finance_asset_previews_for_snapshot(
         let Some(prim) = snapshot.prims.iter().find(|prim| &prim.path == prim_path) else {
             continue;
         };
-        if prim.type_name != "FinancialAsset" {
+        if !is_finance_price_asset_stage_type(&prim.type_name) {
             continue;
         }
         let symbol = prim
             .attributes
             .get("inputs:symbol")
             .map(|value| value.as_str())
-            .unwrap_or("SPY");
+            .unwrap_or("");
         let csv_path = prim.attributes.get("inputs:csv_path").map(|value| value.as_str());
+        let node_type = if prim.type_name == "FinancialReturnAsset" {
+            type_id::FINANCIAL_RETURN_ASSET
+        } else {
+            type_id::FINANCIAL_ASSET
+        };
         previews.insert(
             node_id.clone(),
-            load_finance_asset_preview(symbol, csv_path),
+            load_finance_asset_preview_for_node(node_type, symbol, csv_path),
         );
     }
     previews
+}
+
+/// Close prices for engine sweep (same resolver as preview loaders).
+pub(crate) fn load_asset_close_series_for_prim(
+    prim: &pulsar_marketlab_core::StageGraphPrim,
+    warnings: &mut Vec<String>,
+) -> (Vec<f64>, bool, bool) {
+    let symbol = prim
+        .attributes
+        .get("inputs:symbol")
+        .map(|value| value.as_str())
+        .unwrap_or("");
+    let explicit_csv = prim.attributes.get("inputs:csv_path");
+    let preview = if prim.type_name == "FinancialReturnAsset" {
+        load_finance_return_asset_preview(symbol, explicit_csv.map(String::as_str))
+    } else {
+        load_finance_asset_preview(
+            symbol,
+            explicit_csv.map(|value| value.as_str()),
+        )
+    };
+    warnings.extend(
+        preview
+            .warnings
+            .iter()
+            .map(|message| format!("{}: {message}", prim.path)),
+    );
+    let closes = preview.close_series();
+    if preview.loaded_from_csv {
+        (closes, true, false)
+    } else {
+        (closes, false, true)
+    }
 }
 
 /// Close prices for engine sweep (same resolver as [`load_finance_asset_preview`]).
@@ -278,7 +431,13 @@ fn bundled_csv_candidates(symbol: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn load_ohlc_bars(path: &Path) -> Result<Vec<FinanceOhlcBar>, String> {
+#[derive(Clone, Debug, PartialEq)]
+struct OhlcCsvLoad {
+    bars: Vec<FinanceOhlcBar>,
+    timestamps: Vec<String>,
+}
+
+fn load_ohlc_bars(path: &Path) -> Result<OhlcCsvLoad, String> {
     if !path.is_file() {
         return Err(format!("file not found at {}", path.display()));
     }
@@ -295,8 +454,10 @@ fn load_ohlc_bars(path: &Path) -> Result<Vec<FinanceOhlcBar>, String> {
     let low_idx = csv_header_index(&headers, &["Low"]).ok_or_else(|| missing_columns(path, &headers))?;
     let close_idx =
         csv_header_index(&headers, &["Adj Close", "Close"]).ok_or_else(|| missing_columns(path, &headers))?;
+    let date_idx = csv_header_index(&headers, &["Date"]).unwrap_or(0);
 
     let mut bars = Vec::new();
+    let mut timestamps = Vec::new();
     for (offset, record) in reader.records().enumerate() {
         let record = record.map_err(|error| format!("row {}: {error}", offset + 2))?;
         let first = record.get(0).unwrap_or("").trim();
@@ -306,6 +467,115 @@ fn load_ohlc_bars(path: &Path) -> Result<Vec<FinanceOhlcBar>, String> {
         let Some((open, high, low, close)) = parse_ohlc_row(&record, open_idx, high_idx, low_idx, close_idx) else {
             continue;
         };
+        let date_label = record
+            .get(date_idx)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("Bar {}", bars.len()));
+        bars.push(FinanceOhlcBar {
+            open,
+            high,
+            low,
+            close,
+        });
+        timestamps.push(date_label);
+    }
+
+    if bars.is_empty() {
+        return Err(format!("no OHLC rows parsed from {}", path.display()));
+    }
+    Ok(OhlcCsvLoad { bars, timestamps })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ReturnSeriesCsvLoad {
+    header_symbol: String,
+    returns: Vec<f64>,
+    timestamps: Vec<String>,
+}
+
+fn load_return_series_csv(path: &Path) -> Result<ReturnSeriesCsvLoad, String> {
+    if !path.is_file() {
+        return Err(format!("file not found at {}", path.display()));
+    }
+
+    let mut reader = csv::Reader::from_path(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let headers = reader
+        .headers()
+        .map_err(|error| format!("read header: {error}"))?
+        .clone();
+
+    let date_idx = csv_header_index(&headers, &["Date"]).ok_or_else(|| {
+        format!(
+            "missing Date column in `{}` (headers: {})",
+            path.display(),
+            headers.iter().collect::<Vec<_>>().join(", ")
+        )
+    })?;
+    let value_idx = (0..headers.len())
+        .find(|index| *index != date_idx)
+        .ok_or_else(|| format!("missing return value column in `{}`", path.display()))?;
+    let header_symbol = headers
+        .get(value_idx)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "RETURN".to_string());
+
+    let mut returns = Vec::new();
+    let mut timestamps = Vec::new();
+    for (offset, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| format!("row {}: {error}", offset + 2))?;
+        let first = record.get(0).unwrap_or("").trim();
+        if first.eq_ignore_ascii_case("Date") {
+            continue;
+        }
+        let Some(ret) = parse_f64_cell(record.get(value_idx)) else {
+            continue;
+        };
+        let date_label = record
+            .get(date_idx)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("Bar {}", returns.len()));
+        returns.push(ret);
+        timestamps.push(date_label);
+    }
+
+    if returns.is_empty() {
+        return Err(format!("no return rows parsed from {}", path.display()));
+    }
+    Ok(ReturnSeriesCsvLoad {
+        header_symbol,
+        returns,
+        timestamps,
+    })
+}
+
+fn parse_f64_cell(raw: Option<&str>) -> Option<f64> {
+    let value = raw?.trim().trim_matches('"');
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<f64>().ok()
+}
+
+/// Compound simple returns into a synthetic OHLC index (base 100).
+pub fn returns_to_ohlc_bars(returns: &[f64]) -> Vec<FinanceOhlcBar> {
+    if returns.is_empty() {
+        return Vec::new();
+    }
+    let mut bars = Vec::with_capacity(returns.len());
+    let mut price = RETURN_INDEX_BASE;
+    for &ret in returns {
+        let open = price;
+        price *= 1.0 + ret;
+        let close = price;
+        let (low, high) = if close >= open {
+            (open, close)
+        } else {
+            (close, open)
+        };
         bars.push(FinanceOhlcBar {
             open,
             high,
@@ -313,11 +583,7 @@ fn load_ohlc_bars(path: &Path) -> Result<Vec<FinanceOhlcBar>, String> {
             close,
         });
     }
-
-    if bars.is_empty() {
-        return Err(format!("no OHLC rows parsed from {}", path.display()));
-    }
-    Ok(bars)
+    bars
 }
 
 fn missing_columns(path: &Path, headers: &csv::StringRecord) -> String {
@@ -355,6 +621,10 @@ fn csv_header_index(headers: &csv::StringRecord, names: &[&str]) -> Option<usize
     None
 }
 
+fn synthetic_preview_timestamps(len: usize) -> Vec<String> {
+    (0..len.max(1)).map(|index| format!("Bar {index}")).collect()
+}
+
 fn flat_ohlc_series(len: usize) -> Vec<FinanceOhlcBar> {
     vec![
         FinanceOhlcBar {
@@ -372,12 +642,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loads_return_series_csv_and_compounds_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("winton.csv");
+        std::fs::write(
+            &path,
+            "Date,Winton\n\
+             12/1/2024,0.0231\n\
+             12/2/2024,0.0023\n\
+             12/3/2024,-0.001234\n",
+        )
+        .expect("write csv");
+        let preview = load_finance_return_asset_preview("", path.to_str());
+        assert!(preview.loaded_from_csv, "{:?}", preview.warnings);
+        assert_eq!(preview.symbol, "Winton");
+        assert_eq!(preview.bars.len(), 3);
+        assert!((preview.bars[0].close - 102.31).abs() < 1e-6);
+        assert!((preview.bars[1].close - 102.545313).abs() < 1e-4);
+        assert_eq!(preview.string_timestamps.len(), 3);
+    }
+
+    #[test]
+    fn return_preview_respects_symbol_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("winton.csv");
+        std::fs::write(&path, "Date,Winton\n12/1/2024,0.01\n").expect("write csv");
+        let preview = load_finance_return_asset_preview("CUSTOM", path.to_str());
+        assert_eq!(preview.symbol, "CUSTOM");
+    }
+
+    #[test]
+    fn returns_to_ohlc_starts_at_base() {
+        let bars = returns_to_ohlc_bars(&[0.1, -0.05]);
+        assert!((bars[0].open - RETURN_INDEX_BASE).abs() < f64::EPSILON);
+        assert!((bars[0].close - 110.0).abs() < 1e-9);
+        assert!((bars[1].close - 104.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn loads_bundled_spy_ohlc_without_explicit_path() {
         let preview = load_finance_asset_preview("SPY", None);
         assert!(preview.loaded_from_csv, "{:?}", preview.warnings);
         assert!(!preview.synthetic);
         assert!(preview.bars.len() >= 2);
         assert!(preview.bars[0].close > 0.0);
+        assert_eq!(preview.string_timestamps.len(), preview.bars.len());
+        assert!(preview.string_timestamps[0].starts_with("2024"));
     }
 
     #[test]
@@ -423,6 +733,31 @@ mod tests {
         assert_eq!(
             normalize_finance_file_path(r"C:\\Users\\joeff\\VEA.csv"),
             r"C:\Users\joeff\VEA.csv"
+        );
+    }
+
+    #[test]
+    fn normalize_finance_file_path_preserves_windows_tmp_segments() {
+        assert_eq!(
+            normalize_finance_file_path(r"C:\tmp\testdata\stream_1.csv"),
+            r"C:\tmp\testdata\stream_1.csv"
+        );
+    }
+
+    #[test]
+    fn normalize_finance_file_path_strips_verbatim_prefix() {
+        assert_eq!(
+            normalize_finance_file_path(r"\\?\C:\tmp\testdata\stream_2.csv"),
+            r"C:\tmp\testdata\stream_2.csv"
+        );
+    }
+
+    #[test]
+    fn normalize_finance_file_path_repairs_tab_corrupted_windows_paths() {
+        let corrupted = format!("C:{tab}mp{tab}estdata\\stream_1.csv", tab = '\t');
+        assert_eq!(
+            normalize_finance_file_path(&corrupted),
+            r"C:\tmp\testdata\stream_1.csv"
         );
     }
 

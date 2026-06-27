@@ -62,6 +62,13 @@ impl CompiledProgramTier {
 
 type SharedSeriesFn = Arc<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>;
 
+fn series_is_discrete_gate(series: &[f64]) -> bool {
+    !series.is_empty()
+        && series.iter().all(|value| {
+            value.is_finite() && matches!(*value, -1.0 | 0.0 | 1.0)
+        })
+}
+
 /// Signal tier: alpha conviction stream over the full timeline.
 pub struct SignalExecutionEngine {
     convictions: Vec<f64>,
@@ -84,9 +91,11 @@ impl SignalExecutionEngine {
     /// causal on `upstream`; per-bar [`Self::execute_at_bar`] only indexes this buffer.
     pub fn prepare(&mut self, upstream: &[f64], bar_count: usize) {
         self.convictions = pad_or_trim((self.series_fn)(upstream), bar_count);
-        let scale = conviction_scale_from_signal_series(&self.convictions);
-        for value in &mut self.convictions {
-            *value = apply_alpha_conviction(*value, &self.alpha_script, scale);
+        if !series_is_discrete_gate(&self.convictions) {
+            let scale = conviction_scale_from_signal_series(&self.convictions);
+            for value in &mut self.convictions {
+                *value = apply_alpha_conviction(*value, &self.alpha_script, scale);
+            }
         }
     }
 

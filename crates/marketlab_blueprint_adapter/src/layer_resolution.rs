@@ -5,10 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::blueprint::{finance_property_defaults, finance_property_fields};
+use crate::blueprint::{finance_is_price_asset_node, finance_property_defaults, finance_property_fields};
 use crate::stage_variants::format_variant_label;
 use crate::usd_persistence::FinanceSessionContext;
-use crate::types::type_id;
 
 /// Composition layer identifiers (strongest → weakest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +210,7 @@ pub fn finance_property_layer_resolutions_with_session(
         })
         .collect();
 
-    if definition_id == type_id::FINANCIAL_ASSET {
+    if finance_is_price_asset_node(definition_id) {
         if graph_properties
             .get("prim_path")
             .map(String::as_str)

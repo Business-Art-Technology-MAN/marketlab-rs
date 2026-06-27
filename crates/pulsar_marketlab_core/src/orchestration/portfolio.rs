@@ -175,6 +175,11 @@ pub fn closures_from_upstream_legs(
         .map(|(asset_id, series, leg_kind)| {
             let direction = match leg_kind {
                 ClosureLegKind::SubPortfolio => DirectionalDistribution::MarketLong,
+                ClosureLegKind::Asset if series_looks_like_trade_gate(series) => {
+                    // Gate semantics (+1/0/-1) are applied in integrate_portfolio; avoid
+                    // treating -1 as MarketShort here (long/flat encoding uses -1 as flat).
+                    DirectionalDistribution::MarketLong
+                }
                 ClosureLegKind::Asset => direction_from_series(series),
             };
             SymbolicOtlClosure {
@@ -305,7 +310,7 @@ fn direction_from_series(series: &[f64]) -> DirectionalDistribution {
     }
 }
 
-fn series_looks_like_trade_gate(series: &[f64]) -> bool {
+pub(crate) fn series_looks_like_trade_gate(series: &[f64]) -> bool {
     !series.is_empty()
         && series
             .iter()
@@ -340,7 +345,8 @@ fn trade_gate_signal_transition(bar_closures: &[SymbolicOtlClosure], bar: usize)
             .get(bar - 1)
             .copied()
             .unwrap_or(0.0);
-        current.signum() != previous.signum()
+        // Discrete gate values (-1/0/1); do not use signum() — 0.0.signum() is 1.0 in Rust.
+        (current - previous).abs() > f64::EPSILON
     })
 }
 
@@ -466,10 +472,13 @@ pub fn integrate_portfolio(
                     .or_else(|| closure.signal_series.last().copied())
                     .unwrap_or(0.0);
                 let mut next = closure.clone();
+                let gate_series = series_looks_like_trade_gate(&closure.signal_series);
                 next.direction = if signal > 0.0 {
                     DirectionalDistribution::MarketLong
                 } else if signal < 0.0 {
                     DirectionalDistribution::MarketShort
+                } else if gate_series {
+                    DirectionalDistribution::Neutral
                 } else {
                     // Preserve baseline leg direction during TA warmup bars (signal == 0).
                     closure.direction
@@ -544,6 +553,7 @@ pub fn integrate_portfolio(
                             if signal > 0.0 {
                                 let cash = held_leg_cash
                                     .remove(&closure.asset_id)
+                                    .filter(|value| *value > f64::EPSILON)
                                     .unwrap_or(budget);
                                 let units = cash / (price * multiplier);
                                 held_asset_units.insert(closure.asset_id.clone(), units);
@@ -552,7 +562,11 @@ pub fn integrate_portfolio(
                                     .remove(&closure.asset_id)
                                     .unwrap_or(0.0);
                                 let cash = units * price * multiplier;
-                                held_leg_cash.insert(closure.asset_id.clone(), cash);
+                                if cash > f64::EPSILON {
+                                    held_leg_cash.insert(closure.asset_id.clone(), cash);
+                                } else {
+                                    held_leg_cash.remove(&closure.asset_id);
+                                }
                             }
                         } else {
                             held_asset_units
@@ -648,6 +662,69 @@ pub fn integrate_portfolio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trade_gate_closures_keep_long_direction() {
+        let legs = vec![(
+            "/MarketLab/Universe/SPY".to_string(),
+            vec![0.0, 0.0, 1.0, 1.0, -1.0, 0.0],
+            ClosureLegKind::Asset,
+        )];
+        let closures = closures_from_upstream_legs(&legs, "Allocation::EqualWeight");
+        assert_eq!(closures[0].direction, DirectionalDistribution::MarketLong);
+    }
+
+    #[test]
+    fn gate_transition_fires_when_signal_turns_on() {
+        let gates: Vec<f64> = (0..120)
+            .map(|i| if i >= 60 { 1.0 } else { 0.0 })
+            .collect();
+        let closures = closures_from_upstream_legs(
+            &[(
+                "SPY".to_string(),
+                gates,
+                ClosureLegKind::Asset,
+            )],
+            "Allocation::EqualWeight",
+        );
+        assert!(trade_gate_signal_transition(&closures, 60));
+    }
+
+    #[test]
+    fn integrate_portfolio_with_gate_signal_trades_underlying() {
+        let prices: Vec<f64> = (0..120).map(|i| 100.0 + i as f64).collect();
+        let gates: Vec<f64> = (0..120)
+            .map(|i| if i >= 60 { 1.0 } else { 0.0 })
+            .collect();
+        let asset = "/MarketLab/Universe/SPY".to_string();
+        let closures = closures_from_upstream_legs(
+            &[(asset.clone(), gates, ClosureLegKind::Asset)],
+            "Allocation::EqualWeight",
+        );
+        let quotes = HashMap::from([(
+            asset,
+            AssetQuote {
+                price_series: Arc::from(prices.into_boxed_slice()),
+                contract_multiplier: 1.0,
+            },
+        )]);
+        let result = integrate_portfolio(
+            &closures,
+            &quotes,
+            120,
+            &PortfolioIntegratorConfig {
+                allocation_method: "Allocation::EqualWeight".into(),
+                initial_capital: 10_000_000.0,
+                otl_script: String::new(),
+            },
+            None,
+        );
+        let final_wealth = result.wealth_series.last().copied().unwrap_or(0.0);
+        assert!(
+            final_wealth > 10_000_000.0,
+            "gate long leg should gain in rising market, final={final_wealth}"
+        );
+    }
 
     #[test]
     fn nominal_units_respect_price_and_multiplier() {

@@ -15,7 +15,7 @@ pub use compiler::{
     compile, compile_script, compile_script_multi, compile_script_multi_with_context, cross,
     display_name_for_script, ema, macd, normalize_script_for_compile, parse,
     parse_script_entry_point_name, parse_script_scalar_uniforms, parse_script_signature,
-    parse_with_context, rsi, set_script_uniform_default, sma, tokenize, BinOp, CompileError,
+    parse_with_context, rsi, set_script_uniform_default, sma, spread_sign, tokenize, BinOp, CompileError,
     CompiledSeries, Expr, MultiSeriesClosure, OslParamType, OslParameter, ScriptCompileContext,
     ScriptSignature, SeriesClosure, Token,
 };

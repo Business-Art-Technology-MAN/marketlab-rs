@@ -262,7 +262,7 @@ mod tests {
         };
         assert_eq!(
             resolve_otl_script_src(&ctx),
-            "ta::cross(input, ta::sma(input, 14))"
+            "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))"
         );
     }
 }

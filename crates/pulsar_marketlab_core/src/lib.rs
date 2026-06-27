@@ -25,7 +25,7 @@ pub use orchestration::{
     compile_unified_script, cross, display_name_for_script, ema, macd,
     normalize_for_series_eval, normalize_script_for_compile, parse, parse_script_entry_point_name,
     parse_script_scalar_uniforms, parse_script_signature, parse_with_context,
-    resolve_otl_script_src, rsi, set_script_uniform_default, sma, tokenize, BinOp, CompileError,
+    resolve_otl_script_src, rsi, set_script_uniform_default, sma, spread_sign, tokenize, BinOp, CompileError,
     wrap_series_script_as_signal_source,
     CompiledSeries, ComputedAttributeStream, ComputedTokenStream, EvaluationContext, ExecutionNode,
     Expr, GraphCompileSpec, OslParamType,

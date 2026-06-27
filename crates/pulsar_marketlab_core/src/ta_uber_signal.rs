@@ -33,7 +33,7 @@ impl TaArchetype {
 
     pub fn default_algorithm(self) -> &'static str {
         match self {
-            Self::Trend => "sma",
+            Self::Trend => "ma_cross_long_short",
             Self::Volatility => "stddev",
             Self::Oscillator => "rsi",
             Self::Channel => "bollinger_bands",
@@ -42,14 +42,46 @@ impl TaArchetype {
 
     pub fn default_period(self) -> u32 {
         match self {
-            Self::Trend | Self::Oscillator => 14,
+            Self::Trend => 10,
             Self::Volatility | Self::Channel => 20,
+            Self::Oscillator => 14,
         }
+    }
+
+    pub fn default_signal_period(self) -> u32 {
+        match self {
+            Self::Trend => 50,
+            _ => 9,
+        }
+    }
+
+    pub fn is_ma_cross_signal(algorithm: &str) -> bool {
+        matches!(
+            algorithm.to_ascii_lowercase().as_str(),
+            "ma_cross_long_short"
+                | "ma_cross_long_flat"
+                | "ema_cross_long_short"
+                | "ema_cross_long_flat"
+        )
+    }
+
+    pub fn is_indicator_overlay(algorithm: &str) -> bool {
+        !Self::is_ma_cross_signal(algorithm)
     }
 
     pub fn algorithms(self) -> &'static [&'static str] {
         match self {
-            Self::Trend => &["sma", "ema", "wma", "hma", "tema"],
+            Self::Trend => &[
+                "ma_cross_long_short",
+                "ma_cross_long_flat",
+                "ema_cross_long_short",
+                "ema_cross_long_flat",
+                "sma",
+                "ema",
+                "wma",
+                "hma",
+                "tema",
+            ],
             Self::Volatility => &["stddev", "variance", "atr", "historical_volatility"],
             Self::Oscillator => &["rsi", "cci", "stochastic", "roc", "macd"],
             Self::Channel => &["bollinger_bands", "keltner_channels", "donchian_channels"],
@@ -121,6 +153,11 @@ pub fn hyperparameter_visibility(config: &TaUberSignalConfig) -> TaHyperparamVis
             out.multiplier = matches!(alg.as_str(), "bollinger_bands" | "keltner_channels");
         }
     }
+    if config.archetype == TaArchetype::Trend
+        && TaArchetype::is_ma_cross_signal(&config.algorithm)
+    {
+        out.signal_period = true;
+    }
     if alg == "historical_volatility" {
         out.annualization = true;
     }
@@ -138,6 +175,10 @@ pub fn node_display_name(config: &TaUberSignalConfig) -> String {
 pub fn algorithm_display_label(algorithm: &str) -> String {
     match algorithm.to_ascii_lowercase().as_str() {
         "sma" => "SMA".into(),
+        "ma_cross_long_short" => "MA Cross L/S".into(),
+        "ma_cross_long_flat" => "MA Cross L/Flat".into(),
+        "ema_cross_long_short" => "EMA Cross L/S".into(),
+        "ema_cross_long_flat" => "EMA Cross L/Flat".into(),
         "ema" => "EMA".into(),
         "wma" => "WMA".into(),
         "hma" => "HMA".into(),
@@ -176,7 +217,7 @@ impl TaUberSignalConfig {
             period: archetype.default_period(),
             multiplier: 2.0,
             annualization: 252.0,
-            signal_period: 9,
+            signal_period: archetype.default_signal_period(),
             archetype,
         }
     }
@@ -244,14 +285,44 @@ pub fn infer_archetype_from_algorithm(algorithm: &str) -> TaArchetype {
     TaArchetype::Oscillator
 }
 
+/// Resolve user-entered period / signal_period into fast and slow MA lookbacks.
+///
+/// Either field may be larger; the shorter value is always the fast MA and the
+/// longer the slow MA (with at least one bar separation).
+pub fn ma_cross_periods(period: u32, signal_period: u32) -> (u32, u32) {
+    let a = period.max(1);
+    let b = signal_period.max(1);
+    let fast = a.min(b);
+    let slow = a.max(b).max(fast + 1);
+    (fast, slow)
+}
+
 /// Build canonical `inputs:script_src` for the vectorized OTL compiler.
+fn compose_trend_script(config: &TaUberSignalConfig) -> String {
+    let (fast, slow) = ma_cross_periods(config.period, config.signal_period);
+    let alg = config.algorithm.to_ascii_lowercase();
+    match alg.as_str() {
+        "ema_cross_long_short" => {
+            format!("ta::spread_sign(ta::ema(input, {fast}), ta::ema(input, {slow}))")
+        }
+        "ma_cross_long_short" => {
+            format!("ta::spread_sign(ta::sma(input, {fast}), ta::sma(input, {slow}))")
+        }
+        "ema_cross_long_flat" => {
+            format!("step(ta::ema(input, {fast}) - ta::ema(input, {slow}), 1.0)")
+        }
+        "ma_cross_long_flat" => {
+            format!("step(ta::sma(input, {fast}) - ta::sma(input, {slow}), 1.0)")
+        }
+        indicator => format!("ta::{indicator}(input, {fast})"),
+    }
+}
+
 pub fn compose_uber_script_src(config: &TaUberSignalConfig) -> String {
     let period = config.period.max(1);
     let alg = config.algorithm.to_ascii_lowercase();
     match config.archetype {
-        TaArchetype::Trend => {
-            format!("ta::cross(input, ta::{alg}(input, {period}))")
-        }
+        TaArchetype::Trend => compose_trend_script(config),
         TaArchetype::Volatility => match alg.as_str() {
             "historical_volatility" => format!(
                 "ta::historical_volatility(input, {period}, {})",
@@ -297,12 +368,47 @@ mod tests {
     }
 
     #[test]
-    fn compose_trend_sma_script() {
-        let config = TaUberSignalConfig::trend("sma").with_period(14);
+    fn ma_cross_periods_orders_inverted_inputs() {
+        assert_eq!(ma_cross_periods(200, 10), (10, 200));
+        assert_eq!(ma_cross_periods(10, 50), (10, 50));
+    }
+
+    #[test]
+    fn compose_trend_ma_cross_respects_inverted_period_fields() {
+        let mut config = TaUberSignalConfig::trend("ma_cross_long_short");
+        config.period = 200;
+        config.signal_period = 10;
         assert_eq!(
             compose_uber_script_src(&config),
-            "ta::cross(input, ta::sma(input, 14))"
+            "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 200))"
         );
+    }
+
+    #[test]
+    fn compose_trend_ma_cross_long_short_script() {
+        let config = TaUberSignalConfig::trend("ma_cross_long_short").with_period(10);
+        let mut config = config;
+        config.signal_period = 50;
+        assert_eq!(
+            compose_uber_script_src(&config),
+            "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))"
+        );
+    }
+
+    #[test]
+    fn compose_trend_ma_cross_long_flat_script() {
+        let mut config = TaUberSignalConfig::trend("ma_cross_long_flat").with_period(10);
+        config.signal_period = 50;
+        assert_eq!(
+            compose_uber_script_src(&config),
+            "step(ta::sma(input, 10) - ta::sma(input, 50), 1.0)"
+        );
+    }
+
+    #[test]
+    fn compose_trend_sma_overlay_script() {
+        let config = TaUberSignalConfig::trend("sma").with_period(14);
+        assert_eq!(compose_uber_script_src(&config), "ta::sma(input, 14)");
     }
 
     #[test]

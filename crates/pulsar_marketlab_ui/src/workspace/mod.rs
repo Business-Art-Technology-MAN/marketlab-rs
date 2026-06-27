@@ -320,37 +320,3 @@ pub fn render_workstation_layout<H: WorkstationLayoutHost>(
                 ),
         )
 }
-
-fn pane_shell(title: &'static str, body: impl IntoElement) -> impl IntoElement {
-    div()
-        .size_full()
-        .min_h_0()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .bg(crate::theme::chrome_color(crate::theme::PANE_BACKPLATE))
-        .border_1()
-        .border_color(crate::theme::chrome_color(crate::theme::GRID_MAJOR))
-        .child(
-            div()
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(crate::theme::chrome_color(crate::theme::GRID_MAJOR))
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .font_family("monospace")
-                .text_color(crate::theme::chrome_color(crate::theme::TEXT_SECONDARY))
-                .child(title),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(body),
-        )
-}

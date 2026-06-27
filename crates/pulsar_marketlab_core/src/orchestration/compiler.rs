@@ -1586,6 +1586,22 @@ fn compile_call(
                 cross(&a, &b)
             }))
         }
+        "spread_sign" | "ta::spread_sign" | "ma_signal" | "ta::ma_signal" => {
+            if args.len() != 2 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 2,
+                    got: args.len(),
+                });
+            }
+            let left = compile_expr(&args[0])?;
+            let right = compile_expr(&args[1])?;
+            Ok(Arc::new(move |input| {
+                let a = left(input.clone());
+                let b = right(input);
+                spread_sign(&a, &b)
+            }))
+        }
         "identity" => {
             if !args.is_empty() {
                 return Err(CompileError::InvalidArgumentCount {
@@ -1726,6 +1742,28 @@ pub fn macd(data: &[f64], short: usize, long: usize) -> (Vec<f64>, Vec<f64>) {
         .map(|(fast_value, slow_value)| fast_value - slow_value)
         .collect();
     (macd_line, slow)
+}
+
+/// Sustained MA spread position: `1.0` when `a > b`, `-1.0` when `a < b`, else `0.0`.
+///
+/// Unlike [`cross`], this holds the regime on every bar (suitable for portfolio gates).
+pub fn spread_sign(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len().min(b.len());
+    (0..len)
+        .map(|index| {
+            let left = a[index];
+            let right = b[index];
+            if !left.is_finite() || !right.is_finite() {
+                0.0
+            } else if left > right {
+                1.0
+            } else if left < right {
+                -1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 /// Crossover detector: `1.0` bullish cross, `-1.0` bearish cross, else `0.0`.
@@ -2027,6 +2065,23 @@ mod tests {
         let b = vec![1.0, 1.0, 1.0];
         let out = cross(&a, &b);
         assert_eq!(out, vec![0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn spread_sign_holds_regime_between_moving_averages() {
+        let fast = vec![1.0, 2.0, 3.0, 2.0, 1.0];
+        let slow = vec![2.0, 2.0, 2.0, 2.0, 2.0];
+        let out = spread_sign(&fast, &slow);
+        assert_eq!(out, vec![-1.0, 0.0, 1.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn compile_script_supports_ma_crossover_signal() {
+        let data: Vec<f64> = (0..30).map(|bar| bar as f64).collect();
+        let closure =
+            compile_script("spread_sign(sma(data, 5), sma(data, 10))").expect("compile");
+        let out = closure(&data);
+        assert!(out.iter().skip(10).any(|value| *value == 1.0));
     }
 
     #[test]

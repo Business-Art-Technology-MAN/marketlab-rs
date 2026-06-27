@@ -7,7 +7,7 @@ use pulsar_marketlab_core::{
     MarketLabGraphEngine, SharedPriceColumn, StageGraphPrim, StageGraphSnapshot,
 };
 
-use crate::asset_data::load_asset_close_series;
+use crate::asset_data::load_asset_close_series_for_prim;
 use crate::compile_profile::{finance_compile_profile_to_sweep, FinanceCompileProfile};
 use crate::snapshot::snapshot_for_engine_execution;
 
@@ -263,24 +263,10 @@ fn build_asset_vectors(snapshot: &StageGraphSnapshot) -> (HashMap<String, Shared
     for prim in snapshot
         .prims
         .iter()
-        .filter(|prim| prim.type_name == "FinancialAsset")
+        .filter(|prim| crate::types::is_finance_price_asset_stage_type(&prim.type_name))
     {
-        let symbol = prim
-            .attributes
-            .get("inputs:symbol")
-            .map(|value| value.trim().to_ascii_uppercase())
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                prim.path
-                    .rsplit('/')
-                    .next()
-                    .map(|leaf| leaf.to_ascii_uppercase())
-            })
-            .unwrap_or_default();
-        let explicit_csv = prim.attributes.get("inputs:csv_path");
-
         let (series, loaded, synthetic) =
-            load_asset_close_series(&symbol, explicit_csv, &prim.path, &mut meta.warnings);
+            load_asset_close_series_for_prim(prim, &mut meta.warnings);
         if loaded {
             meta.loaded += 1;
         }
@@ -316,6 +302,7 @@ mod tests {
     use pulsar_marketlab_core::{GraphCompileWire, StageGraphPrim};
 
     use super::*;
+    use crate::asset_data::load_asset_close_series;
     use crate::snapshot::graph_description_to_stage_snapshot;
     use crate::types::type_id;
     use graphy::{Connection, ConnectionType, GraphDescription, NodeInstance, Position};
@@ -430,7 +417,370 @@ mod tests {
         assert!(result.error.is_none(), "{:?}", result.error);
         assert_eq!(result.portfolios.len(), 1);
         assert!(result.portfolios[0].final_wealth > 0.0);
+        assert!(
+            result.portfolios[0].return_pct.abs() > f64::EPSILON,
+            "TA-gated portfolio should move off initial capital, got {:?}",
+            result.portfolios[0]
+        );
         assert!(result.assets_loaded >= 1, "{:?}", result);
+    }
+
+    #[test]
+    fn sweep_runs_ta_through_sub_portfolios_into_master() {
+        use graphy::JsonValue;
+
+        let mut graph = GraphDescription::new("test");
+        let mut spy = NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        );
+        spy.properties
+            .insert("symbol".into(), JsonValue::String("SPY".into()));
+        let mut qqq = NodeInstance::new(
+            "qqq",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 80.0),
+        );
+        qqq.properties
+            .insert("symbol".into(), JsonValue::String("QQQ".into()));
+        graph.add_node(spy);
+        graph.add_node(qqq);
+        graph.add_node(NodeInstance::new(
+            "ta_ear",
+            type_id::TA_TREND,
+            Position::new(120.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "ta_ept",
+            type_id::TA_TREND,
+            Position::new(120.0, 80.0),
+        ));
+        let mut ear_fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(240.0, 0.0),
+        );
+        ear_fund
+            .properties
+            .insert("name".into(), JsonValue::String("ear_fund".into()));
+        let mut ept_fund = NodeInstance::new(
+            "ept_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(240.0, 80.0),
+        );
+        ept_fund
+            .properties
+            .insert("name".into(), JsonValue::String("ept_fund".into()));
+        let mut master = NodeInstance::new(
+            "master",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(360.0, 40.0),
+        );
+        master
+            .properties
+            .insert("name".into(), JsonValue::String("fund".into()));
+        graph.add_node(ear_fund);
+        graph.add_node(ept_fund);
+        graph.add_node(master);
+
+        for (asset, ta) in [("spy", "ta_ear"), ("qqq", "ta_ept")] {
+            graph.add_connection(Connection {
+                source_node: asset.into(),
+                source_pin: "close".into(),
+                target_node: ta.into(),
+                target_pin: "source_stream".into(),
+                connection_type: ConnectionType::Data,
+            });
+        }
+        graph.add_connection(Connection {
+            source_node: "ta_ear".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_ept".into(),
+            source_pin: "result".into(),
+            target_node: "ept_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ear_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "master".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ept_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "master".into(),
+            target_pin: "signal_1".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.portfolios.len(), 3, "{:?}", result.portfolios);
+
+        let master_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.ends_with("/fund"))
+            .map(|prim| prim.path.clone())
+            .expect("master prim");
+        let master_summary = result
+            .portfolios
+            .iter()
+            .find(|portfolio| portfolio.prim_path == master_path)
+            .expect("master sweep");
+        assert!(
+            master_summary.return_pct.abs() > f64::EPSILON,
+            "nested master fund should move off initial capital, got {:?}",
+            master_summary
+        );
+    }
+
+    #[test]
+    fn sweep_runs_sub_portfolio_wealth_through_ta_into_master() {
+        use graphy::JsonValue;
+
+        let mut graph = GraphDescription::new("test");
+        let mut spy = NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        );
+        spy.properties
+            .insert("symbol".into(), JsonValue::String("SPY".into()));
+        graph.add_node(spy);
+        graph.add_node(NodeInstance::new(
+            "ta_ear",
+            type_id::TA_TREND,
+            Position::new(120.0, 0.0),
+        ));
+        let mut ear_fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(240.0, 0.0),
+        );
+        ear_fund
+            .properties
+            .insert("name".into(), JsonValue::String("ear_fund".into()));
+        graph.add_node(ear_fund);
+        graph.add_node(NodeInstance::new(
+            "ta_master",
+            type_id::TA_TREND,
+            Position::new(360.0, 0.0),
+        ));
+        let mut master = NodeInstance::new(
+            "master",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(480.0, 0.0),
+        );
+        master
+            .properties
+            .insert("name".into(), JsonValue::String("fund".into()));
+        graph.add_node(master);
+
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "ta_ear".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_ear".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ear_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "ta_master".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_master".into(),
+            source_pin: "result".into(),
+            target_node: "master".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        assert!(
+            snapshot.wires.iter().any(|wire| {
+                wire.relationship == "inputs:underlying"
+                    && wire.source_prim_path.contains("ear_fund")
+                    && wire.target_prim_path.contains("ta_master")
+            }),
+            "expected portfolio wealth to wire into TA as underlying, got {:?}",
+            snapshot.wires
+        );
+
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let master_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.ends_with("/fund"))
+            .map(|prim| prim.path.clone())
+            .expect("master prim");
+        let master_summary = result
+            .portfolios
+            .iter()
+            .find(|portfolio| portfolio.prim_path == master_path)
+            .expect("master sweep");
+        assert!(
+            master_summary.return_pct.abs() > f64::EPSILON,
+            "portfolio wealth fed through TA should move master fund, got {:?}",
+            master_summary
+        );
+    }
+
+    #[test]
+    fn sweep_runs_dual_hrp_sub_funds_through_ta_into_master_hrp() {
+        use graphy::JsonValue;
+
+        fn hrp_portfolio(id: &str, y: f64) -> NodeInstance {
+            let mut node = NodeInstance::new(
+                id,
+                type_id::PORTFOLIO_INTEGRATOR,
+                Position::new(240.0, y),
+            );
+            node.properties
+                .insert("name".into(), JsonValue::String(id.into()));
+            node.properties.insert(
+                "allocation_id".into(),
+                JsonValue::String("Allocation::HierarchicalRiskParity".into()),
+            );
+            node
+        }
+
+        let mut graph = GraphDescription::new("test");
+        for (id, y) in [("spy", 0.0), ("qqq", 40.0), ("iwm", 80.0)] {
+            let mut asset = NodeInstance::new(
+                id,
+                type_id::FINANCIAL_ASSET,
+                Position::new(0.0, y),
+            );
+            asset
+                .properties
+                .insert("symbol".into(), JsonValue::String(id.into()));
+            graph.add_node(asset);
+            graph.add_node(NodeInstance::new(
+                format!("ta_{id}"),
+                type_id::TA_TREND,
+                Position::new(120.0, y),
+            ));
+        }
+        graph.add_node(hrp_portfolio("ear_fund", 0.0));
+        graph.add_node(hrp_portfolio("ept_fund", 80.0));
+        graph.add_node(NodeInstance::new(
+            "ta_master_ear",
+            type_id::TA_TREND,
+            Position::new(360.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "ta_master_ept",
+            type_id::TA_TREND,
+            Position::new(360.0, 80.0),
+        ));
+        graph.add_node(hrp_portfolio("fund", 40.0));
+
+        for asset in ["spy", "qqq", "iwm"] {
+            graph.add_connection(Connection {
+                source_node: asset.into(),
+                source_pin: "close".into(),
+                target_node: format!("ta_{asset}"),
+                target_pin: "source_stream".into(),
+                connection_type: ConnectionType::Data,
+            });
+        }
+        graph.add_connection(Connection {
+            source_node: "ta_spy".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_qqq".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_1".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_iwm".into(),
+            source_pin: "result".into(),
+            target_node: "ept_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ear_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "ta_master_ear".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ept_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "ta_master_ept".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_master_ear".into(),
+            source_pin: "result".into(),
+            target_node: "fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_master_ept".into(),
+            source_pin: "result".into(),
+            target_node: "fund".into(),
+            target_pin: "signal_1".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+
+        let master_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.ends_with("/fund"))
+            .map(|prim| prim.path.clone())
+            .expect("master prim");
+        let master_summary = result
+            .portfolios
+            .iter()
+            .find(|portfolio| portfolio.prim_path == master_path)
+            .expect("master sweep");
+        assert!(
+            master_summary.final_wealth > master_summary.initial_capital * 0.5,
+            "master fund should retain meaningful wealth when both HRP sub-funds feed through TA, got {:?}",
+            master_summary
+        );
+        assert!(
+            master_summary.return_pct > -50.0,
+            "master fund should not collapse to zero wealth, got {:?}",
+            master_summary
+        );
     }
 
     #[test]
@@ -468,6 +818,73 @@ mod tests {
         let result = run_finance_sweep_with_profile(&snapshot, &profile, &paths);
         assert!(result.error.is_none(), "{:?}", result.error);
         assert!(result.portfolios.is_empty());
+    }
+
+    #[test]
+    fn ta_trend_default_emits_ma_crossover_script() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let ta = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.type_name == "OtlTaUberSignal")
+            .expect("ta prim");
+        assert_eq!(
+            ta.attributes.get("inputs:script_src"),
+            Some(&"ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))".to_string())
+        );
+    }
+
+    #[test]
+    fn ta_trend_signal_period_affects_script_when_below_period() {
+        let snapshot_with = |period: u32, signal_period: u32| {
+            let mut graph = GraphDescription::new("test");
+            graph.add_node(NodeInstance::new(
+                "spy",
+                type_id::FINANCIAL_ASSET,
+                Position::new(0.0, 0.0),
+            ));
+            let mut trend = NodeInstance::new(
+                "trend",
+                type_id::TA_TREND,
+                Position::new(100.0, 0.0),
+            );
+            trend
+                .properties
+                .insert("period".into(), graphy::JsonValue::Number(period.into()));
+            trend.properties.insert(
+                "signal_period".into(),
+                graphy::JsonValue::Number(signal_period.into()),
+            );
+            graph.add_node(trend);
+            graph_description_to_stage_snapshot(&graph)
+        };
+
+        let inverted = snapshot_with(200, 10);
+        let swapped = snapshot_with(10, 200);
+        let ta_script = |snapshot: &StageGraphSnapshot| {
+            snapshot
+                .prims
+                .iter()
+                .find(|prim| prim.type_name == "OtlTaUberSignal")
+                .and_then(|prim| prim.attributes.get("inputs:script_src"))
+                .cloned()
+        };
+        assert_eq!(
+            ta_script(&inverted),
+            Some("ta::spread_sign(ta::sma(input, 10), ta::sma(input, 200))".to_string())
+        );
+        assert_eq!(ta_script(&swapped), ta_script(&inverted));
     }
 
     #[test]
@@ -509,6 +926,200 @@ mod tests {
             short_ta.attributes.get("inputs:script_src"),
             long_ta.attributes.get("inputs:script_src")
         );
+    }
+
+    #[test]
+    fn ta_trend_signal_follows_wired_asset_prices() {
+        use graphy::JsonValue;
+
+        let mut graph = GraphDescription::new("test");
+        let mut spy = NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        );
+        spy.properties
+            .insert("symbol".into(), JsonValue::String("SPY".into()));
+        let mut qqq = NodeInstance::new(
+            "qqq",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 120.0),
+        );
+        qqq.properties
+            .insert("symbol".into(), JsonValue::String("QQQ".into()));
+        graph.add_node(spy);
+        graph.add_node(qqq);
+        graph.add_node(NodeInstance::new(
+            "trend_spy",
+            type_id::TA_TREND,
+            Position::new(160.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend_qqq",
+            type_id::TA_TREND,
+            Position::new(160.0, 120.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend_spy".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "qqq".into(),
+            source_pin: "close".into(),
+            target_node: "trend_qqq".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        assert!(
+            snapshot.wires.iter().any(|wire| {
+                wire.relationship == "inputs:underlying"
+                    && wire.source_prim_path.contains("SPY")
+                    && wire.target_prim_path.contains("trend_spy")
+            }),
+            "expected asset→TA underlying wire, got {:?}",
+            snapshot.wires
+        );
+
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+
+        let spy_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.contains("trend_spy"))
+            .map(|prim| prim.path.clone())
+            .expect("trend_spy prim");
+        let qqq_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.contains("trend_qqq"))
+            .map(|prim| prim.path.clone())
+            .expect("trend_qqq prim");
+
+        let spy_signal = result
+            .analytics_signals
+            .get(&spy_path)
+            .expect("spy-linked TA signal");
+        let qqq_signal = result
+            .analytics_signals
+            .get(&qqq_path)
+            .expect("qqq-linked TA signal");
+
+        assert!(
+            spy_signal.iter().any(|value| value.abs() > f64::EPSILON),
+            "wired TA should emit non-zero gate values, got {spy_signal:?}"
+        );
+        assert_ne!(
+            spy_signal, qqq_signal,
+            "different upstream assets should produce different TA signals"
+        );
+    }
+
+    #[test]
+    fn unwired_ta_trend_differs_from_wired_asset() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend_wired",
+            type_id::TA_TREND,
+            Position::new(120.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend_unwired",
+            type_id::TA_TREND,
+            Position::new(120.0, 80.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend_wired".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+
+        let wired_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.contains("trend_wired"))
+            .map(|prim| prim.path.clone())
+            .expect("wired ta prim");
+        let unwired_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.path.contains("trend_unwired"))
+            .map(|prim| prim.path.clone())
+            .expect("unwired ta prim");
+
+        let wired = result.analytics_signals.get(&wired_path).expect("wired signal");
+        let unwired = result
+            .analytics_signals
+            .get(&unwired_path)
+            .expect("unwired signal");
+
+        assert!(
+            wired.iter().any(|value| value.abs() > f64::EPSILON),
+            "wired TA should use asset prices"
+        );
+        assert!(
+            unwired.iter().all(|value| value.abs() < f64::EPSILON),
+            "unwired TA should stay flat without upstream, got {unwired:?}"
+        );
+        assert_ne!(wired, unwired);
+    }
+
+    #[test]
+    fn ta_trend_accepts_otl_underlying_pin_alias_in_graph() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend".into(),
+            target_pin: "underlying".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        assert!(
+            snapshot.wires.iter().any(|wire| wire.relationship == "inputs:underlying"),
+            "OTL pin alias should still produce an underlying wire, got {:?}",
+            snapshot.wires
+        );
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let ta_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.type_name == "OtlTaUberSignal")
+            .map(|prim| prim.path.clone())
+            .expect("ta prim");
+        let signal = result
+            .analytics_signals
+            .get(&ta_path)
+            .expect("ta signal");
+        assert!(signal.iter().any(|value| value.abs() > f64::EPSILON));
     }
 
     #[test]

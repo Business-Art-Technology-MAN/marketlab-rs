@@ -89,61 +89,23 @@ pub fn build_finance_stage_tree(graph: &GraphDescription) -> FinanceStageTreeMod
         }
     }
 
-    // Nest wired upstream nodes under their portfolio parent.
-    // Financial assets stay in Universe; portfolios get lightweight AssetRef stub rows.
-    for connection in &graph.connections {
-        let Some(&target_row) = node_row_by_id.get(&connection.target_node) else {
+    // Nest upstream lineage under each portfolio (asset → analytics → portfolio chains).
+    for portfolio_id in &portfolio_node_ids {
+        let Some(&portfolio_row) = node_row_by_id.get(portfolio_id) else {
             continue;
         };
-        let target_node = graph.nodes.get(&connection.target_node);
-        let Some(target_kind) = target_node
-            .and_then(|node| FinanceNodeKind::from_graphy_type_id(&node.node_type))
-        else {
-            continue;
-        };
-        if target_kind != FinanceNodeKind::PortfolioIntegrator {
-            continue;
-        }
-        let Some(source_node) = graph.nodes.get(&connection.source_node) else {
-            continue;
-        };
-        let Some(source_kind) = FinanceNodeKind::from_graphy_type_id(&source_node.node_type) else {
-            continue;
-        };
-
-        if source_kind == FinanceNodeKind::FinancialAsset {
-            let source_path = paths.get(&connection.source_node).cloned();
-            let ref_label = node_display_label(source_node, source_kind, source_path.as_deref().unwrap_or(""));
-            let ref_row = rows.len();
-            rows.push(FinanceStageTreeRow {
-                row_index: ref_row,
-                node_id: Some(connection.source_node.clone()),
-                label: ref_label,
-                type_label: "AssetRef".to_string(),
-                prim_path: source_path,
-                children: Vec::new(),
-                is_scope_folder: false,
-            });
-            if !rows[target_row].children.contains(&ref_row) {
-                rows[target_row].children.push(ref_row);
-            }
-            continue;
-        }
-
-        let Some(&source_row) = node_row_by_id.get(&connection.source_node) else {
-            continue;
-        };
-        if source_row == target_row {
-            continue;
-        }
-
-        let source_scope = scope_for_kind(source_kind);
-        if let Some(folder_index) = scope_folder_index.get(source_scope).copied() {
-            rows[folder_index].children.retain(|child| *child != source_row);
-        }
-
-        if !rows[target_row].children.contains(&source_row) {
-            rows[target_row].children.push(source_row);
+        let mut visiting = HashSet::new();
+        for upstream_id in upstream_node_ids(graph, portfolio_id) {
+            attach_upstream_lineage(
+                graph,
+                &paths,
+                &mut rows,
+                &node_row_by_id,
+                &scope_folder_index,
+                portfolio_row,
+                &upstream_id,
+                &mut visiting,
+            );
         }
     }
 
@@ -158,9 +120,217 @@ pub fn build_finance_stage_tree(graph: &GraphDescription) -> FinanceStageTreeMod
     FinanceStageTreeModel { rows, root_ids }
 }
 
+fn upstream_node_ids(graph: &GraphDescription, node_id: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    graph
+        .connections
+        .iter()
+        .filter(|connection| connection.target_node == node_id)
+        .map(|connection| connection.source_node.clone())
+        .filter(|source_id| seen.insert(source_id.clone()))
+        .collect()
+}
+
+fn asset_ref_child_index(
+    rows: &[FinanceStageTreeRow],
+    parent_row: usize,
+    node_id: &str,
+) -> Option<usize> {
+    rows.get(parent_row).and_then(|parent| {
+        parent.children.iter().copied().find(|&child| {
+            rows.get(child).is_some_and(|row| {
+                row.type_label == "AssetRef" && row.node_id.as_deref() == Some(node_id)
+            })
+        })
+    })
+}
+
+fn attach_asset_ref_under_parent(
+    rows: &mut Vec<FinanceStageTreeRow>,
+    parent_row: usize,
+    node: &NodeInstance,
+    kind: FinanceNodeKind,
+    node_id: &str,
+    prim_path: Option<String>,
+) {
+    if asset_ref_child_index(rows, parent_row, node_id).is_some() {
+        return;
+    }
+    let ref_row = push_asset_ref_row(rows, node, kind, node_id, prim_path);
+    push_child_unique(&mut rows[parent_row].children, ref_row);
+}
+
+fn push_child_unique(children: &mut Vec<usize>, child: usize) {
+    if !children.contains(&child) {
+        children.push(child);
+    }
+}
+
+fn detach_from_scope_folder(
+    rows: &mut [FinanceStageTreeRow],
+    scope_folder_index: &HashMap<&'static str, usize>,
+    row_index: usize,
+    kind: FinanceNodeKind,
+) {
+    if let Some(folder_index) = scope_folder_index.get(scope_for_kind(kind)).copied() {
+        rows[folder_index].children.retain(|child| *child != row_index);
+    }
+}
+
+fn push_asset_ref_row(
+    rows: &mut Vec<FinanceStageTreeRow>,
+    node: &NodeInstance,
+    kind: FinanceNodeKind,
+    node_id: &str,
+    prim_path: Option<String>,
+) -> usize {
+    let ref_row = rows.len();
+    rows.push(FinanceStageTreeRow {
+        row_index: ref_row,
+        node_id: Some(node_id.to_string()),
+        label: node_display_label(node, kind, prim_path.as_deref().unwrap_or("")),
+        type_label: "AssetRef".to_string(),
+        prim_path,
+        children: Vec::new(),
+        is_scope_folder: false,
+    });
+    ref_row
+}
+
+fn attach_upstream_lineage(
+    graph: &GraphDescription,
+    paths: &HashMap<String, String>,
+    rows: &mut Vec<FinanceStageTreeRow>,
+    node_row_by_id: &HashMap<String, usize>,
+    scope_folder_index: &HashMap<&'static str, usize>,
+    parent_row: usize,
+    upstream_id: &str,
+    visiting: &mut HashSet<String>,
+) {
+    if parent_row >= rows.len() || !visiting.insert(upstream_id.to_string()) {
+        return;
+    }
+    let Some(node) = graph.nodes.get(upstream_id) else {
+        visiting.remove(upstream_id);
+        return;
+    };
+    let Some(kind) = FinanceNodeKind::from_graphy_type_id(&node.node_type) else {
+        visiting.remove(upstream_id);
+        return;
+    };
+
+    match kind {
+        FinanceNodeKind::FinancialAsset | FinanceNodeKind::FinancialReturnAsset => {
+            attach_asset_ref_under_parent(
+                rows,
+                parent_row,
+                node,
+                kind,
+                upstream_id,
+                paths.get(upstream_id).cloned(),
+            );
+        }
+        FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal => {
+            let Some(analytics_row) = node_row_by_id.get(upstream_id).copied() else {
+                visiting.remove(upstream_id);
+                return;
+            };
+            if analytics_row == parent_row {
+                visiting.remove(upstream_id);
+                return;
+            }
+            detach_from_scope_folder(rows, scope_folder_index, analytics_row, kind);
+            push_child_unique(&mut rows[parent_row].children, analytics_row);
+            for asset_id in upstream_node_ids(graph, upstream_id) {
+                let Some(asset_node) = graph.nodes.get(&asset_id) else {
+                    continue;
+                };
+                let Some(asset_kind) = FinanceNodeKind::from_graphy_type_id(&asset_node.node_type)
+                else {
+                    continue;
+                };
+                if !asset_kind.is_price_source() {
+                    continue;
+                }
+                attach_asset_ref_under_parent(
+                    rows,
+                    analytics_row,
+                    asset_node,
+                    asset_kind,
+                    &asset_id,
+                    paths.get(&asset_id).cloned(),
+                );
+            }
+            for nested_id in upstream_node_ids(graph, upstream_id) {
+                let Some(nested_kind) = graph
+                    .nodes
+                    .get(&nested_id)
+                    .and_then(|node| FinanceNodeKind::from_graphy_type_id(&node.node_type))
+                else {
+                    continue;
+                };
+                match nested_kind {
+                    FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal => {
+                        attach_upstream_lineage(
+                            graph,
+                            paths,
+                            rows,
+                            node_row_by_id,
+                            scope_folder_index,
+                            analytics_row,
+                            &nested_id,
+                            visiting,
+                        );
+                    }
+                    FinanceNodeKind::PortfolioIntegrator => {
+                        attach_upstream_lineage(
+                            graph,
+                            paths,
+                            rows,
+                            node_row_by_id,
+                            scope_folder_index,
+                            analytics_row,
+                            &nested_id,
+                            visiting,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        FinanceNodeKind::PortfolioIntegrator => {
+            let Some(sub_row) = node_row_by_id.get(upstream_id).copied() else {
+                visiting.remove(upstream_id);
+                return;
+            };
+            if sub_row == parent_row {
+                visiting.remove(upstream_id);
+                return;
+            }
+            detach_from_scope_folder(rows, scope_folder_index, sub_row, kind);
+            push_child_unique(&mut rows[parent_row].children, sub_row);
+            for nested_id in upstream_node_ids(graph, upstream_id) {
+                attach_upstream_lineage(
+                    graph,
+                    paths,
+                    rows,
+                    node_row_by_id,
+                    scope_folder_index,
+                    sub_row,
+                    &nested_id,
+                    visiting,
+                );
+            }
+        }
+        FinanceNodeKind::PerformanceAnalytics => {}
+    }
+
+    visiting.remove(upstream_id);
+}
+
 fn scope_for_kind(kind: FinanceNodeKind) -> &'static str {
     match kind {
-        FinanceNodeKind::FinancialAsset => category::UNIVERSE,
+        FinanceNodeKind::FinancialAsset | FinanceNodeKind::FinancialReturnAsset => category::UNIVERSE,
         FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal => category::ANALYTICS,
         FinanceNodeKind::PortfolioIntegrator => category::PORTFOLIOS,
         FinanceNodeKind::PerformanceAnalytics => category::REPORTING,
@@ -169,7 +339,7 @@ fn scope_for_kind(kind: FinanceNodeKind) -> &'static str {
 
 fn type_display_label(kind: FinanceNodeKind) -> String {
     match kind {
-        FinanceNodeKind::FinancialAsset => "AssetRef".to_string(),
+        FinanceNodeKind::FinancialAsset | FinanceNodeKind::FinancialReturnAsset => "AssetRef".to_string(),
         FinanceNodeKind::OtlOperator => "OtlOperator".to_string(),
         FinanceNodeKind::OtlTaUberSignal => "SignalTransform".to_string(),
         FinanceNodeKind::PortfolioIntegrator => "Portfolio".to_string(),
@@ -184,7 +354,7 @@ fn node_display_label(node: &NodeInstance, kind: FinanceNodeKind, prim_path: &st
         }
     }
     match kind {
-        FinanceNodeKind::FinancialAsset => property_string(node, "symbol").unwrap_or_else(|| {
+        FinanceNodeKind::FinancialAsset | FinanceNodeKind::FinancialReturnAsset => property_string(node, "symbol").unwrap_or_else(|| {
             prim_path
                 .rsplit('/')
                 .next()
@@ -386,6 +556,272 @@ mod tests {
         assert_eq!(asset_ref.type_label, "AssetRef");
         assert_eq!(asset_ref.label, "SPY");
         assert_eq!(asset_ref.node_id.as_deref(), Some("spy"));
+    }
+
+    #[test]
+    fn stage_tree_nests_asset_under_ta_under_portfolio() {
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        let mut ear_fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        );
+        ear_fund.properties.insert(
+            "name".into(),
+            graphy::JsonValue::String("ear_fund".into()),
+        );
+        graph.add_node(ear_fund);
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "trend".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let model = build_finance_stage_tree(&graph);
+        let portfolio_row = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("ear_fund"))
+            .expect("ear_fund row");
+        assert_eq!(portfolio_row.children.len(), 1);
+        let ta_row = &model.rows[portfolio_row.children[0]];
+        assert_eq!(ta_row.node_id.as_deref(), Some("trend"));
+        assert_eq!(ta_row.children.len(), 1);
+        let asset_ref = &model.rows[ta_row.children[0]];
+        assert_eq!(asset_ref.type_label, "AssetRef");
+        assert_eq!(asset_ref.node_id.as_deref(), Some("spy"));
+
+        let universe = &model.rows[0];
+        assert_eq!(universe.children.len(), 1);
+    }
+
+    #[test]
+    fn stage_tree_nests_sub_portfolio_lineage_under_master() {
+        use graphy::JsonValue;
+
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "trend",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        let mut ear_fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        );
+        ear_fund.properties.insert(
+            "name".into(),
+            JsonValue::String("ear_fund".into()),
+        );
+        let mut master = NodeInstance::new(
+            "master",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(300.0, 0.0),
+        );
+        master
+            .properties
+            .insert("name".into(), JsonValue::String("fund".into()));
+        graph.add_node(ear_fund);
+        graph.add_node(master);
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "trend".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "trend".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ear_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "master".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let model = build_finance_stage_tree(&graph);
+        let master_row = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("master"))
+            .expect("master row");
+        assert!(
+            master_row
+                .children
+                .iter()
+                .any(|child| model.rows[*child].node_id.as_deref() == Some("ear_fund")),
+            "master should nest ear_fund"
+        );
+        let ear_row = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("ear_fund"))
+            .expect("ear_fund row");
+        assert!(
+            ear_row
+                .children
+                .iter()
+                .any(|child| model.rows[*child].node_id.as_deref() == Some("trend")),
+            "ear_fund should nest TA"
+        );
+    }
+
+    #[test]
+    fn stage_tree_nests_portfolio_under_ta_under_master() {
+        use graphy::JsonValue;
+
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        graph.add_node(NodeInstance::new(
+            "ta_ear",
+            type_id::TA_TREND,
+            Position::new(100.0, 0.0),
+        ));
+        let mut ear_fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(200.0, 0.0),
+        );
+        ear_fund.properties.insert(
+            "name".into(),
+            JsonValue::String("ear_fund".into()),
+        );
+        graph.add_node(ear_fund);
+        graph.add_node(NodeInstance::new(
+            "ta_master",
+            type_id::TA_TREND,
+            Position::new(300.0, 0.0),
+        ));
+        let mut master = NodeInstance::new(
+            "master",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(400.0, 0.0),
+        );
+        master
+            .properties
+            .insert("name".into(), JsonValue::String("fund".into()));
+        graph.add_node(master);
+
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "ta_ear".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_ear".into(),
+            source_pin: "result".into(),
+            target_node: "ear_fund".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ear_fund".into(),
+            source_pin: "wealth".into(),
+            target_node: "ta_master".into(),
+            target_pin: "source_stream".into(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_master".into(),
+            source_pin: "result".into(),
+            target_node: "master".into(),
+            target_pin: "signal_0".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let model = build_finance_stage_tree(&graph);
+        let master_row = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("master"))
+            .expect("master row");
+        let ta_master_row = master_row
+            .children
+            .iter()
+            .map(|child| &model.rows[*child])
+            .find(|row| row.node_id.as_deref() == Some("ta_master"))
+            .expect("ta_master nested under master");
+        assert!(
+            ta_master_row
+                .children
+                .iter()
+                .any(|child| model.rows[*child].node_id.as_deref() == Some("ear_fund")),
+            "ear_fund wealth source should appear under ta_master"
+        );
+    }
+
+    #[test]
+    fn stage_tree_dedupes_duplicate_asset_wires_under_portfolio() {
+        let mut graph = GraphDescription::new("test");
+        for id in ["stream_1", "ear_fund"] {
+            graph.add_node(NodeInstance::new(
+                id,
+                if id == "stream_1" {
+                    type_id::FINANCIAL_RETURN_ASSET
+                } else {
+                    type_id::PORTFOLIO_INTEGRATOR
+                },
+                Position::new(0.0, 0.0),
+            ));
+        }
+        for pin in ["signal_0", "signal_1"] {
+            graph.add_connection(Connection {
+                source_node: "stream_1".into(),
+                source_pin: "close".into(),
+                target_node: "ear_fund".into(),
+                target_pin: pin.into(),
+                connection_type: ConnectionType::Data,
+            });
+        }
+
+        let model = build_finance_stage_tree(&graph);
+        let ear = model
+            .rows
+            .iter()
+            .find(|row| row.node_id.as_deref() == Some("ear_fund"))
+            .expect("ear_fund");
+        assert_eq!(
+            ear.children.len(),
+            1,
+            "duplicate wires to the same portfolio leg should appear once in the stage tree"
+        );
     }
 
     #[test]

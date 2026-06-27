@@ -5,6 +5,8 @@
 
 mod cold_path_write;
 mod asset_data;
+mod bulk_assets;
+mod viewport_timeline;
 mod compile;
 mod compile_profile;
 mod metadata;
@@ -28,10 +30,13 @@ mod usd_persistence;
 
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
-    finance_has_strategy_channels, finance_is_analytics_node, finance_is_reporting_node,
+    finance_has_strategy_channels, finance_is_analytics_node, finance_is_price_asset_node,
+    finance_is_reporting_node,
     finance_node_header_rgba,
     finance_node_layout_extra_height, finance_node_graph_title, finance_primary_output_pin, finance_property_defaults,
-    finance_property_fields, finance_property_is_numeric, finance_strategy_channel_fields,
+    finance_property_fields, finance_property_is_numeric, finance_property_triggers_compile,
+    finance_resolve_stream_pin,
+    finance_strategy_channel_fields,
     is_marketlab_finance_node, merge_finance_node_metadata, FinancePropertyField,
     FINANCE_STRATEGY_BLOCK_HEIGHT, FINANCE_STRATEGY_CHANNELS,
     FINANCE_SIGNAL_TYPE,
@@ -40,8 +45,17 @@ pub use blueprint::{
 pub use metadata::finance_node_catalog;
 pub use provider::FinanceNodeMetadataProvider;
 pub use asset_data::{
-    finance_asset_previews_for_snapshot, load_finance_asset_preview, normalize_finance_file_path,
-    FinanceAssetPreview, FinanceOhlcBar,
+    finance_asset_previews_for_snapshot, load_finance_asset_preview,
+    load_finance_asset_preview_for_node, load_finance_return_asset_preview,
+    normalize_finance_file_path, returns_to_ohlc_bars, FinanceAssetPreview, FinanceOhlcBar,
+};
+pub use bulk_assets::{
+    collect_finance_bulk_drafts, finance_bulk_draft_from_csv_path,
+    finance_bulk_draft_from_symbol, infer_csv_kind, list_bundled_finance_symbols,
+    parse_symbol_tokens, FinanceBulkAssetDraft, FinanceCsvKind,
+};
+pub use viewport_timeline::{
+    synthetic_bar_timestamps, ViewportAxisTick, ViewportTimelineBridge, ViewportYAxisMode,
 };
 pub use compile::{compile_finance_graph, FinanceCompileReport};
 pub use compile_profile::{
@@ -72,7 +86,7 @@ pub use telemetry::{
     finance_nodal_cache_health_pct, format_nodal_cache_gauge, FinanceDiagnosticState,
     FinanceWorkspaceTelemetry,
 };
-pub use types::{category, type_id, FinanceNodeKind, PORTFOLIO_ALLOCATION_TOKENS};
+pub use types::{category, type_id, FinanceNodeKind, is_finance_price_asset_stage_type, PORTFOLIO_ALLOCATION_TOKENS};
 pub use taxonomy_index::{
     finance_asset_properties_for_symbol, FinanceDatabaseIndex, TaxonomyIndex,
 };

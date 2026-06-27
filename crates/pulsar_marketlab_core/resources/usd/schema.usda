@@ -41,6 +41,19 @@ class "FinancialAsset" (
     string info:zipcode = ""
 }
 
+class "FinancialReturnAsset" (
+    inherits = </Typed>
+    doc = "Manager or fund return series (Date, simple-return CSV). Index prices are synthesized on ingestion."
+) {
+    bool inputs:active = 1
+    token inputs:symbol = ""
+    token inputs:asset_class = "Alternative" (
+        allowedTokens = ["Alternative", "Equity", "ETF", "Commodity", "FixedIncome"]
+    )
+    string inputs:csv_path = ""
+    rel inputs:underlying
+}
+
 class "OtlOperator" (
     inherits = </Typed>
     doc = "Generic OTL formula node (mix, clamp, custom expressions)."

@@ -14,6 +14,7 @@ pub const FINANCE_SIGNAL_TYPE: &str = "MarketLabSignalSeries";
 pub fn finance_display_label(node_type: &str) -> Option<&'static str> {
     match node_type {
         type_id::FINANCIAL_ASSET => Some("Financial Asset"),
+        type_id::FINANCIAL_RETURN_ASSET => Some("Return Series Asset"),
         type_id::OTL_OPERATOR => Some("OTL Operator"),
         type_id::TA_TREND => Some("TA Trend"),
         type_id::TA_VOLATILITY => Some("TA Volatility"),
@@ -28,7 +29,7 @@ pub fn finance_display_label(node_type: &str) -> Option<&'static str> {
 /// Primary data output pin id for a finance node (Blueprint editor pin names).
 pub fn finance_primary_output_pin(node_type: &str) -> Option<&'static str> {
     match node_type {
-        type_id::FINANCIAL_ASSET => Some("close"),
+        type_id::FINANCIAL_ASSET | type_id::FINANCIAL_RETURN_ASSET => Some("close"),
         type_id::OTL_OPERATOR | type_id::TA_TREND | type_id::TA_VOLATILITY
         | type_id::TA_OSCILLATOR | type_id::TA_CHANNEL => Some("result"),
         type_id::PORTFOLIO_INTEGRATOR => Some("wealth"),
@@ -54,6 +55,13 @@ pub fn merge_finance_node_metadata(metadata: &mut HashMap<String, NodeMetadata>)
     }
 }
 
+pub fn finance_is_price_asset_node(definition_id: &str) -> bool {
+    matches!(
+        definition_id,
+        type_id::FINANCIAL_ASSET | type_id::FINANCIAL_RETURN_ASSET
+    )
+}
+
 /// Returns true when `node_type` is a MarketLab finance graph node.
 pub fn is_marketlab_finance_node(node_type: &str) -> bool {
     node_type.starts_with("marketlab.")
@@ -61,6 +69,49 @@ pub fn is_marketlab_finance_node(node_type: &str) -> bool {
 
 /// Strategy channel property ids (analytics nodes).
 pub const FINANCE_STRATEGY_CHANNELS: &[&str] = &["aggression", "decay", "elasticity"];
+
+/// True when editing this property requires a finance graph recompile to refresh results.
+pub fn finance_property_triggers_compile(definition_id: &str, property_id: &str) -> bool {
+    if !is_marketlab_finance_node(definition_id) {
+        return false;
+    }
+    if finance_is_analytics_node(definition_id) {
+        return matches!(
+            property_id,
+            "archetype"
+                | "algorithm"
+                | "period"
+                | "signal_period"
+                | "multiplier"
+                | "annualization"
+                | "script_src"
+                | "script_compiled_path"
+        );
+    }
+    if definition_id == type_id::PORTFOLIO_INTEGRATOR {
+        return matches!(
+            property_id,
+            "allocation_id" | "initial_capital" | "rebalance_frequency" | "name"
+        );
+    }
+    if finance_is_price_asset_node(definition_id) {
+        return matches!(
+            property_id,
+            "symbol" | "csv_path" | "asset_class" | "prim_path"
+        );
+    }
+    if finance_is_reporting_node(definition_id) {
+        return matches!(
+            property_id,
+            "name"
+                | "risk_free_rate"
+                | "rolling_window"
+                | "benchmark_mode"
+                | "benchmark_symbol"
+        );
+    }
+    false
+}
 
 /// Extra canvas body height (graph units) for inline strategy sliders.
 pub const FINANCE_STRATEGY_BLOCK_HEIGHT: f32 = 72.0;
@@ -106,7 +157,7 @@ pub fn finance_node_header_rgba(definition_id: &str) -> Option<[f32; 4]> {
 }
 
 pub fn finance_node_layout_extra_height(definition_id: &str) -> f32 {
-    if definition_id == type_id::FINANCIAL_ASSET {
+    if finance_is_price_asset_node(definition_id) {
         return crate::sparkline_bitmap::FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT;
     }
     if finance_has_strategy_channels(definition_id) {
@@ -123,12 +174,16 @@ pub fn finance_node_graph_title(
 ) -> Option<String> {
     let base = finance_display_label(definition_id)?;
     match definition_id {
-        type_id::FINANCIAL_ASSET => {
+        type_id::FINANCIAL_ASSET | type_id::FINANCIAL_RETURN_ASSET => {
             let symbol = properties
                 .get("symbol")
                 .map(|value| value.trim())
                 .filter(|value| !value.is_empty())
-                .unwrap_or("SPY");
+                .unwrap_or(if definition_id == type_id::FINANCIAL_RETURN_ASSET {
+                    "Return"
+                } else {
+                    "SPY"
+                });
             Some(format!("{base} · {symbol}"))
         }
         type_id::PORTFOLIO_INTEGRATOR => {
@@ -182,6 +237,33 @@ pub fn finance_data_types_compatible(a: &str, b: &str) -> bool {
         type_name.starts_with("MarketLab")
     }
     is_finance_stream(a) && is_finance_stream(b)
+}
+
+/// Canonical finance stream input pins (`TA Trend` uses `source_stream`, OTL uses `underlying`).
+pub const FINANCE_STREAM_INPUT_PINS: &[&str] = &["source_stream", "underlying"];
+
+/// Canonical finance stream output pins (assets emit `close`, analytics emit `result`).
+pub const FINANCE_STREAM_OUTPUT_PINS: &[&str] = &["close", "result", "wealth"];
+
+/// Map a requested finance stream pin to an available pin on the node (compile-time alias).
+pub fn finance_resolve_stream_pin(requested: &str, available: &[String]) -> Option<String> {
+    if available.iter().any(|pin| pin == requested) {
+        return Some(requested.to_string());
+    }
+    let is_stream_alias = FINANCE_STREAM_INPUT_PINS.contains(&requested)
+        || FINANCE_STREAM_OUTPUT_PINS.contains(&requested);
+    if !is_stream_alias {
+        return None;
+    }
+    for alias in FINANCE_STREAM_INPUT_PINS
+        .iter()
+        .chain(FINANCE_STREAM_OUTPUT_PINS.iter())
+    {
+        if available.iter().any(|pin| pin == *alias) {
+            return Some((*alias).to_string());
+        }
+    }
+    None
 }
 
 /// Inspector field descriptor for a finance node property.
@@ -277,6 +359,21 @@ fn empty_default_for_type(type_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finance_resolve_stream_pin_aliases_ta_and_otl_inputs() {
+        let ta_pins = vec!["source_stream".to_string()];
+        assert_eq!(
+            finance_resolve_stream_pin("underlying", &ta_pins),
+            Some("source_stream".to_string())
+        );
+
+        let otl_pins = vec!["underlying".to_string()];
+        assert_eq!(
+            finance_resolve_stream_pin("source_stream", &otl_pins),
+            Some("underlying".to_string())
+        );
+    }
 
     #[test]
     fn finance_signal_types_are_mutually_compatible() {

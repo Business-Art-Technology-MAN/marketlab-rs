@@ -34,7 +34,16 @@ use crate::types::{type_id, FinanceNodeKind, PORTFOLIO_ALLOCATION_TOKENS};
 
 const MARKETLAB_ROOT: &str = "/MarketLab";
 const MARKETLAB_DEFAULT_PRIM: &str = "MarketLab";
-const LINEAGE_RELATIONSHIPS: [&str; 2] = ["inputs:underlying", "inputs:sources"];
+/// USD scope folder for OTL / TA analytics prims (`/MarketLab/Analytics/...`).
+const ANALYTICS_SCOPE: &str = "Analytics";
+/// USD scope folder for performance tear-sheet prims (`/MarketLab/Reporting/...`).
+const REPORTING_SCOPE: &str = "Reporting";
+const LINEAGE_RELATIONSHIPS: [&str; 4] = [
+    "inputs:underlying",
+    "inputs:sources",
+    "inputs:series",
+    "inputs:benchmark",
+];
 
 static STAGE_OPEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -141,6 +150,7 @@ pub fn import_document(path: impl AsRef<Path>) -> Result<FinanceWorkspaceDocumen
     let tx = UsdTransaction::open(path)?;
     let mut doc = hydrate_document(&tx)?;
     refresh_asset_taxonomy_in_graph(&mut doc.graph);
+    dedupe_finance_graph_connections(&mut doc.graph);
     doc.document_path = Some(path.to_path_buf());
     doc.layer_stack = default_layer_stack();
     doc.session_opinions = load_session_opinions(path)?;
@@ -160,6 +170,7 @@ pub fn export_document(
 ) -> Result<FinanceColdWriteReport, UsdPersistenceError> {
     let path = path.as_ref();
     let assets_refreshed = prepare_finance_graph_for_cold_write(&mut doc.graph, database);
+    dedupe_finance_graph_connections(&mut doc.graph);
     doc.refresh_resolved_prim_paths();
 
     let expected_finance_nodes = doc.graph.nodes.len();
@@ -251,11 +262,19 @@ fn collect_stage_graph(
         }
         for relationship in LINEAGE_RELATIONSHIPS {
             for target in relationship_targets(stage, &child_path, relationship) {
-                wires.push(GraphCompileWire {
+                let wire = GraphCompileWire {
                     source_prim_path: target,
                     target_prim_path: child_path.clone(),
                     relationship: relationship.to_string(),
-                });
+                };
+                if wires.iter().any(|existing| {
+                    existing.source_prim_path == wire.source_prim_path
+                        && existing.target_prim_path == wire.target_prim_path
+                        && existing.relationship == wire.relationship
+                }) {
+                    continue;
+                }
+                wires.push(wire);
             }
         }
         collect_stage_graph(stage, &child_path, prims, wires)?;
@@ -290,7 +309,16 @@ fn graph_from_stage_prims(
 
     let mut portfolio_port_cursor: HashMap<String, usize> = HashMap::new();
     let mut performance_series_cursor: HashMap<String, usize> = HashMap::new();
+    let mut seen_lineage: HashSet<(String, String, String)> = HashSet::new();
     for wire in wires {
+        let lineage_key = (
+            wire.source_prim_path.clone(),
+            wire.target_prim_path.clone(),
+            wire.relationship.clone(),
+        );
+        if !seen_lineage.insert(lineage_key) {
+            continue;
+        }
         let Some(source_id) = path_to_id.get(&wire.source_prim_path) else {
             continue;
         };
@@ -376,6 +404,7 @@ fn unique_node_id(prim: &StageGraphPrim, index: usize, used: &mut HashSet<String
 fn graphy_type_for_prim(kind: FinanceNodeKind, attrs: &HashMap<String, String>) -> String {
     match kind {
         FinanceNodeKind::FinancialAsset => type_id::FINANCIAL_ASSET.to_string(),
+        FinanceNodeKind::FinancialReturnAsset => type_id::FINANCIAL_RETURN_ASSET.to_string(),
         FinanceNodeKind::OtlOperator => type_id::OTL_OPERATOR.to_string(),
         FinanceNodeKind::PortfolioIntegrator => type_id::PORTFOLIO_INTEGRATOR.to_string(),
         FinanceNodeKind::PerformanceAnalytics => type_id::PERFORMANCE_ANALYTICS.to_string(),
@@ -408,7 +437,7 @@ fn apply_prim_properties(
     };
 
     match kind {
-        FinanceNodeKind::FinancialAsset => {
+        FinanceNodeKind::FinancialAsset | FinanceNodeKind::FinancialReturnAsset => {
             insert(
                 node,
                 "symbol",
@@ -423,7 +452,13 @@ fn apply_prim_properties(
                 attrs
                     .get("inputs:asset_class")
                     .cloned()
-                    .unwrap_or_else(|| "Equity".into()),
+                    .unwrap_or_else(|| {
+                        if kind == FinanceNodeKind::FinancialReturnAsset {
+                            "Alternative".into()
+                        } else {
+                            "Equity".into()
+                        }
+                    }),
             );
             insert(
                 node,
@@ -432,34 +467,35 @@ fn apply_prim_properties(
                     &attrs.get("inputs:csv_path").cloned().unwrap_or_default(),
                 ),
             );
-            insert(
-                node,
-                "category",
-                attrs.get("inputs:category").cloned().unwrap_or_default(),
-            );
-            insert(
-                node,
-                "sub_category",
-                attrs
-                    .get("inputs:sub_category")
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            insert(
-                node,
-                "exchange_mic",
-                attrs
-                    .get("inputs:exchange_mic")
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            insert(
-                node,
-                "provider",
-                attrs.get("inputs:provider").cloned().unwrap_or_default(),
-            );
-            for (usd_key, prop_key) in [
-                ("info:sector", "info_sector"),
+            if kind == FinanceNodeKind::FinancialAsset {
+                insert(
+                    node,
+                    "category",
+                    attrs.get("inputs:category").cloned().unwrap_or_default(),
+                );
+                insert(
+                    node,
+                    "sub_category",
+                    attrs
+                        .get("inputs:sub_category")
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                insert(
+                    node,
+                    "exchange_mic",
+                    attrs
+                        .get("inputs:exchange_mic")
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                insert(
+                    node,
+                    "provider",
+                    attrs.get("inputs:provider").cloned().unwrap_or_default(),
+                );
+                for (usd_key, prop_key) in [
+                    ("info:sector", "info_sector"),
                 ("info:industry_group", "info_industry_group"),
                 ("info:industry", "info_industry"),
                 ("info:currency", "info_currency"),
@@ -474,17 +510,20 @@ fn apply_prim_properties(
                     attrs.get(usd_key).cloned().unwrap_or_default(),
                 );
             }
+            }
+            let symbol_leaf = attrs
+                .get("inputs:symbol")
+                .map(String::as_str)
+                .unwrap_or_else(|| prim_leaf(prim_path));
+            let prim_leaf = if kind == FinanceNodeKind::FinancialReturnAsset {
+                symbol_leaf.to_string()
+            } else {
+                symbol_leaf.to_ascii_uppercase()
+            };
             insert(
                 node,
                 "prim_path",
-                format!(
-                    "/MarketLab/Universe/{}",
-                    attrs
-                        .get("inputs:symbol")
-                        .map(String::as_str)
-                        .unwrap_or_else(|| prim_leaf(prim_path))
-                        .to_ascii_uppercase()
-                ),
+                format!("/MarketLab/Universe/{prim_leaf}"),
             );
         }
         FinanceNodeKind::OtlOperator => {
@@ -608,19 +647,26 @@ fn compose_finance_usda(graph: &GraphDescription) -> Result<String, UsdPersisten
 
     let mut relationships: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for wire in &snapshot.wires {
-        relationships
+        let targets = relationships
             .entry(wire.target_prim_path.clone())
             .or_default()
             .entry(wire.relationship.clone())
-            .or_default()
-            .push(wire.source_prim_path.clone());
+            .or_default();
+        if !targets.iter().any(|target| target == &wire.source_prim_path) {
+            targets.push(wire.source_prim_path.clone());
+        }
     }
 
     let mut out = String::from("#usda 1.0\n(\n");
     out.push_str(&format!("    defaultPrim = \"{MARKETLAB_DEFAULT_PRIM}\"\n)\n\n"));
     out.push_str(&format!("def Scope \"{MARKETLAB_DEFAULT_PRIM}\"\n{{\n"));
 
-    for scope in [UNIVERSE_SCOPE, SIGNALS_SCOPE, PORTFOLIOS_SCOPE] {
+    for scope in [
+        UNIVERSE_SCOPE,
+        ANALYTICS_SCOPE,
+        PORTFOLIOS_SCOPE,
+        REPORTING_SCOPE,
+    ] {
         out.push_str(&format!("    def Scope \"{scope}\"\n    {{\n"));
         let mut scope_prims: Vec<&StageGraphPrim> = snapshot
             .prims
@@ -631,7 +677,10 @@ fn compose_finance_usda(graph: &GraphDescription) -> Result<String, UsdPersisten
         let mut written_paths = HashSet::new();
         for prim in scope_prims {
             if !written_paths.insert(prim.path.clone()) {
-                continue;
+                return Err(UsdPersistenceError::Hydrate(format!(
+                    "duplicate prim path {} — two nodes cannot share the same USD path",
+                    prim.path
+                )));
             }
             write_prim_block(&mut out, prim, relationships.get(&prim.path), graph, &path_to_node)?;
         }
@@ -654,6 +703,12 @@ fn write_prim_block(
             .filter(|symbol| !symbol.is_empty())
             .map(|symbol| symbol.to_ascii_uppercase())
             .unwrap_or_else(|| prim_leaf(&prim.path).to_ascii_uppercase())
+    } else if prim.type_name == "FinancialReturnAsset" {
+        prim.attributes
+            .get("inputs:symbol")
+            .filter(|symbol| !symbol.is_empty())
+            .cloned()
+            .unwrap_or_else(|| prim_leaf(&prim.path).to_string())
     } else {
         prim_leaf(&prim.path).to_string()
     };
@@ -811,6 +866,7 @@ fn is_schema_template_prim(path: &str) -> bool {
     matches!(
         path,
         "/FinancialAsset"
+            | "/FinancialReturnAsset"
             | "/OtlOperator"
             | "/OtlTaUberSignal"
             | "/PortfolioIntegrator"
@@ -832,7 +888,7 @@ fn prim_type_name(stage: &Stage, path_str: &str) -> Option<String> {
 
 fn classify_type_name(type_name: &str) -> Option<&str> {
     match type_name {
-        "FinancialAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator"
+        "FinancialAsset" | "FinancialReturnAsset" | "OtlOperator" | "OtlTaUberSignal" | "PortfolioIntegrator"
         | "PerformanceAnalytics" => Some(type_name),
         _ => None,
     }
@@ -886,10 +942,16 @@ fn read_prim_attributes(stage: &Stage, path_str: &str) -> HashMap<String, String
 fn legacy_type_name_from_path(path_str: &str) -> Option<String> {
     if path_str.starts_with("/assets/") {
         Some("FinancialAsset".to_string())
-    } else if path_str.starts_with("/analytics/") {
+    } else if path_str.starts_with("/analytics/")
+        || path_str.starts_with(&format!("{MARKETLAB_ROOT}/Analytics/"))
+    {
         Some("OtlTaUberSignal".to_string())
     } else if path_str.starts_with("/portfolios/") {
         Some("PortfolioIntegrator".to_string())
+    } else if path_str.starts_with("/reporting/")
+        || path_str.starts_with(&format!("{MARKETLAB_ROOT}/Reporting/"))
+    {
+        Some("PerformanceAnalytics".to_string())
     } else {
         None
     }
@@ -916,6 +978,44 @@ fn path_list_op_targets(list_op: PathListOp) -> Vec<String> {
 
 fn prim_leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Collapse duplicate canvas wires that serialize to the same USD lineage edge.
+fn dedupe_finance_graph_connections(graph: &mut GraphDescription) {
+    let mut exact = HashSet::new();
+    graph.connections.retain(|connection| {
+        exact.insert((
+            connection.source_node.clone(),
+            connection.source_pin.clone(),
+            connection.target_node.clone(),
+            connection.target_pin.clone(),
+        ))
+    });
+
+    let mut lineage = HashSet::new();
+    graph.connections.retain(|connection| {
+        let Some(target_kind) = graph
+            .nodes
+            .get(&connection.target_node)
+            .and_then(|node| FinanceNodeKind::from_graphy_type_id(&node.node_type))
+        else {
+            return true;
+        };
+        let semantic_key = match target_kind {
+            FinanceNodeKind::PortfolioIntegrator
+            | FinanceNodeKind::OtlOperator
+            | FinanceNodeKind::OtlTaUberSignal
+            | FinanceNodeKind::PerformanceAnalytics => Some((
+                connection.source_node.clone(),
+                connection.target_node.clone(),
+            )),
+            _ => None,
+        };
+        match semantic_key {
+            Some(key) => lineage.insert(key),
+            None => true,
+        }
+    });
 }
 
 /// Merge embedded taxonomy metadata into financial asset node properties after cold import.
@@ -1001,6 +1101,185 @@ mod tests {
                 .get("inputs:category")
                 .is_some(),
             "category should round-trip in USD attributes"
+        );
+    }
+
+    #[test]
+    fn export_round_trip_preserves_duplicate_named_reporting_nodes() {
+        use graphy::{GraphDescription, NodeInstance, Position};
+
+        let mut graph = GraphDescription::new("reporting_dup");
+        for id in ["report_a", "report_b"] {
+            let mut node = NodeInstance::new(
+                id,
+                type_id::PERFORMANCE_ANALYTICS,
+                Position::new(0.0, 0.0),
+            );
+            node.properties.insert(
+                "name".to_string(),
+                graphy::JsonValue::String("total".to_string()),
+            );
+            graph.add_node(node);
+        }
+
+        let mut doc = FinanceWorkspaceDocument::new(graph);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("reporting_dup.usda");
+        export_document(&mut doc, &path, None).expect("export");
+        let reopened = import_document(&path).expect("reopen");
+        assert_eq!(
+            reopened.graph.nodes.len(),
+            2,
+            "both reporting nodes must survive save when names collide"
+        );
+    }
+
+    #[test]
+    fn export_round_trip_preserves_performance_reporting_nodes() {
+        use graphy::{Connection, ConnectionType, GraphDescription, NodeInstance, Position};
+
+        let mut graph = GraphDescription::new("reporting_save");
+        let mut fund = NodeInstance::new(
+            "fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(0.0, 0.0),
+        );
+        fund.properties.insert(
+            "name".to_string(),
+            graphy::JsonValue::String("fund".to_string()),
+        );
+        let mut report = NodeInstance::new(
+            "perf_report",
+            type_id::PERFORMANCE_ANALYTICS,
+            Position::new(200.0, 0.0),
+        );
+        report.properties.insert(
+            "name".to_string(),
+            graphy::JsonValue::String("Performance Report".to_string()),
+        );
+        graph.add_node(fund);
+        graph.add_node(report);
+        graph.add_connection(Connection {
+            source_node: "fund".to_string(),
+            source_pin: "wealth".to_string(),
+            target_node: "perf_report".to_string(),
+            target_pin: "series_0".to_string(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let mut doc = FinanceWorkspaceDocument::new(graph);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("reporting_roundtrip.usda");
+        export_document(&mut doc, &path, None).expect("export");
+
+        let usda = std::fs::read_to_string(&path).expect("read usda");
+        assert!(
+            usda.contains("def Scope \"Reporting\""),
+            "reporting prims must export under Reporting scope: {usda}"
+        );
+        assert!(
+            usda.contains("def PerformanceAnalytics"),
+            "missing performance analytics prim block: {usda}"
+        );
+        assert!(
+            usda.contains("rel inputs:series"),
+            "portfolio wealth wire must round-trip as inputs:series: {usda}"
+        );
+
+        let reopened = import_document(&path).expect("reopen");
+        assert_eq!(
+            reopened.graph.nodes.len(),
+            2,
+            "expected portfolio + reporting node after round-trip"
+        );
+        assert!(
+            reopened
+                .graph
+                .nodes
+                .values()
+                .any(|node| node.node_type == type_id::PERFORMANCE_ANALYTICS),
+            "performance reporting node missing after reopen"
+        );
+        assert_eq!(
+            reopened.graph.connections.len(),
+            1,
+            "wealth → report wire should survive reopen"
+        );
+    }
+
+    #[test]
+    fn export_round_trip_preserves_ta_analytics_nodes() {
+        use graphy::{Connection, ConnectionType, GraphDescription, NodeInstance, Position};
+
+        let mut graph = GraphDescription::new("ta_save");
+        let mut spy = NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        );
+        spy.properties.insert(
+            "symbol".to_string(),
+            graphy::JsonValue::String("SPY".to_string()),
+        );
+        graph.add_node(spy);
+        graph.add_node(NodeInstance::new(
+            "ta_ear",
+            type_id::TA_TREND,
+            Position::new(120.0, 0.0),
+        ));
+        let mut fund = NodeInstance::new(
+            "ear_fund",
+            type_id::PORTFOLIO_INTEGRATOR,
+            Position::new(240.0, 0.0),
+        );
+        fund.properties.insert(
+            "name".to_string(),
+            graphy::JsonValue::String("ear_fund".to_string()),
+        );
+        graph.add_node(fund);
+        graph.add_connection(Connection {
+            source_node: "spy".to_string(),
+            source_pin: "close".to_string(),
+            target_node: "ta_ear".to_string(),
+            target_pin: "source_stream".to_string(),
+            connection_type: ConnectionType::Data,
+        });
+        graph.add_connection(Connection {
+            source_node: "ta_ear".to_string(),
+            source_pin: "result".to_string(),
+            target_node: "ear_fund".to_string(),
+            target_pin: "signal_0".to_string(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let mut doc = FinanceWorkspaceDocument::new(graph);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("ta_roundtrip.usda");
+        export_document(&mut doc, &path, None).expect("export");
+
+        let usda = std::fs::read_to_string(&path).expect("read usda");
+        assert!(
+            usda.contains("def Scope \"Analytics\""),
+            "TA prims must export under Analytics scope: {usda}"
+        );
+        assert!(
+            usda.contains("def OtlTaUberSignal \"ta_ear\""),
+            "missing TA prim block: {usda}"
+        );
+
+        let reopened = import_document(&path).expect("reopen");
+        assert_eq!(
+            reopened.graph.nodes.len(),
+            3,
+            "expected asset + TA + portfolio after round-trip"
+        );
+        assert!(
+            reopened
+                .graph
+                .nodes
+                .values()
+                .any(|node| node.node_type == type_id::TA_TREND),
+            "TA node missing after reopen"
         );
     }
 

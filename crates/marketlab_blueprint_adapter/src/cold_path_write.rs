@@ -101,6 +101,12 @@ pub fn validate_finance_graph_for_cold_write(
             "one or more finance nodes lack a resolved USD prim path".into(),
         ));
     }
+    let unique_paths: HashSet<&String> = paths.values().collect();
+    if unique_paths.len() != paths.len() {
+        return Err(UsdPersistenceError::Hydrate(
+            "two or more finance nodes resolve to the same USD prim path".into(),
+        ));
+    }
 
     let mut asset_symbols = HashSet::new();
     for node in graph.nodes.values() {
