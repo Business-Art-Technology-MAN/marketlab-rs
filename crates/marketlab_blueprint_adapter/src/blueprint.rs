@@ -160,6 +160,11 @@ pub fn finance_node_layout_extra_height(definition_id: &str) -> f32 {
     if finance_is_price_asset_node(definition_id) {
         return crate::sparkline_bitmap::FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT;
     }
+    if finance_is_analytics_node(definition_id)
+        || definition_id == type_id::PORTFOLIO_INTEGRATOR
+    {
+        return crate::sparkline_bitmap::FINANCE_NODE_SPARKLINE_BLOCK_HEIGHT;
+    }
     if finance_has_strategy_channels(definition_id) {
         FINANCE_STRATEGY_BLOCK_HEIGHT
     } else {

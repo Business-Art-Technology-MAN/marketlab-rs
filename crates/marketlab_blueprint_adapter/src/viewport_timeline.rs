@@ -299,9 +299,24 @@ fn year_from_date(date_part: &str) -> String {
 
 fn format_y_tick(value: f64, mode: ViewportYAxisMode) -> String {
     match mode {
-        ViewportYAxisMode::AbsolutePrice => format!("${value:.2}"),
+        ViewportYAxisMode::AbsolutePrice => format_compact_usd(value),
         ViewportYAxisMode::CumulativeReturn => format!("{value:+.1}%"),
         ViewportYAxisMode::SignalStrength => format!("{value:.2}"),
+    }
+}
+
+fn format_compact_usd(value: f64) -> String {
+    let abs = value.abs();
+    if abs >= 1_000_000_000.0 {
+        format!("${:.2}B", value / 1_000_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("${:.2}M", value / 1_000_000.0)
+    } else if abs >= 10_000.0 {
+        format!("${:.0}K", value / 1_000.0)
+    } else if abs >= 1_000.0 {
+        format!("${:.1}K", value / 1_000.0)
+    } else {
+        format!("${value:.2}")
     }
 }
 

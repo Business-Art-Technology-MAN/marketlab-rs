@@ -3,6 +3,8 @@
 //! - [`FinanceNodeMetadataProvider`] — Graphy node palette + validation metadata
 //! - [`FinanceGraphAdapter`] — `GraphDescription` → [`StageGraphSnapshot`] (engine input)
 
+mod chart_model;
+mod chart_raster;
 mod cold_path_write;
 mod asset_data;
 mod bulk_assets;
@@ -20,6 +22,7 @@ mod telemetry;
 mod taxonomy_index;
 mod types;
 mod blueprint;
+mod node_series_cache;
 mod performance_analytics;
 mod performance_export;
 mod performance_report;
@@ -98,6 +101,11 @@ pub use usd_persistence::{
     export_document, import_document, stage_open_counter, FinanceLayerRef, FinanceSessionContext,
     FinanceWorkspaceDocument, UsdPersistenceError, UsdTransaction,
 };
+pub use node_series_cache::{
+    build_finance_node_series_cache, bundle_scrub_readout, classify_series_kind,
+    resolve_upstream_series, FinanceNodeSeriesBuildContext, FinanceNodeSeriesBundle,
+    FinanceSeriesKind, FinanceSeriesResolveContext, NodeValueSummary, ResolvedFinanceSeries,
+};
 pub use performance_analytics::{
     compare_to_benchmark, compute_performance_bundle, cumulative_return_index,
     drawdown_series_pct, summarize_performance, FinanceBenchmarkComparison,
@@ -117,7 +125,18 @@ pub use series_pins::{
     PERFORMANCE_BENCHMARK_PIN,
 };
 pub use sparkline_bitmap::{
-    rasterize_asset_preview_sparkline, rasterize_close_sparkline, FinanceSparklineBitmap,
-    FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT, FINANCE_SPARKLINE_HEIGHT, FINANCE_SPARKLINE_WIDTH,
+    rasterize_asset_preview_sparkline, rasterize_close_sparkline, rasterize_series_sparkline,
+    FinanceSparklineBitmap, FINANCE_ASSET_SPARKLINE_BLOCK_HEIGHT, FINANCE_NODE_SPARKLINE_BLOCK_HEIGHT,
+    FINANCE_SPARKLINE_HEIGHT, FINANCE_SPARKLINE_WIDTH,
+};
+pub use chart_model::{
+    build_analytics_trading_chart, build_asset_ohlc_chart, build_isolated_series_chart,
+    build_performance_chart, build_portfolio_wealth_chart, build_sparkline_model,
+    build_wealth_trading_chart, ChartLayer, ChartPaneKind, ChartPaneSpec, FinanceChartModel,
+    CHART_BACK_RGB, CHART_BULL_RGB, CHART_BEAR_RGB,
+};
+pub use chart_raster::{
+    rasterize_finance_chart_pane, rasterize_finance_chart_thumbnail, CHART_RASTER_MAX_WIDTH,
+    CHART_RASTER_MIN_WIDTH,
 };
 pub use pulsar_marketlab_core::{StageGraphSnapshot, StageSweepProfile};

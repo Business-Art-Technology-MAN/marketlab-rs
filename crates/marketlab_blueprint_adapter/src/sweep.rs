@@ -33,6 +33,8 @@ pub struct FinanceSweepResult {
     pub portfolios: Vec<FinancePortfolioSweepSummary>,
     /// OTL / TA output series keyed by analytics prim path.
     pub analytics_signals: HashMap<String, Vec<f64>>,
+    /// All scalar attribute streams keyed by prim path then attribute name.
+    pub attribute_streams: HashMap<String, HashMap<String, Vec<f64>>>,
     pub warnings: Vec<String>,
     pub error: Option<String>,
 }
@@ -217,23 +219,18 @@ fn run_finance_sweep_internal(
         warnings.push("Sweep completed but no portfolio wealth streams were produced".to_string());
     }
 
-    let mut analytics_signals = HashMap::new();
+    let mut attribute_streams: HashMap<String, HashMap<String, Vec<f64>>> = HashMap::new();
     for stream in &result.streams {
-        let Some(prim) = snapshot
-            .prims
-            .iter()
-            .find(|prim| prim.path == stream.prim_path)
-        else {
+        if stream.values.is_empty() {
             continue;
-        };
-        if matches!(
-            prim.type_name.as_str(),
-            "OtlOperator" | "OtlTaUberSignal"
-        ) && !stream.values.is_empty()
-        {
-            analytics_signals.insert(stream.prim_path.clone(), stream.values.clone());
         }
+        attribute_streams
+            .entry(stream.prim_path.clone())
+            .or_default()
+            .insert(stream.attribute.clone(), stream.values.clone());
     }
+
+    let analytics_signals = collect_analytics_signals(snapshot, &attribute_streams);
 
     FinanceSweepResult {
         timeline_len,
@@ -241,6 +238,7 @@ fn run_finance_sweep_internal(
         assets_synthetic: load_meta.synthetic,
         portfolios,
         analytics_signals,
+        attribute_streams,
         warnings,
         error: None,
     }
@@ -281,6 +279,35 @@ fn build_asset_vectors(snapshot: &StageGraphSnapshot) -> (HashMap<String, Shared
     }
 
     (vectors, meta)
+}
+
+const ANALYTICS_SIGNAL_ATTRIBUTES: &[&str] = &["outputs:result", "outputs:signal"];
+
+fn collect_analytics_signals(
+    snapshot: &StageGraphSnapshot,
+    attribute_streams: &HashMap<String, HashMap<String, Vec<f64>>>,
+) -> HashMap<String, Vec<f64>> {
+    let mut analytics_signals = HashMap::new();
+    for prim in snapshot.prims.iter().filter(|prim| {
+        matches!(
+            prim.type_name.as_str(),
+            "OtlOperator" | "OtlTaUberSignal"
+        )
+    }) {
+        let Some(attrs) = attribute_streams.get(&prim.path) else {
+            continue;
+        };
+        let series = ANALYTICS_SIGNAL_ATTRIBUTES
+            .iter()
+            .find_map(|attribute| attrs.get(*attribute))
+            .or_else(|| attrs.values().next());
+        if let Some(values) = series {
+            if !values.is_empty() {
+                analytics_signals.insert(prim.path.clone(), values.clone());
+            }
+        }
+    }
+    analytics_signals
 }
 
 fn portfolio_label(prim: &StageGraphPrim) -> String {

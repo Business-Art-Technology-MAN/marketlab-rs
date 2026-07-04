@@ -3,7 +3,7 @@
 //! Run from repo root:
 //!   cargo run --manifest-path crates/marketlab_finance_editor/Cargo.toml
 
-use blueprint_editor_plugin::{BlueprintEditorPanel, CompileMode};
+use blueprint_editor_plugin::{init_finance_otl_editor_keys, BlueprintEditorPanel, CompileMode};
 use gpui::*;
 use ui::{Assets, Root, Theme, ThemeMode};
 
@@ -11,6 +11,7 @@ fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         ui::init(cx);
         ui::themes::init(cx);
+        init_finance_otl_editor_keys(cx);
         Theme::change(ThemeMode::Dark, None, cx);
 
         cx.open_window(

@@ -13,4 +13,4 @@ path = "src/main.rs"
 [dependencies]
 blueprint_editor_plugin = { path = "../../external/Plugin_Blueprints" }
 gpui-ce = { git = "https://github.com/Far-Beyond-Pulsar/WGPUI", rev = "3458d987317e30f6cda800e03822292e27ef4a33" }
-ui = { git = "https://github.com/Far-Beyond-Pulsar/WGPUI-Component", rev = "3e386a01cf3e0e3c0f86eed7f3e3b9835ce54f70" }
+ui = { git = "https://github.com/Far-Beyond-Pulsar/WGPUI-Component", rev = "3e386a01cf3e0e3c0f86eed7f3e3b9835ce54f70", features = ["tree-sitter-languages"] }
