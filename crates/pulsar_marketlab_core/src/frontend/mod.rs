@@ -1,7 +1,9 @@
 //! OTL three-tier object frontend (`signal`, `allocator`, `portfolio`).
 
-mod codegen;
 mod ast;
+mod canonical;
+mod codegen;
+mod format;
 mod lexer;
 mod parser;
 mod validate;
@@ -10,10 +12,16 @@ pub use ast::{
     OtlObjectDeclaration, OtlObjectKind, OtlProgram, OtlType, PortDirection, PropertyDeclaration,
     Statement,
 };
+pub use canonical::{
+    canonicalize_otl_source, signal_object_from_expression, shader_object_from_osl_source,
+};
+pub(crate) use canonical::shader_uses_osl_parameter_syntax;
 pub use codegen::{
-    apply_alpha_conviction, conviction_scale_from_signal_series, resolve_runtime_script_source,
+    apply_alpha_conviction, conviction_scale_from_signal_series, expression_from_object,
+    resolve_runtime_script_source, series_expression_from_source, signal_expression_from_object,
     ResolvedOtlSource,
 };
+pub use format::{format_object, format_program, otl_default_template, OTL_DEFAULT_TEMPLATE};
 pub use lexer::{object_kind_from_token, tokenize as tokenize_object_declarations};
 pub use parser::{parse_program, ParseError};
 pub use validate::{validate_object, validate_program, ValidationError};
@@ -109,7 +117,7 @@ allocator bad(
     }
 
     #[test]
-    fn legacy_osl_desugars_to_legacy_shader_object() {
+    fn legacy_osl_desugars_to_shader_object() {
         let legacy = r#"
 void adaptive_trigger(
     float source,
@@ -122,6 +130,85 @@ void adaptive_trigger(
         let program = parse_program(legacy).expect("legacy desugar");
         assert_eq!(program.objects.len(), 1);
         assert_eq!(program.objects[0].kind, OtlObjectKind::LegacyShader);
+        assert_eq!(program.objects[0].name, "adaptive_trigger");
+    }
+
+    #[test]
+    fn bare_expression_desugars_to_signal_object() {
+        let program = parse_program("sma(input, 14)").expect("parse expression");
+        assert_eq!(program.objects[0].kind, OtlObjectKind::Signal);
+    }
+
+    #[test]
+    fn canonicalize_roundtrip_preserves_compile_surface() {
+        let source = "ta::sma(input, 10)";
+        let canonical = canonicalize_otl_source(source).expect("canonicalize");
+        assert!(canonical.contains("signal "));
+        assert!(canonical.contains("gated = ta::sma(input, 10);"));
+    }
+
+    #[test]
+    fn parses_osl_shader_ma_crossover_for_tier_compile() {
+        let src = r#"shader ma_crossover(
+    float source,
+    int fast = 10,
+    int slow = 50,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        let program = parse_program(src).expect("parse OSL shader");
+        assert_eq!(program.objects.len(), 1);
+        assert_eq!(program.objects[0].kind, OtlObjectKind::LegacyShader);
+        canonicalize_otl_source(src).expect("canonicalize ma_crossover");
+        compile_object_program(src).expect("compile_object_program ma_crossover");
+    }
+
+    #[test]
+    fn canonicalize_preserves_scalar_uniform_defaults() {
+        let src = r#"shader ma_crossover(
+    float source,
+    int fast = 10,
+    int slow = 50,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        let canonical = canonicalize_otl_source(src).expect("canonicalize");
+        assert!(
+            canonical.contains("fast = 10"),
+            "expected fast default in canonical script: {canonical}"
+        );
+        assert!(
+            canonical.contains("slow = 50"),
+            "expected slow default in canonical script: {canonical}"
+        );
+        let uniforms = crate::parse_script_scalar_uniforms(&canonical);
+        assert_eq!(
+            uniforms
+                .iter()
+                .find(|param| param.name == "fast")
+                .and_then(|param| param.default_value),
+            Some(10.0)
+        );
+        assert_eq!(
+            uniforms
+                .iter()
+                .find(|param| param.name == "slow")
+                .and_then(|param| param.default_value),
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn parses_sma_smoke_shader_declaration() {
+        let src = r#"shader sma_smoke(
+    input float source,
+    output float signal
+) {
+    signal = ta::sma(source, 3);
+}"#;
+        canonicalize_otl_source(src).expect("canonicalize sma_smoke");
     }
 
     #[test]

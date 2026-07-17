@@ -12,9 +12,11 @@ use crate::engine::{
 use crate::execution_matrix::{ExecutionContext, GraphSeriesMatrix, RuntimeEngineError};
 use crate::{
     apply_alpha_conviction, compile_unified_script, compute_allocation_weights,
-    conviction_scale_from_signal_series, AssetQuote, ClosureLegKind, CompileError, CompiledSeries,
+    conviction_scale_from_signal_series, format_program, normalize_for_series_eval,
+    normalize_script_for_compile, AssetQuote, ClosureLegKind, CompileError, CompiledSeries,
     DirectionalDistribution, OtlObjectDeclaration, OtlObjectKind, OtlProgram, PortDirection,
-    SeriesClosure, Statement, SymbolicOtlClosure,
+    ScriptCompileContext, SeriesClosure, SeriesEvalBuffer, Statement, SymbolicOtlClosure,
+    compile_script_multi_with_context,
 };
 
 /// Column and upstream-series lookup table for wiring OTL object ports.
@@ -22,6 +24,12 @@ use crate::{
 pub struct ObjectCodegenRegistry {
     pub signal_columns: HashMap<String, usize>,
     pub upstream_series: Vec<Vec<f64>>,
+    /// Named OSL float inputs beyond the primary series (param name -> column).
+    pub named_upstream: HashMap<String, Vec<f64>>,
+    /// Scalar uniforms (`fast`, `slow`, etc.) from the authored OTL script.
+    pub scalar_params: HashMap<String, f64>,
+    /// Constituent columns for `ga::wedge_volume` / basket nodes.
+    pub constituent_series: Vec<Vec<f64>>,
     pub allocation_method: String,
     pub initial_capital: f64,
     pub asset_quotes: HashMap<String, AssetQuote>,
@@ -60,7 +68,7 @@ impl CompiledProgramTier {
     }
 }
 
-type SharedSeriesFn = Arc<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>;
+type SharedSeriesFn = Arc<dyn Fn(&crate::SeriesEvalContext<'_>) -> Vec<f64> + Send + Sync>;
 
 fn series_is_discrete_gate(series: &[f64]) -> bool {
     !series.is_empty()
@@ -74,6 +82,7 @@ pub struct SignalExecutionEngine {
     convictions: Vec<f64>,
     series_fn: SharedSeriesFn,
     alpha_script: String,
+    eval_buffer: SeriesEvalBuffer,
 }
 
 impl std::fmt::Debug for SignalExecutionEngine {
@@ -90,13 +99,37 @@ impl SignalExecutionEngine {
     /// Precompute the full conviction vector in one pass. Series intrinsics (e.g. `sma`) are
     /// causal on `upstream`; per-bar [`Self::execute_at_bar`] only indexes this buffer.
     pub fn prepare(&mut self, upstream: &[f64], bar_count: usize) {
-        self.convictions = pad_or_trim((self.series_fn)(upstream), bar_count);
+        self.eval_buffer.primary = upstream.to_vec();
+        self.prepare_from_eval_buffer(bar_count);
+    }
+
+    fn prepare_from_eval_buffer(&mut self, bar_count: usize) {
+        let ctx = self.eval_buffer.context();
+        self.convictions = pad_or_trim((self.series_fn)(&ctx), bar_count);
         if !series_is_discrete_gate(&self.convictions) {
             let scale = conviction_scale_from_signal_series(&self.convictions);
             for value in &mut self.convictions {
                 *value = apply_alpha_conviction(*value, &self.alpha_script, scale);
             }
         }
+    }
+
+    pub fn prepare_from_exec_context(&mut self, ctx: &crate::ExecutionContext, bar_count: usize) {
+        self.eval_buffer = SeriesEvalBuffer::from_slices(
+            ctx.signal_upstream.as_slice(),
+            &ctx.signal_named_upstream,
+            &ctx.signal_constituent_series,
+        );
+        self.prepare_from_eval_buffer(bar_count);
+    }
+
+    pub fn prepare_with_registry(&mut self, registry: &ObjectCodegenRegistry, bar_count: usize) {
+        self.eval_buffer = SeriesEvalBuffer::from_slices(
+            registry.upstream_at(0).unwrap_or(&[]),
+            &registry.named_upstream,
+            &registry.constituent_series,
+        );
+        self.prepare_from_eval_buffer(bar_count);
     }
 
     pub fn execute_at_bar(&self, bar_idx: usize, _ctx: &ExecutionContext) -> f64 {
@@ -116,6 +149,7 @@ impl SignalExecutionEngine {
             convictions: Vec::new(),
             series_fn: Arc::clone(&self.series_fn),
             alpha_script: self.alpha_script.clone(),
+            eval_buffer: SeriesEvalBuffer::default(),
         }
     }
 }
@@ -471,12 +505,25 @@ fn compile_signal_engine(
     registry: &ObjectCodegenRegistry,
 ) -> Result<SignalExecutionEngine, CompileError> {
     let script = body_to_runtime_expression(object);
-    let series_fn = Arc::from(compile_series_closure(&script)?);
+    let canonical = format_program(&OtlProgram {
+        objects: vec![object.clone()],
+    });
+    let mut ctx = ScriptCompileContext::from_script_source(&canonical);
+    for (name, value) in &registry.scalar_params {
+        let key = name.to_ascii_lowercase();
+        if ctx.scalar_params.contains_key(&key) {
+            ctx.scalar_params.insert(key, *value);
+        }
+    }
+    let stripped = normalize_script_for_compile(&script);
+    let normalized = normalize_for_series_eval(&stripped);
+    let series_fn = Arc::from(compile_series_closure_with_context(&normalized, &ctx)?);
     let _upstream = registry.upstream_at(0).unwrap_or(&[]);
     Ok(SignalExecutionEngine {
         convictions: Vec::new(),
         series_fn,
         alpha_script: script,
+        eval_buffer: SeriesEvalBuffer::default(),
     })
 }
 
@@ -607,11 +654,22 @@ fn resolve_signal_inputs(
 fn compile_series_closure(script: &str) -> Result<SeriesClosure, CompileError> {
     match compile_unified_script(script)? {
         CompiledSeries::Single(closure) => Ok(closure),
-        CompiledSeries::Multi(closure, _) => Ok(Box::new(move |input| {
-            closure(input)
-                .into_iter()
-                .next()
-                .unwrap_or_default()
+        CompiledSeries::Multi(closure, _) => Ok(Box::new(move |ctx| {
+            closure(ctx).into_iter().next().unwrap_or_default()
+        })),
+    }
+}
+
+fn compile_series_closure_with_context(
+    script: &str,
+    ctx: &ScriptCompileContext,
+) -> Result<SeriesClosure, CompileError> {
+    let stripped = normalize_script_for_compile(script);
+    let normalized = normalize_for_series_eval(&stripped);
+    match compile_script_multi_with_context(&normalized, ctx)? {
+        CompiledSeries::Single(closure) => Ok(closure),
+        CompiledSeries::Multi(closure, _) => Ok(Box::new(move |eval_ctx| {
+            closure(eval_ctx).into_iter().next().unwrap_or_default()
         })),
     }
 }
@@ -630,18 +688,7 @@ fn body_to_runtime_script(object: &OtlObjectDeclaration) -> String {
 }
 
 fn body_to_runtime_expression(object: &OtlObjectDeclaration) -> String {
-    for statement in &object.body {
-        match statement {
-            Statement::Assign { expr, .. } | Statement::Return { expr } => {
-                return expr.trim().trim_end_matches(';').trim().to_string();
-            }
-            Statement::Raw { text } if !text.trim().is_empty() => {
-                return text.clone();
-            }
-            _ => {}
-        }
-    }
-    body_to_runtime_script(object)
+    crate::signal_expression_from_object(object)
 }
 
 fn parse_blend_weights(script: &str, leg_count: usize) -> Vec<f64> {

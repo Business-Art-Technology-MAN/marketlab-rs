@@ -1,0 +1,6 @@
+// Single-file reference: geometric beta decomposition (article Sensor 2 demo).
+// Wire: fn main(data=asset, market=SPY)
+
+fn main(data, market) {
+    return ga::geometric_beta(data, market, 60);
+}

@@ -1,0 +1,12 @@
+[package]
+name = "vector-ga"
+version = "0.1.0"
+edition = "2021"
+description = "Geometric algebra indicators for MarketLab (vectorTA-style dispatch)"
+
+[dependencies]
+clifford = { workspace = true }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+vector-ta = { workspace = true }

@@ -1,0 +1,9 @@
+// Sensor 1 — Regime: hyper-volume of sector return vectors (Gram determinant).
+// Wire: inputs:constituents ← XLK, XLF, XLV, XLE, XLI, XLY, XLP, XLB, XLU (adjusted close).
+
+shader regime_wedge_volume(
+    input float placeholder,
+    output float volume
+) {
+    volume = ga::wedge_volume(60);
+}

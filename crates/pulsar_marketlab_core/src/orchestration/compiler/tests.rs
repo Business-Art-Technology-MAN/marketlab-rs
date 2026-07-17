@@ -1,7 +1,8 @@
 //! Integration tests: OSL C-style scripts → `compile_unified_script` → closure execution.
 
-use crate::orchestration::compiler::{CompiledSeries, MultiSeriesClosure, SeriesClosure};
+use crate::orchestration::compiler::{eval_series_primary, CompiledSeries, MultiSeriesClosure, SeriesClosure};
 use crate::orchestration::script_resolve::compile_unified_script;
+use crate::SeriesEvalContext;
 
 /// Mock daily close stream with mild trend and oscillation (deterministic).
 fn mock_close_prices(bars: usize) -> Vec<f64> {
@@ -85,7 +86,7 @@ fn compile_unified_osl_void_main_generates_executable_series_closure() {
     };
 
     let closes = mock_close_prices(96);
-    let output = closure(&closes);
+    let output = eval_series_primary(&closure, &closes);
 
     assert_series_output_valid(&output, closes.len(), 0);
     assert!(
@@ -110,7 +111,7 @@ fn compile_unified_osl_bare_shader_sma_executes_on_mock_closes() {
     };
 
     let closes = mock_close_prices(48);
-    let output = closure(&closes);
+    let output = eval_series_primary(&closure, &closes);
 
     // SMA(5) leaves four NaN warmup bars.
     assert_series_output_valid(&output, closes.len(), 4);
@@ -130,7 +131,7 @@ fn compile_unified_osl_multi_channel_bollinger_executes_all_outputs() {
 
     assert_eq!(labels.len(), 3);
     let closes = mock_close_prices(64);
-    let channels = multi(&closes);
+    let channels = multi(&SeriesEvalContext::primary_only(&closes));
     assert_multi_output_valid(&channels, closes.len(), 9);
 }
 
@@ -142,8 +143,8 @@ fn compile_unified_osl_void_main_closure_is_deterministic_across_invocations() {
     };
 
     let closes = mock_close_prices(32);
-    let first = closure(&closes);
-    let second = closure(&closes);
+    let first = eval_series_primary(&closure, &closes);
+    let second = eval_series_primary(&closure, &closes);
     assert_eq!(first, second, "series closure must be deterministic");
 }
 

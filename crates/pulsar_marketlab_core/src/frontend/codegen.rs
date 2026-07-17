@@ -22,15 +22,20 @@ pub fn resolve_runtime_script_source(source: &str) -> Result<ResolvedOtlSource, 
         });
     }
 
-    if !starts_with_object_keyword(trimmed) {
+    if starts_with_object_keyword(trimmed) {
+        let program = compile_object_program(trimmed)?;
+        let object = program
+            .objects
+            .first()
+            .ok_or_else(|| FrontendError::Parse(super::ParseError::ExpectedObjectKind))?;
         return Ok(ResolvedOtlSource {
-            kind: OtlObjectKind::LegacyShader,
-            runtime_script: trimmed.to_string(),
-            object_name: "legacy".to_string(),
+            kind: object.kind,
+            runtime_script: body_to_runtime_script(object),
+            object_name: object.name.clone(),
         });
     }
 
-    let program = compile_object_program(trimmed)?;
+    let program = super::parse_program(trimmed)?;
     let object = program
         .objects
         .first()
@@ -60,6 +65,62 @@ fn body_to_runtime_script(object: &OtlObjectDeclaration) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Extract the series math expression from a three-tier / shader OTL declaration.
+pub fn series_expression_from_source(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if !starts_with_object_keyword(trimmed) {
+        return None;
+    }
+    let program = super::parse_program(trimmed).ok()?;
+    let object = program.primary_object()?;
+    Some(expression_from_object(object))
+}
+
+pub fn expression_from_object(object: &OtlObjectDeclaration) -> String {
+    signal_expression_from_object(object)
+}
+
+/// Extract the series math for the primary output port (typically `signal`).
+pub fn signal_expression_from_object(object: &OtlObjectDeclaration) -> String {
+    let output_names: Vec<String> = object
+        .outputs
+        .iter()
+        .map(|port| port.name.to_ascii_lowercase())
+        .collect();
+
+    let mut last_output_expr = None;
+    for statement in &object.body {
+        if let Statement::Assign { target, expr } = statement {
+            let target = target.trim().to_ascii_lowercase();
+            if output_names.iter().any(|name| name == &target) {
+                last_output_expr = Some(expr.trim().trim_end_matches(';').trim().to_string());
+            }
+        }
+    }
+    if let Some(expr) = last_output_expr.filter(|expr| !expr.is_empty()) {
+        return expr;
+    }
+
+    for statement in &object.body {
+        match statement {
+            Statement::Return { expr } => {
+                return expr.trim().trim_end_matches(';').trim().to_string();
+            }
+            Statement::Assign { expr, .. } => {
+                return expr.trim().trim_end_matches(';').trim().to_string();
+            }
+            Statement::Raw { text } if !text.trim().is_empty() => {
+                let normalized = crate::normalize_script_for_compile(text);
+                if !normalized.trim().is_empty() {
+                    return normalized;
+                }
+            }
+            _ => {}
+        }
+    }
+    String::new()
 }
 
 /// Scale unitless closure conviction from signal magnitude (0.1–1.0).
@@ -108,7 +169,7 @@ signal trend_gate(input closure raw, output closure gated) {
     #[test]
     fn legacy_script_passthrough() {
         let resolved = resolve_runtime_script_source("sma(input, 14)").expect("legacy");
-        assert_eq!(resolved.kind, OtlObjectKind::LegacyShader);
-        assert_eq!(resolved.runtime_script, "sma(input, 14)");
+        assert_eq!(resolved.kind, OtlObjectKind::Signal);
+        assert!(resolved.runtime_script.contains("gated = sma(input, 14)"));
     }
 }

@@ -1,6 +1,7 @@
 //! Unified OTL script resolution and normalization for canvas, USDA, and graph engine.
 
 use super::compiler::{CompileError, CompiledSeries};
+use crate::frontend::{format_program, signal_object_from_expression, OtlProgram};
 use crate::ta_uber_signal::{compose_uber_script_src, TaUberSignalConfig};
 
 /// Inputs required to resolve the canonical `inputs:script_src` string for an OTL node.
@@ -61,13 +62,13 @@ fn strip_ta_namespace_prefix(source: &str) -> String {
 pub fn wrap_series_script_as_signal_source(source: &str) -> String {
     let body = normalize_for_series_eval(source);
     if body.is_empty() {
-        "signal auto_pass(input closure raw, output closure gated) {\n    gated = raw;\n}\n"
-            .to_string()
-    } else {
-        format!(
-            "signal auto_series(input closure raw, output closure gated) {{\n    gated = {body};\n}}\n"
-        )
+        return format_program(&OtlProgram {
+            objects: vec![signal_object_from_expression("raw")],
+        });
     }
+    format_program(&OtlProgram {
+        objects: vec![signal_object_from_expression(&body)],
+    })
 }
 
 /// Parse and compile OTL using shared normalization (graph engine entry point).
@@ -215,7 +216,8 @@ mod tests {
         let CompiledSeries::Single(closure) = compiled else {
             panic!("expected single series");
         };
-        let out = closure(&data);
+        use crate::orchestration::compiler::eval_series_primary;
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out.len(), data.len());
         assert!(out[1].is_nan());
         assert_eq!(out[2], 2.0);
@@ -236,7 +238,8 @@ mod tests {
         let CompiledSeries::Single(closure) = compiled else {
             panic!("expected single series");
         };
-        let out = closure(&data);
+        use crate::orchestration::compiler::eval_series_primary;
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out[2], 2.0);
     }
 
@@ -248,8 +251,28 @@ mod tests {
         let CompiledSeries::Single(closure) = compiled else {
             panic!("expected single series");
         };
-        let out = closure(&data);
+        use crate::orchestration::compiler::eval_series_primary;
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out[2], 2.0);
+    }
+
+    #[test]
+    fn compile_unified_geometric_beta_multi() {
+        use crate::orchestration::{
+            compile_script_multi_with_context, normalize_script_for_compile, CompiledSeries,
+            ScriptCompileContext,
+        };
+        let script = "fn main(data, market) { return ga::geometric_beta(data, market, 5); }";
+        let ctx = ScriptCompileContext::from_script_source(script);
+        let stripped = normalize_script_for_compile(script);
+        let normalized = normalize_for_series_eval(&stripped);
+        assert_eq!(stripped, "ga::geometric_beta(data, market, 5)");
+        assert_eq!(normalized, "ga::geometric_beta(data, market, 5)");
+        let compiled = compile_script_multi_with_context(&normalized, &ctx).expect("compile");
+        let CompiledSeries::Multi(_, ports) = compiled else {
+            panic!("expected multi, got single");
+        };
+        assert_eq!(ports, vec!["outputs:scalar", "outputs:bivector"]);
     }
 
     #[test]

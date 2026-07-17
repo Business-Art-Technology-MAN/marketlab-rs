@@ -7,7 +7,7 @@ use pulsar_marketlab_core::StageGraphSnapshot;
 
 use crate::asset_data::{load_finance_asset_preview_for_node, FinanceAssetPreview};
 use crate::blueprint::{
-    finance_is_analytics_node, finance_primary_output_pin, FINANCE_STREAM_INPUT_PINS,
+    finance_is_analytics_node, finance_is_stream_input_pin, finance_primary_output_pin,
 };
 use crate::sweep::{FinancePortfolioSweepSummary, FinanceSweepResult};
 use crate::types::{type_id, FinanceNodeKind};
@@ -80,6 +80,8 @@ const ANALYTICS_OUTPUT_PRIORITY: &[&str] = &[
     "outputs:signal",
     "outputs:portfolio_wealth",
 ];
+
+const OTL_OUTPUT_PIN_PRIORITY: &[&str] = &["result", "signal"];
 
 pub fn build_finance_node_series_cache(
     ctx: &FinanceNodeSeriesBuildContext<'_>,
@@ -296,6 +298,24 @@ fn select_primary_series(bundle: &mut FinanceNodeSeriesBundle) {
         }
     }
 
+    if matches!(
+        bundle.node_kind,
+        FinanceNodeKind::OtlOperator | FinanceNodeKind::OtlTaUberSignal
+    ) {
+        for pin in OTL_OUTPUT_PIN_PRIORITY {
+            if let Some(series) = bundle.outputs.get(*pin) {
+                bundle.primary_output = Some((*pin).to_string());
+                bundle.primary_series = series.clone();
+                bundle.primary_kind = bundle
+                    .series_kinds
+                    .get(*pin)
+                    .copied()
+                    .unwrap_or_else(|| classify_series_kind(bundle.node_kind, pin, series));
+                return;
+            }
+        }
+    }
+
     for attribute in ANALYTICS_OUTPUT_PRIORITY {
         let pin = analytics_attribute_to_pin(attribute);
         if let Some(series) = bundle.outputs.get(&pin) {
@@ -457,7 +477,7 @@ fn primary_inbound_stream_connection(
     inbound.sort_by(|left, right| left.target_pin.cmp(&right.target_pin));
     inbound
         .into_iter()
-        .find(|connection| FINANCE_STREAM_INPUT_PINS.contains(&connection.target_pin.as_str()))
+        .find(|connection| finance_is_stream_input_pin(&connection.target_pin))
         .or_else(|| {
             graph
                 .connections

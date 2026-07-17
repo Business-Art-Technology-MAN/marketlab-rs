@@ -67,9 +67,6 @@ pub fn is_marketlab_finance_node(node_type: &str) -> bool {
     node_type.starts_with("marketlab.")
 }
 
-/// Strategy channel property ids (analytics nodes).
-pub const FINANCE_STRATEGY_CHANNELS: &[&str] = &["aggression", "decay", "elasticity"];
-
 /// True when editing this property requires a finance graph recompile to refresh results.
 pub fn finance_property_triggers_compile(definition_id: &str, property_id: &str) -> bool {
     if !is_marketlab_finance_node(definition_id) {
@@ -111,14 +108,6 @@ pub fn finance_property_triggers_compile(definition_id: &str, property_id: &str)
         );
     }
     false
-}
-
-/// Extra canvas body height (graph units) for inline strategy sliders.
-pub const FINANCE_STRATEGY_BLOCK_HEIGHT: f32 = 72.0;
-
-/// Analytics / OTL nodes expose unified strategy channels on the node face.
-pub fn finance_has_strategy_channels(definition_id: &str) -> bool {
-    finance_is_analytics_node(definition_id)
 }
 
 pub fn finance_is_analytics_node(definition_id: &str) -> bool {
@@ -165,11 +154,7 @@ pub fn finance_node_layout_extra_height(definition_id: &str) -> f32 {
     {
         return crate::sparkline_bitmap::FINANCE_NODE_SPARKLINE_BLOCK_HEIGHT;
     }
-    if finance_has_strategy_channels(definition_id) {
-        FINANCE_STRATEGY_BLOCK_HEIGHT
-    } else {
-        0.0
-    }
+    0.0
 }
 
 /// EventGraph node header label with finance-specific context (symbol, allocation, etc.).
@@ -215,27 +200,6 @@ pub fn finance_node_graph_title(
     }
 }
 
-pub fn finance_strategy_channel_fields() -> &'static [FinancePropertyField] {
-    use std::sync::OnceLock;
-    static FIELDS: OnceLock<Vec<FinancePropertyField>> = OnceLock::new();
-    FIELDS.get_or_init(|| {
-        FINANCE_STRATEGY_CHANNELS
-            .iter()
-            .map(|id| FinancePropertyField {
-                id: (*id).to_string(),
-                label: match *id {
-                    "aggression" => "Aggression",
-                    "decay" => "Decay",
-                    "elasticity" => "Elasticity",
-                    _ => id,
-                }
-                .to_string(),
-            })
-            .collect()
-    });
-    FIELDS.get().map(Vec::as_slice).unwrap_or(&[])
-}
-
 /// Whether two pin type names may connect in the finance graph.
 pub fn finance_data_types_compatible(a: &str, b: &str) -> bool {
     fn is_finance_stream(type_name: &str) -> bool {
@@ -247,20 +211,42 @@ pub fn finance_data_types_compatible(a: &str, b: &str) -> bool {
 /// Canonical finance stream input pins (`TA Trend` uses `source_stream`, OTL uses `underlying`).
 pub const FINANCE_STREAM_INPUT_PINS: &[&str] = &["source_stream", "underlying"];
 
+/// OTL / OSL script parameter names that carry a primary price or signal series.
+pub const FINANCE_STREAM_INPUT_ALIASES: &[&str] = &[
+    "source_stream",
+    "underlying",
+    "source",
+    "input",
+    "close",
+    "price",
+    "data",
+    "x",
+];
+
 /// Canonical finance stream output pins (assets emit `close`, analytics emit `result`).
-pub const FINANCE_STREAM_OUTPUT_PINS: &[&str] = &["close", "result", "wealth"];
+pub const FINANCE_STREAM_OUTPUT_PINS: &[&str] = &["close", "result", "wealth", "signal"];
+
+/// True when a pin id names a finance series input (including OTL script ports).
+pub fn finance_is_stream_input_pin(pin: &str) -> bool {
+    FINANCE_STREAM_INPUT_ALIASES.contains(&pin)
+}
+
+/// True when a pin id names a finance series output.
+pub fn finance_is_stream_output_pin(pin: &str) -> bool {
+    FINANCE_STREAM_OUTPUT_PINS.contains(&pin)
+}
 
 /// Map a requested finance stream pin to an available pin on the node (compile-time alias).
 pub fn finance_resolve_stream_pin(requested: &str, available: &[String]) -> Option<String> {
     if available.iter().any(|pin| pin == requested) {
         return Some(requested.to_string());
     }
-    let is_stream_alias = FINANCE_STREAM_INPUT_PINS.contains(&requested)
-        || FINANCE_STREAM_OUTPUT_PINS.contains(&requested);
+    let is_stream_alias = finance_is_stream_input_pin(requested)
+        || finance_is_stream_output_pin(requested);
     if !is_stream_alias {
         return None;
     }
-    for alias in FINANCE_STREAM_INPUT_PINS
+    for alias in FINANCE_STREAM_INPUT_ALIASES
         .iter()
         .chain(FINANCE_STREAM_OUTPUT_PINS.iter())
     {
@@ -269,6 +255,42 @@ pub fn finance_resolve_stream_pin(requested: &str, available: &[String]) -> Opti
         }
     }
     None
+}
+
+/// When OTL port sync renames inputs (`underlying` → `source`), preserve existing wires.
+pub fn finance_remap_stream_input_pin(old_pin: &str, new_pins: &[String]) -> Option<String> {
+    if new_pins.iter().any(|pin| pin == old_pin) {
+        return Some(old_pin.to_string());
+    }
+    if !finance_is_stream_input_pin(old_pin) {
+        return None;
+    }
+    if new_pins.len() == 1 {
+        return Some(new_pins[0].clone());
+    }
+    new_pins
+        .iter()
+        .find(|pin| finance_is_stream_input_pin(pin))
+        .cloned()
+        .or_else(|| new_pins.first().cloned())
+}
+
+/// When OTL port sync renames outputs (`result` → `signal`), preserve downstream wires.
+pub fn finance_remap_stream_output_pin(old_pin: &str, new_pins: &[String]) -> Option<String> {
+    if new_pins.iter().any(|pin| pin == old_pin) {
+        return Some(old_pin.to_string());
+    }
+    if !finance_is_stream_output_pin(old_pin) {
+        return None;
+    }
+    if new_pins.len() == 1 {
+        return Some(new_pins[0].clone());
+    }
+    new_pins
+        .iter()
+        .find(|pin| finance_is_stream_output_pin(pin))
+        .cloned()
+        .or_else(|| new_pins.first().cloned())
 }
 
 /// Inspector field descriptor for a finance node property.
@@ -378,6 +400,24 @@ mod tests {
             finance_resolve_stream_pin("source_stream", &otl_pins),
             Some("underlying".to_string())
         );
+
+        let otl_source = vec!["source".to_string()];
+        assert_eq!(
+            finance_resolve_stream_pin("underlying", &otl_source),
+            Some("source".to_string())
+        );
+    }
+
+    #[test]
+    fn finance_remap_stream_pins_preserves_wires_on_otl_signature_change() {
+        assert_eq!(
+            finance_remap_stream_input_pin("underlying", &["source".into()]),
+            Some("source".into())
+        );
+        assert_eq!(
+            finance_remap_stream_output_pin("result", &["signal".into()]),
+            Some("signal".into())
+        );
     }
 
     #[test]
@@ -386,14 +426,6 @@ mod tests {
             FINANCE_SIGNAL_TYPE,
             "MarketLabPriceSeries"
         ));
-    }
-
-    #[test]
-    fn analytics_nodes_include_strategy_channels() {
-        let fields = finance_property_fields(type_id::TA_TREND);
-        assert!(fields.iter().any(|field| field.id == "aggression"));
-        assert!(fields.iter().any(|field| field.id == "decay"));
-        assert!(fields.iter().any(|field| field.id == "elasticity"));
     }
 
     #[test]

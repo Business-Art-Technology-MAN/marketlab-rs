@@ -295,21 +295,21 @@ mod tests {
     }
 
     #[test]
-    fn strategy_channel_marks_schema_when_graph_differs() {
-        let graph = HashMap::from([("aggression".to_string(), "0.80".to_string())]);
+    fn graph_property_marks_schema_when_graph_differs() {
+        let graph = HashMap::from([("period".to_string(), "20".to_string())]);
         let rows = finance_property_layer_resolutions(
             type_id::TA_TREND,
             "ta1",
             &graph,
             &HashMap::new(),
         );
-        let aggression = rows
+        let period = rows
             .iter()
-            .find(|row| row.property_id == "aggression")
-            .expect("aggression row");
-        assert_eq!(aggression.active_layer, FinanceCompositionLayer::Signals);
-        assert!(aggression.has_layer_override);
-        assert!(aggression
+            .find(|row| row.property_id == "period")
+            .expect("period row");
+        assert_eq!(period.active_layer, FinanceCompositionLayer::Signals);
+        assert!(period.has_layer_override);
+        assert!(period
             .overridden_layers
             .iter()
             .any(|layer| layer.layer == FinanceCompositionLayer::Schema));

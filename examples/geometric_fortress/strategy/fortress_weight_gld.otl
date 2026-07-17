@@ -1,0 +1,19 @@
+// GLD leg weight — defense mode: max bivector among oriented havens.
+
+float wedge,
+float panic_thresh,
+float defense_thresh,
+float tlt_orient,
+float gld_orient,
+float tlt_bivector,
+float gld_bivector,
+output float gld_w
+{
+    gld_w = ga::month_end()
+        * step(defense_thresh - wedge, 1.0)
+        * step(wedge - panic_thresh, 1.0)
+        * (
+            gld_orient * step(0.0 - tlt_orient, 1.0)
+            + tlt_orient * gld_orient * step(tlt_bivector - gld_bivector, 1.0)
+        );
+}

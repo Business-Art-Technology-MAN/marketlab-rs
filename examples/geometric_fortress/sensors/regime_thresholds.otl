@@ -1,0 +1,11 @@
+// Adaptive panic / defense thresholds on wedge volume (252-day rolling quantiles).
+// Wire: primary ← upstream regime_wedge_volume node.
+// Python: roll_vol.quantile(0.15) and roll_vol.quantile(0.40)
+
+float wedge,
+output float panic_thresh,
+output float defense_thresh
+{
+    panic_thresh = ga::rolling_quantile(wedge, 252, 0.15);
+    defense_thresh = ga::rolling_quantile(wedge, 252, 0.40);
+}

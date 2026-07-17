@@ -1,0 +1,8 @@
+// Sensor 3 — Orientation: 200-day price displacement sign (counter-clockwise = uptrend).
+// Wire: primary ← asset adjusted close.
+
+float asset,
+output float oriented
+{
+    oriented = ga::orientation(asset, 200);
+}

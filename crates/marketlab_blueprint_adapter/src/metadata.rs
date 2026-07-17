@@ -12,29 +12,6 @@ use crate::portfolio_pins::portfolio_signal_pin_id;
 use crate::series_pins::{performance_series_pin_id, PERFORMANCE_BENCHMARK_PIN};
 use crate::types::{category, type_id, PORTFOLIO_ALLOCATION_TOKENS};
 
-/// Unified strategy channels rendered on analytics node faces (0..1).
-fn strategy_channel_schema() -> Vec<PropertySchema> {
-    vec![
-        PropertySchema::new(
-            "aggression",
-            "Aggression",
-            ReflectedType::parse_str("f64"),
-        )
-        .with_default(PropertyValue::Float(0.5))
-        .with_tooltip("Execution velocity and order-impact limits"),
-        PropertySchema::new("decay", "Decay", ReflectedType::parse_str("f64"))
-            .with_default(PropertyValue::Float(0.35))
-            .with_tooltip("Data attenuation and historical memory decay"),
-        PropertySchema::new(
-            "elasticity",
-            "Elasticity",
-            ReflectedType::parse_str("f64"),
-        )
-        .with_default(PropertyValue::Float(0.55))
-        .with_tooltip("Return-to-base pacing after volatility spikes"),
-    ]
-}
-
 fn signal_series_param(name: &str) -> ParamInfo {
     ParamInfo::new(name, FINANCE_SIGNAL_TYPE)
 }
@@ -91,25 +68,21 @@ fn otl_operator_metadata() -> NodeMetadata {
     )
     .with_params(vec![signal_series_param("underlying")])
     .with_return_type(TypeInfo::new(FINANCE_SIGNAL_TYPE))
-    .with_property_schema({
-        let mut schema = vec![
-            PropertySchema::new(
-                "script_src",
-                "OTL source",
-                ReflectedType::parse_str("String"),
-            )
-            .with_default(PropertyValue::String(
-                "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))".into(),
-            )),
-            PropertySchema::new(
-                "script_compiled_path",
-                "Compiled OTL path",
-                ReflectedType::parse_str("String"),
-            ),
-        ];
-        schema.extend(strategy_channel_schema());
-        schema
-    })
+    .with_property_schema(vec![
+        PropertySchema::new(
+            "script_src",
+            "OTL source",
+            ReflectedType::parse_str("String"),
+        )
+        .with_default(PropertyValue::String(
+            "ta::spread_sign(ta::sma(input, 10), ta::sma(input, 50))".into(),
+        )),
+        PropertySchema::new(
+            "script_compiled_path",
+            "Compiled OTL path",
+            ReflectedType::parse_str("String"),
+        ),
+    ])
     .with_doc("OTL Operator")
     .with_version(1)
 }
@@ -149,10 +122,7 @@ fn ta_uber_metadata(type_id: &'static str, archetype: TaArchetype) -> NodeMetada
                 ReflectedType::parse_str("f64"),
             )
             .with_default(PropertyValue::Float(252.0)),
-        ]
-        .into_iter()
-        .chain(strategy_channel_schema())
-        .collect())
+        ])
         .with_doc(archetype.display_name())
         .with_version(1)
 }

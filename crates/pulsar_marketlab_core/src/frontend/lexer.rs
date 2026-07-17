@@ -51,7 +51,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 ident.push(c);
                 while chars
                     .peek()
-                    .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+                    .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_' || *next == ':')
                 {
                     ident.push(chars.next().expect("peeked"));
                 }

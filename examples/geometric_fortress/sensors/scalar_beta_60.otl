@@ -1,0 +1,9 @@
+// Scalar (dot) beta — crowd / participation score vs SPY.
+// Python: calculate_geometric_beta(...)[0]
+
+float asset,
+float market,
+output float scalar
+{
+    scalar = ga::scalar_beta(asset, market, 60);
+}

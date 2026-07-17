@@ -33,15 +33,17 @@ mod usd_persistence;
 
 pub use blueprint::{
     finance_category_icon, finance_data_types_compatible, finance_display_label,
-    finance_has_strategy_channels, finance_is_analytics_node, finance_is_price_asset_node,
+    finance_is_analytics_node, finance_is_price_asset_node,
     finance_is_reporting_node,
     finance_node_header_rgba,
     finance_node_layout_extra_height, finance_node_graph_title, finance_primary_output_pin, finance_property_defaults,
     finance_property_fields, finance_property_is_numeric, finance_property_triggers_compile,
     finance_resolve_stream_pin,
-    finance_strategy_channel_fields,
+    finance_remap_stream_input_pin,
+    finance_remap_stream_output_pin,
+    finance_is_stream_input_pin,
+    finance_is_stream_output_pin,
     is_marketlab_finance_node, merge_finance_node_metadata, FinancePropertyField,
-    FINANCE_STRATEGY_BLOCK_HEIGHT, FINANCE_STRATEGY_CHANNELS,
     FINANCE_SIGNAL_TYPE,
 };
 
@@ -131,7 +133,8 @@ pub use sparkline_bitmap::{
 };
 pub use chart_model::{
     build_analytics_trading_chart, build_asset_ohlc_chart, build_isolated_series_chart,
-    build_performance_chart, build_portfolio_wealth_chart, build_sparkline_model,
+    build_performance_chart, build_portfolio_wealth_chart, build_otl_analytics_sparkline_model,
+    build_sparkline_model, ma_crossover_periods_from_script,
     build_wealth_trading_chart, ChartLayer, ChartPaneKind, ChartPaneSpec, FinanceChartModel,
     CHART_BACK_RGB, CHART_BULL_RGB, CHART_BEAR_RGB,
 };

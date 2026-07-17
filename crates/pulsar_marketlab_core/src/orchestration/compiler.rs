@@ -6,11 +6,20 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-/// Compiled OTL transform: maps an upstream price window to an output series.
-pub type SeriesClosure = Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>;
+use super::ga_bridge::{ga_compute_f64, ga_multi_outputs, is_ga_function};
+use super::series_eval::SeriesEvalContext;
+use vector_ga::{
+    bivector_beta_series, displacement_series, orientation_series, rolling_quantile_series,
+    scalar_beta_series,
+};
+
+type InnerSeriesFn = Arc<dyn Fn(&SeriesEvalContext<'_>) -> Vec<f64> + Send + Sync>;
+
+/// Compiled OTL transform: maps upstream series context to an output series.
+pub type SeriesClosure = Box<dyn Fn(&SeriesEvalContext<'_>) -> Vec<f64> + Send + Sync>;
 
 /// Multi-channel OTL transform (AOV ports); channel order matches archetype port order.
-pub type MultiSeriesClosure = Box<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync>;
+pub type MultiSeriesClosure = Box<dyn Fn(&SeriesEvalContext<'_>) -> Vec<Vec<f64>> + Send + Sync>;
 
 /// Compiled OTL transform: single series or fixed multi-AOV channels.
 pub enum CompiledSeries {
@@ -28,6 +37,7 @@ impl CompiledSeries {
 pub enum Expr {
     Literal(f64),
     Input,
+    NamedSeries(String),
     Binary(Box<Expr>, BinOp, Box<Expr>),
     Call { name: String, args: Vec<Expr> },
 }
@@ -293,7 +303,10 @@ impl Parser {
                         "input binding `{name}` is not callable"
                     )));
                 }
-                return Ok(Expr::Input);
+                if self.compile_ctx.is_primary_series(&key) {
+                    return Ok(Expr::Input);
+                }
+                return Ok(Expr::NamedSeries(key));
             }
             if let Some(&scalar) = self.compile_ctx.scalar_params.get(&key) {
                 if self.match_token(Token::LParen) {
@@ -423,7 +436,12 @@ pub fn parse_with_context(input: &str, ctx: &ScriptCompileContext) -> Result<Exp
 /// Compile a parsed AST into a vectorized runtime closure.
 pub fn compile(expr: &Expr) -> Result<SeriesClosure, CompileError> {
     let inner = compile_expr(expr)?;
-    Ok(Box::new(move |input| inner(Arc::new(input.to_vec()))))
+    Ok(Box::new(move |ctx| inner(ctx)))
+}
+
+/// Evaluate a series closure against a single primary input (TA / legacy path).
+pub fn eval_series_primary(closure: &SeriesClosure, primary: &[f64]) -> Vec<f64> {
+    closure(&SeriesEvalContext::primary_only(primary))
 }
 
 /// Shallow scan of OTL script source for dynamic canvas port synthesis.
@@ -456,6 +474,7 @@ pub struct OslParameter {
 pub struct ScriptCompileContext {
     pub series_inputs: HashSet<String>,
     pub scalar_params: HashMap<String, f64>,
+    pub primary_series: Option<String>,
 }
 
 impl ScriptCompileContext {
@@ -463,6 +482,17 @@ impl ScriptCompileContext {
         let mut ctx = Self::default();
         ctx.register_canonical_series_inputs();
         let stripped = strip_line_comments(source);
+        if let Ok(program) = crate::parse_object_program(stripped.trim()) {
+            if let Some(object) = program.primary_object() {
+                ctx.apply_object_ports(object);
+                let parameters = collect_osl_parameters(&stripped);
+                ctx.register_scalar_ports(object, &parameters);
+                if let Some(body) = extract_osl_shader_body(stripped.trim()) {
+                    ctx.apply_body_scalar_assignments(&body);
+                }
+                return ctx;
+            }
+        }
         let parameters = collect_osl_parameters(&stripped);
         if parameters.is_empty() {
             let legacy = parse_legacy_fn_main_signature(&stripped);
@@ -498,23 +528,73 @@ impl ScriptCompileContext {
         }
     }
 
+    fn apply_object_ports(&mut self, object: &crate::OtlObjectDeclaration) {
+        use crate::{OtlType, PortDirection};
+        let float_inputs: Vec<_> = object
+            .inputs
+            .iter()
+            .filter(|port| port.direction == PortDirection::Input && port.ty == OtlType::Float)
+            .collect();
+        if float_inputs.len() == 1 {
+            let name = float_inputs[0].name.to_ascii_lowercase();
+            self.series_inputs.insert(name.clone());
+            self.primary_series = Some(name);
+        } else {
+            for port in float_inputs {
+                self.series_inputs.insert(port.name.to_ascii_lowercase());
+            }
+        }
+    }
+
+    /// Register `int` / scalar uniforms from OSL defaults and canonical shader ports.
+    fn register_scalar_ports(
+        &mut self,
+        object: &crate::OtlObjectDeclaration,
+        parameters: &[OslParameter],
+    ) {
+        use crate::{OtlType, PortDirection};
+        for param in parameters.iter().filter(|param| !param.is_output) {
+            let key = param.name.to_ascii_lowercase();
+            if self.primary_series.as_deref() == Some(key.as_str()) {
+                continue;
+            }
+            match param.ty {
+                OslParamType::Int => {
+                    self.scalar_params
+                        .insert(key, param.default_value.unwrap_or(14.0));
+                }
+                OslParamType::Float => {
+                    self.scalar_params
+                        .insert(key, param.default_value.unwrap_or(0.0));
+                }
+                OslParamType::String => {}
+            }
+        }
+        for port in object.inputs.iter().filter(|port| {
+            port.direction == PortDirection::Input && matches!(port.ty, OtlType::Int)
+        }) {
+            let key = port.name.to_ascii_lowercase();
+            self.scalar_params.entry(key).or_insert(14.0);
+        }
+    }
+
     fn apply_osl_parameters(&mut self, parameters: &[OslParameter]) {
         let mut primary_series_registered = false;
         for param in parameters.iter().filter(|param| !param.is_output) {
             let key = param.name.to_ascii_lowercase();
             match param.ty {
                 OslParamType::Float if !primary_series_registered => {
-                    self.series_inputs.insert(key);
+                    self.series_inputs.insert(key.clone());
+                    self.primary_series = Some(key);
                     primary_series_registered = true;
                 }
-                OslParamType::Float | OslParamType::Int => {
-                    let fallback = match param.ty {
-                        OslParamType::Int => 14.0,
-                        OslParamType::Float => 1.0,
-                        OslParamType::String => continue,
-                    };
+                OslParamType::Float => {
                     self.scalar_params
-                        .insert(key, param.default_value.unwrap_or(fallback));
+                        .insert(key, param.default_value.unwrap_or(0.0));
+                }
+                OslParamType::Int => {
+                    self.scalar_params
+                        .insert(key, param.default_value.unwrap_or(14.0));
                 }
                 OslParamType::String => {}
             }
@@ -525,11 +605,19 @@ impl ScriptCompileContext {
         for (index, name) in inputs.iter().enumerate() {
             let key = name.to_ascii_lowercase();
             if index == 0 {
-                self.series_inputs.insert(key);
+                self.series_inputs.insert(key.clone());
+                self.primary_series = Some(key);
             } else {
-                self.scalar_params.entry(key).or_insert(14.0);
+                self.series_inputs.insert(key);
             }
         }
+    }
+
+    pub fn is_primary_series(&self, name: &str) -> bool {
+        self.primary_series
+            .as_deref()
+            .map(|primary| primary == name)
+            .unwrap_or_else(|| matches!(name, "data" | "input" | "close" | "price" | "x" | "source" | "source_stream"))
     }
 
     fn apply_body_scalar_assignments(&mut self, body: &str) {
@@ -598,9 +686,42 @@ pub fn parse_script_scalar_uniforms(source: &str) -> Vec<OslParameter> {
         .collect()
 }
 
+/// Series ports that require canvas wiring (excludes scalar uniforms like `period`).
+pub fn otl_wirable_series_inputs(signature: &ScriptSignature) -> Vec<String> {
+    if signature.parameters.is_empty() {
+        if signature.inputs.is_empty() {
+            return vec!["underlying".to_string()];
+        }
+        return signature.inputs.clone();
+    }
+
+    let mut primary_float_registered = false;
+    let mut wired = signature
+        .parameters
+        .iter()
+        .filter(|param| !param.is_output)
+        .filter(|param| match param.ty {
+            OslParamType::Float if !primary_float_registered => {
+                primary_float_registered = true;
+                true
+            }
+            OslParamType::Float | OslParamType::Int | OslParamType::String => false,
+        })
+        .map(|param| param.name.clone())
+        .collect::<Vec<_>>();
+    if wired.is_empty() {
+        if !signature.inputs.is_empty() {
+            wired = signature.inputs.clone();
+        } else {
+            wired = vec!["underlying".to_string()];
+        }
+    }
+    wired
+}
+
 /// Update or insert a default value for one scalar uniform in an OSL function signature.
 pub fn set_script_uniform_default(source: &str, param_name: &str, value: f64) -> String {
-    let Some((start, end)) = osl_function_parameter_list_span(source) else {
+    let Some((start, end)) = osl_parameter_list_span(source) else {
         return source.to_string();
     };
     let param_list = source[start..end].trim();
@@ -616,7 +737,7 @@ pub fn set_script_uniform_default(source: &str, param_name: &str, value: f64) ->
         if full.is_output || full.name.to_ascii_lowercase() != key {
             continue;
         }
-        *segment = format_osl_parameter_with_default(&full, value);
+        *segment = rewrite_osl_parameter_default(segment, &full, value);
         updated = true;
         break;
     }
@@ -627,6 +748,17 @@ pub fn set_script_uniform_default(source: &str, param_name: &str, value: f64) ->
     out.push_str(&source[..start]);
     out.push_str(&segments.join(", "));
     out.push_str(&source[end..]);
+    out
+}
+
+/// Copy scalar uniform default bindings from `donor` onto `target` by parameter name.
+pub fn merge_script_scalar_uniforms(donor: &str, target: &str) -> String {
+    let mut out = target.to_string();
+    for param in parse_script_scalar_uniforms(donor) {
+        if let Some(value) = param.default_value {
+            out = set_script_uniform_default(&out, &param.name, value);
+        }
+    }
     out
 }
 
@@ -644,6 +776,32 @@ fn extract_void_function_name(source: &str) -> Option<String> {
         return None;
     }
     Some(func_name.to_string())
+}
+
+fn osl_parameter_list_span(source: &str) -> Option<(usize, usize)> {
+    if let Some(list) = extract_shader_keyword_parameter_list(source) {
+        let start = source.find(list)?;
+        return Some((start, start + list.len()));
+    }
+    osl_function_parameter_list_span(source)
+}
+
+fn rewrite_osl_parameter_default(segment: &str, param: &OslParameter, value: f64) -> String {
+    let ty = match param.ty {
+        OslParamType::Float => "float",
+        OslParamType::Int => "int",
+        OslParamType::String => "string",
+    };
+    let default = format_scalar_default(param.ty, value);
+    let lowered = segment.trim().to_ascii_lowercase();
+    if param.is_output {
+        return format!("output {ty} {}", param.name);
+    }
+    if lowered.starts_with("input") {
+        format!("input {ty} {} = {default}", param.name)
+    } else {
+        format!("{ty} {} = {default}", param.name)
+    }
 }
 
 fn osl_function_parameter_list_span(source: &str) -> Option<(usize, usize)> {
@@ -667,20 +825,6 @@ fn osl_function_parameter_list_span(source: &str) -> Option<(usize, usize)> {
     let start = base + open_paren + 1;
     let end = base + open_paren + close_paren;
     Some((start, end))
-}
-
-fn format_osl_parameter_with_default(param: &OslParameter, value: f64) -> String {
-    let ty = match param.ty {
-        OslParamType::Float => "float",
-        OslParamType::Int => "int",
-        OslParamType::String => "string",
-    };
-    let default = format_scalar_default(param.ty, value);
-    if param.is_output {
-        format!("output {ty} {}", param.name)
-    } else {
-        format!("{ty} {} = {default}", param.name)
-    }
 }
 
 fn format_scalar_default(ty: OslParamType, value: f64) -> String {
@@ -726,17 +870,60 @@ fn collect_osl_parameters(source: &str) -> Vec<OslParameter> {
         .collect()
 }
 
-/// Parameter text for an OSL shader: inside `void name(...)` / `fn main(...)`, or a bare typed header.
+/// Parameter text for an OSL shader: inside `void name(...)` / `fn main(...)`, `shader name(...)`, or a bare typed header.
 fn extract_osl_parameter_list(source: &str) -> Option<&str> {
     if let Some(list) = extract_osl_function_parameter_list(source) {
         return Some(list);
     }
+    if let Some(list) = extract_shader_keyword_parameter_list(source) {
+        return Some(list);
+    }
     let open_brace = source.find('{')?;
     let header = source[..open_brace].trim();
+    if header.to_ascii_lowercase().starts_with("shader") {
+        return None;
+    }
     if looks_like_osl_header(header) {
         return Some(header);
     }
     None
+}
+
+/// `shader entry_name(float source, int period = 14, ...)`
+fn extract_shader_keyword_parameter_list(source: &str) -> Option<&str> {
+    let lower = source.to_ascii_lowercase();
+    let shader_idx = lower.find("shader")?;
+    let after_shader = &source[shader_idx + "shader".len()..];
+    let after_name = after_shader.trim_start();
+    let open_paren = after_name.find('(')?;
+    let name = after_name[..open_paren].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    let close_paren = balanced_delimiter_offset(&after_name[open_paren..], '(', ')')?;
+    Some(after_name[open_paren + 1..open_paren + close_paren].trim())
+}
+
+fn params_end_after_shader_function(source: &str) -> Option<usize> {
+    let lower = source.to_ascii_lowercase();
+    let shader_idx = lower.find("shader")?;
+    let after_shader = &source[shader_idx + "shader".len()..];
+    let leading_ws = after_shader.len() - after_shader.trim_start().len();
+    let after_name = after_shader.trim_start();
+    let open_paren = after_name.find('(')?;
+    let close_paren = balanced_delimiter_offset(&after_name[open_paren..], '(', ')')?;
+    Some(
+        shader_idx
+            + "shader".len()
+            + leading_ws
+            + open_paren
+            + close_paren
+            + 1,
+    )
 }
 
 /// Extract comma-separated OSL parameters from `void name(...)` or legacy `fn main(...)`.
@@ -822,6 +1009,8 @@ fn parse_osl_parameter_full(param: &str) -> Option<OslParameter> {
     let is_output = lower.starts_with("output");
     if is_output {
         segment = segment["output".len()..].trim();
+    } else if lower.starts_with("input") {
+        segment = segment["input".len()..].trim();
     }
 
     let tokens = segment.split_whitespace().collect::<Vec<_>>();
@@ -985,6 +1174,12 @@ fn balanced_delimiter_offset(input: &str, open: char, close: char) -> Option<usi
 pub fn normalize_script_for_compile(source: &str) -> String {
     let trimmed = strip_line_comments(source).trim().to_string();
 
+    if let Some(expr) = crate::frontend::series_expression_from_source(&trimmed) {
+        if !expr.is_empty() {
+            return expr;
+        }
+    }
+
     if is_osl_shader_source(&trimmed) {
         let signature = parse_osl_shader_signature(&trimmed).unwrap_or_default();
         if let Some(body) = extract_osl_shader_body(&trimmed) {
@@ -1009,6 +1204,9 @@ pub fn normalize_script_for_compile(source: &str) -> String {
 
 fn is_osl_shader_source(source: &str) -> bool {
     if extract_osl_function_parameter_list(source).is_some() {
+        return true;
+    }
+    if extract_shader_keyword_parameter_list(source).is_some() {
         return true;
     }
     let Some(open) = source.find('{') else {
@@ -1037,6 +1235,10 @@ fn locate_osl_body_open_brace(source: &str) -> Option<usize> {
     }
     if extract_void_function_parameter_list(source).is_some() {
         let params_end = params_end_after_void_function(source)?;
+        return source[params_end..].find('{').map(|offset| params_end + offset);
+    }
+    if extract_shader_keyword_parameter_list(source).is_some() {
+        let params_end = params_end_after_shader_function(source)?;
         return source[params_end..].find('{').map(|offset| params_end + offset);
     }
     source.find('{')
@@ -1295,8 +1497,15 @@ fn detect_multi_root(expr: &Expr) -> Option<(&str, &[Expr], &'static [&'static s
         "ta::stochastic" | "stochastic" if args.len() >= 3 => {
             Some((key, args.as_slice(), &["oscillator", "signal_line"]))
         }
+        _ if args.len() >= 2 => ga_multi_outputs(key).map(|channels| (key, args.as_slice(), channels)),
         _ => None,
     }
+}
+
+fn strip_otl_namespace_prefix(name: &str) -> &str {
+    name.strip_prefix("ta::")
+        .or_else(|| name.strip_prefix("ga::"))
+        .unwrap_or(name)
 }
 
 fn compile_multi_call(
@@ -1304,7 +1513,7 @@ fn compile_multi_call(
     args: &[Expr],
     _channels: &[&str],
 ) -> Result<MultiSeriesClosure, CompileError> {
-    let key = name.strip_prefix("ta::").unwrap_or(name);
+    let key = strip_otl_namespace_prefix(name);
     match key {
         "bollinger_bands" => {
             if args.len() != 3 {
@@ -1317,8 +1526,8 @@ fn compile_multi_call(
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
             let mult = literal_f64(&args[2], "multiplier")?;
-            Ok(Box::new(move |input| {
-                let data = series(Arc::new(input.to_vec()));
+            Ok(Box::new(move |ctx| {
+                let data = series(ctx);
                 let (upper, basis, lower) = bollinger_bands(&data, period, mult);
                 vec![upper, basis, lower]
             }))
@@ -1334,8 +1543,8 @@ fn compile_multi_call(
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
             let mult = literal_f64(&args[2], "multiplier")?;
-            Ok(Box::new(move |input| {
-                let data = series(Arc::new(input.to_vec()));
+            Ok(Box::new(move |ctx| {
+                let data = series(ctx);
                 let (upper, basis, lower) = keltner_channels(&data, period, mult);
                 vec![upper, basis, lower]
             }))
@@ -1350,8 +1559,8 @@ fn compile_multi_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Box::new(move |input| {
-                let data = series(Arc::new(input.to_vec()));
+            Ok(Box::new(move |ctx| {
+                let data = series(ctx);
                 let (upper, basis, lower) = donchian_channels(&data, period);
                 vec![upper, basis, lower]
             }))
@@ -1367,8 +1576,8 @@ fn compile_multi_call(
             let series = compile_expr(&args[0])?;
             let short = literal_usize(&args[1], "short period")?;
             let signal = literal_usize(&args[2], "signal period")?;
-            Ok(Box::new(move |input| {
-                let data = series(Arc::new(input.to_vec()));
+            Ok(Box::new(move |ctx| {
+                let data = series(ctx);
                 let (macd_line, _) = macd(&data, short, short.saturating_add(8));
                 let signal_line = ema(&macd_line, signal.max(1));
                 vec![macd_line, signal_line]
@@ -1385,10 +1594,30 @@ fn compile_multi_call(
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
             let signal = literal_usize(&args[2], "signal period")?;
-            Ok(Box::new(move |input| {
-                let data = series(Arc::new(input.to_vec()));
+            Ok(Box::new(move |ctx| {
+                let data = series(ctx);
                 let (osc, sig) = stochastic(&data, period, signal);
                 vec![osc, sig]
+            }))
+        }
+        "geometric_beta" => {
+            if args.len() != 3 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 3,
+                    got: args.len(),
+                });
+            }
+            let asset = compile_expr(&args[0])?;
+            let market = compile_expr(&args[1])?;
+            let period = literal_usize(&args[2], "period")?;
+            Ok(Box::new(move |ctx| {
+                let a = asset(ctx);
+                let m = market(ctx);
+                vec![
+                    scalar_beta_series(&a, &m, period),
+                    bivector_beta_series(&a, &m, period),
+                ]
             }))
         }
         other => Err(CompileError::UnknownFunction(other.to_string())),
@@ -1402,20 +1631,24 @@ fn literal_f64(expr: &Expr, label: &'static str) -> Result<f64, CompileError> {
     }
 }
 
-fn compile_expr(expr: &Expr) -> Result<Arc<dyn Fn(Arc<Vec<f64>>) -> Vec<f64> + Send + Sync>, CompileError> {
+fn compile_expr(expr: &Expr) -> Result<InnerSeriesFn, CompileError> {
     match expr {
         Expr::Literal(value) => {
             let scalar = *value;
-            Ok(Arc::new(move |input| vec![scalar; input.len()]))
+            Ok(Arc::new(move |ctx| vec![scalar; ctx.len().max(1)]))
         }
-        Expr::Input => Ok(Arc::new(|input| (*input).clone())),
+        Expr::Input => Ok(Arc::new(|ctx| ctx.primary.to_vec())),
+        Expr::NamedSeries(name) => {
+            let name = name.clone();
+            Ok(Arc::new(move |ctx| ctx.series_named(&name).to_vec()))
+        }
         Expr::Binary(left, op, right) => {
             let left = compile_expr(left)?;
             let right = compile_expr(right)?;
             let op = *op;
-            Ok(Arc::new(move |input| {
-                let lhs = left(input.clone());
-                let rhs = right(input);
+            Ok(Arc::new(move |ctx| {
+                let lhs = left(ctx);
+                let rhs = right(ctx);
                 zip_binary(&lhs, &rhs, op)
             }))
         }
@@ -1423,10 +1656,7 @@ fn compile_expr(expr: &Expr) -> Result<Arc<dyn Fn(Arc<Vec<f64>>) -> Vec<f64> + S
     }
 }
 
-fn compile_call(
-    name: &str,
-    args: &[Expr],
-) -> Result<Arc<dyn Fn(Arc<Vec<f64>>) -> Vec<f64> + Send + Sync>, CompileError> {
+fn compile_call(name: &str, args: &[Expr]) -> Result<InnerSeriesFn, CompileError> {
     match name {
         "sma" | "ta::sma" => {
             if args.len() != 2 {
@@ -1438,7 +1668,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| sma(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| sma(&series(ctx), period)))
         }
         "ema" | "ta::ema" | "ta_ema" => {
             if args.len() != 2 {
@@ -1450,7 +1680,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| ema(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| ema(&series(ctx), period)))
         }
         "rsi" | "ta::rsi" => {
             if args.len() != 2 {
@@ -1462,7 +1692,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| rsi(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| rsi(&series(ctx), period)))
         }
         "macd" | "ta::macd" => {
             if args.len() != 3 {
@@ -1475,8 +1705,8 @@ fn compile_call(
             let series = compile_expr(&args[0])?;
             let short = literal_usize(&args[1], "short period")?;
             let long = literal_usize(&args[2], "long period")?;
-            Ok(Arc::new(move |input| {
-                let (macd_line, _) = macd(&series(input.clone()), short, long);
+            Ok(Arc::new(move |ctx| {
+                let (macd_line, _) = macd(&series(ctx), short, long);
                 macd_line
             }))
         }
@@ -1490,7 +1720,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| wma(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| wma(&series(ctx), period)))
         }
         "stddev" | "ta::stddev" | "ta_stddev" => {
             if args.len() != 2 {
@@ -1502,7 +1732,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| rolling_stddev(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| rolling_stddev(&series(ctx), period)))
         }
         "variance" | "ta::variance" => {
             if args.len() != 2 {
@@ -1514,8 +1744,8 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| {
-                let sd = rolling_stddev(&series(input.clone()), period);
+            Ok(Arc::new(move |ctx| {
+                let sd = rolling_stddev(&series(ctx), period);
                 sd.iter().map(|v| v * v).collect()
             }))
         }
@@ -1529,7 +1759,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| atr(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| atr(&series(ctx), period)))
         }
         "ta::historical_volatility" | "historical_volatility" => {
             if args.len() != 3 {
@@ -1542,8 +1772,8 @@ fn compile_call(
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
             let annual = literal_f64(&args[2], "annualization")?;
-            Ok(Arc::new(move |input| {
-                historical_volatility(&series(input.clone()), period, annual)
+            Ok(Arc::new(move |ctx| {
+                historical_volatility(&series(ctx), period, annual)
             }))
         }
         "tema" | "ta::tema" => {
@@ -1556,7 +1786,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| tema(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| tema(&series(ctx), period)))
         }
         "hma" | "ta::hma" => {
             if args.len() != 2 {
@@ -1568,7 +1798,7 @@ fn compile_call(
             }
             let series = compile_expr(&args[0])?;
             let period = literal_usize(&args[1], "period")?;
-            Ok(Arc::new(move |input| hma(&series(input.clone()), period)))
+            Ok(Arc::new(move |ctx| hma(&series(ctx), period)))
         }
         "cross" | "ta::cross" => {
             if args.len() != 2 {
@@ -1580,9 +1810,9 @@ fn compile_call(
             }
             let left = compile_expr(&args[0])?;
             let right = compile_expr(&args[1])?;
-            Ok(Arc::new(move |input| {
-                let a = left(input.clone());
-                let b = right(input);
+            Ok(Arc::new(move |ctx| {
+                let a = left(ctx);
+                let b = right(ctx);
                 cross(&a, &b)
             }))
         }
@@ -1596,9 +1826,9 @@ fn compile_call(
             }
             let left = compile_expr(&args[0])?;
             let right = compile_expr(&args[1])?;
-            Ok(Arc::new(move |input| {
-                let a = left(input.clone());
-                let b = right(input);
+            Ok(Arc::new(move |ctx| {
+                let a = left(ctx);
+                let b = right(ctx);
                 spread_sign(&a, &b)
             }))
         }
@@ -1610,7 +1840,7 @@ fn compile_call(
                     got: args.len(),
                 });
             }
-            Ok(Arc::new(|input| (*input).clone()))
+            Ok(Arc::new(|ctx| ctx.primary.to_vec()))
         }
         "clamp" => {
             if args.len() != 3 {
@@ -1623,10 +1853,10 @@ fn compile_call(
             let series = compile_expr(&args[0])?;
             let min = compile_expr(&args[1])?;
             let max = compile_expr(&args[2])?;
-            Ok(Arc::new(move |input| {
-                let values = series(input.clone());
-                let mins = min(input.clone());
-                let maxs = max(input);
+            Ok(Arc::new(move |ctx| {
+                let values = series(ctx);
+                let mins = min(ctx);
+                let maxs = max(ctx);
                 values
                     .iter()
                     .zip(mins.iter())
@@ -1646,10 +1876,10 @@ fn compile_call(
             let a = compile_expr(&args[0])?;
             let b = compile_expr(&args[1])?;
             let t = compile_expr(&args[2])?;
-            Ok(Arc::new(move |input| {
-                let a_vals = a(input.clone());
-                let b_vals = b(input.clone());
-                let t_vals = t(input);
+            Ok(Arc::new(move |ctx| {
+                let a_vals = a(ctx);
+                let b_vals = b(ctx);
+                let t_vals = t(ctx);
                 a_vals
                     .iter()
                     .zip(b_vals.iter())
@@ -1668,9 +1898,9 @@ fn compile_call(
             }
             let edge = compile_expr(&args[0])?;
             let value = compile_expr(&args[1])?;
-            Ok(Arc::new(move |input| {
-                let edges = edge(input.clone());
-                let values = value(input);
+            Ok(Arc::new(move |ctx| {
+                let edges = edge(ctx);
+                let values = value(ctx);
                 edges
                     .iter()
                     .zip(values.iter())
@@ -1678,7 +1908,119 @@ fn compile_call(
                     .collect()
             }))
         }
+        name if is_ga_function(name) => compile_ga_call(name, args),
         other => Err(CompileError::UnknownFunction(other.to_string())),
+    }
+}
+
+fn compile_ga_call(name: &str, args: &[Expr]) -> Result<InnerSeriesFn, CompileError> {
+    let id = name.strip_prefix("ga::").unwrap_or(name);
+    match id {
+        "wedge_volume" => {
+            if args.len() != 1 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 1,
+                    got: args.len(),
+                });
+            }
+            let period = literal_usize(&args[0], "period")?;
+            Ok(Arc::new(move |ctx| ga_compute_f64("wedge_volume", ctx, period, None)))
+        }
+        "scalar_beta" => {
+            if args.len() != 3 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 3,
+                    got: args.len(),
+                });
+            }
+            let asset = compile_expr(&args[0])?;
+            let market = compile_expr(&args[1])?;
+            let period = literal_usize(&args[2], "period")?;
+            Ok(Arc::new(move |ctx| {
+                scalar_beta_series(&asset(ctx), &market(ctx), period)
+            }))
+        }
+        "bivector_beta" => {
+            if args.len() != 3 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 3,
+                    got: args.len(),
+                });
+            }
+            let asset = compile_expr(&args[0])?;
+            let market = compile_expr(&args[1])?;
+            let period = literal_usize(&args[2], "period")?;
+            Ok(Arc::new(move |ctx| {
+                bivector_beta_series(&asset(ctx), &market(ctx), period)
+            }))
+        }
+        "orientation" => {
+            if args.len() != 2 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 2,
+                    got: args.len(),
+                });
+            }
+            let series = compile_expr(&args[0])?;
+            let period = literal_usize(&args[1], "period")?;
+            Ok(Arc::new(move |ctx| {
+                orientation_series(&series(ctx), period)
+                    .into_iter()
+                    .map(|flag| if flag { 1.0 } else { 0.0 })
+                    .collect()
+            }))
+        }
+        "displacement" => {
+            if args.len() != 2 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 2,
+                    got: args.len(),
+                });
+            }
+            let series = compile_expr(&args[0])?;
+            let period = literal_usize(&args[1], "period")?;
+            Ok(Arc::new(move |ctx| displacement_series(&series(ctx), period)))
+        }
+        "rolling_quantile" => {
+            if args.len() != 3 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 3,
+                    got: args.len(),
+                });
+            }
+            let series = compile_expr(&args[0])?;
+            let period = literal_usize(&args[1], "period")?;
+            let q = literal_f64(&args[2], "quantile")?;
+            Ok(Arc::new(move |ctx| rolling_quantile_series(&series(ctx), period, q)))
+        }
+        "nnls_weights" => {
+            if args.len() != 1 {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 1,
+                    got: args.len(),
+                });
+            }
+            let period = literal_usize(&args[0], "period")?;
+            Ok(Arc::new(move |ctx| ga_compute_f64("nnls_weights", ctx, period, None)))
+        }
+        "month_end" => {
+            if !args.is_empty() {
+                return Err(CompileError::InvalidArgumentCount {
+                    name: name.to_string(),
+                    expected: 0,
+                    got: args.len(),
+                });
+            }
+            Ok(Arc::new(|ctx| ga_compute_f64("month_end", ctx, 1, None)))
+        }
+        other => Err(CompileError::UnknownFunction(format!("ga::{other}"))),
     }
 }
 
@@ -2037,13 +2379,13 @@ mod tests {
     fn compiled_sma_closure_is_causal_under_future_price_perturbation() {
         let data: Vec<f64> = (0..20).map(|bar| (bar as f64) + 1.0).collect();
         let closure = compile_script("sma(data, 5)").expect("compile sma");
-        let baseline = closure(&data);
+        let baseline = eval_series_primary(&closure, &data);
         for bar in 4..data.len() {
             let mut poisoned = data.clone();
             for value in poisoned.iter_mut().skip(bar + 1) {
                 *value = 999.0;
             }
-            let perturbed = closure(&poisoned);
+            let perturbed = eval_series_primary(&closure, &poisoned);
             assert_eq!(
                 baseline[bar], perturbed[bar],
                 "compiled sma at bar {bar} must not read future samples"
@@ -2080,7 +2422,7 @@ mod tests {
         let data: Vec<f64> = (0..30).map(|bar| bar as f64).collect();
         let closure =
             compile_script("spread_sign(sma(data, 5), sma(data, 10))").expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert!(out.iter().skip(10).any(|value| *value == 1.0));
     }
 
@@ -2088,7 +2430,7 @@ mod tests {
     fn compile_script_runs_sma_pipeline() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let closure = compile_script("sma(data, 3)").expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out.len(), data.len());
         assert!(out[1].is_nan());
         assert_eq!(out[2], 2.0);
@@ -2098,8 +2440,39 @@ mod tests {
     fn compile_script_supports_cross_of_averages() {
         let data = (0..40).map(|v| v as f64).collect::<Vec<_>>();
         let closure = compile_script("cross(sma(data, 5), sma(data, 10))").expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out.len(), data.len());
+    }
+
+    #[test]
+    fn otl_wirable_series_inputs_reads_canonical_shader_ports() {
+        let script = r#"shader ma_crossover(
+    input float source,
+    input int fast,
+    input int slow,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        let signature = parse_script_signature(script);
+        assert_eq!(otl_wirable_series_inputs(&signature), vec!["source".to_string()]);
+        assert_eq!(signature.outputs, vec!["signal".to_string()]);
+    }
+
+    #[test]
+    fn otl_wirable_series_inputs_skip_scalar_uniforms() {
+        let script = r#"
+            float source,
+            int period = 14,
+            output float signal
+        {
+            signal = sma(source, period);
+        }"#;
+        let signature = parse_script_signature(script);
+        assert_eq!(otl_wirable_series_inputs(&signature), vec!["source".to_string()]);
+        let uniforms = parse_script_scalar_uniforms(script);
+        assert_eq!(uniforms.len(), 1);
+        assert_eq!(uniforms[0].name, "period");
     }
 
     #[test]
@@ -2159,6 +2532,19 @@ mod tests {
     }
 
     #[test]
+    fn normalize_script_for_compile_extracts_shader_object_expression() {
+        let script = r#"shader regime_wedge_volume(
+    input float placeholder,
+    output float volume
+) {
+    volume = ga::wedge_volume(60);
+}"#;
+        let normalized = normalize_script_for_compile(script);
+        assert_eq!(normalized, "ga::wedge_volume(60)");
+        let _ = compile_script(script).expect("shader declaration compiles");
+    }
+
+    #[test]
     fn normalize_script_for_compile_extracts_osl_output_assignment() {
         let script = r#"
             float source,
@@ -2174,6 +2560,35 @@ mod tests {
     }
 
     #[test]
+    fn compile_shader_input_int_ports_default_to_positive_period() {
+        let script = r#"shader ma_crossover(
+    input float source,
+    input int fast,
+    input int slow,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        compile_script(script).expect("canonical int ports must not compile with period 0");
+    }
+
+    #[test]
+    fn compile_shader_keyword_with_osl_scalar_defaults() {
+        let script = r#"shader ma_crossover(
+    float source,
+    int fast = 10,
+    int slow = 50,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        let closure = compile_script(script).expect("shader ma_crossover must compile");
+        let data: Vec<f64> = (0..60).map(|bar| 100.0 + bar as f64).collect();
+        let out = eval_series_primary(&closure, &data);
+        assert_eq!(out.len(), data.len());
+    }
+
+    #[test]
     fn compile_script_compiles_osl_shader_with_scalar_parameters() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
         let script = r#"
@@ -2185,7 +2600,7 @@ mod tests {
             signal = sma(source, lookback);
         }"#;
         let closure = compile_script(script).expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out.len(), data.len());
         assert!(out[13].is_finite(), "SMA with signature scalar must compile");
     }
@@ -2210,7 +2625,7 @@ void main(
         assert_eq!(args[1], Expr::Literal(14.0));
         let closure = compile_script(script).expect("compile");
         let data = (0..32).map(|v| v as f64 + 100.0).collect::<Vec<_>>();
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert!(out.iter().any(|value| value.is_finite()));
     }
 
@@ -2225,7 +2640,7 @@ void main(
             signal = sma(source, 3);
         }"#;
         let closure = compile_script(script).expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out[2], 2.0);
     }
 
@@ -2256,7 +2671,7 @@ void main(
     fn compile_script_compiles_fn_main_body() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let closure = compile_script("fn main(data) { return sma(data, 3); }").expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out.len(), data.len());
         assert_eq!(out[2], 2.0);
     }
@@ -2363,6 +2778,39 @@ void adaptive_trigger(
     }
 
     #[test]
+    fn merge_script_scalar_uniforms_copies_bindings_by_name() {
+        let donor = r#"shader ma_crossover(
+    input float source,
+    input int fast = 10,
+    input int slow = 50,
+    output float signal
+) { signal = 0.0; }"#;
+        let target = r#"shader ma_crossover(
+    input float source,
+    input int fast,
+    input int slow,
+    output float signal
+) { signal = 0.0; }"#;
+        let merged = merge_script_scalar_uniforms(donor, target);
+        assert!(merged.contains("input int fast = 10"));
+        assert!(merged.contains("input int slow = 50"));
+    }
+
+    #[test]
+    fn set_script_uniform_default_updates_canonical_shader_binding() {
+        let script = r#"shader ma_crossover(
+    input float source,
+    input int fast,
+    input int slow,
+    output float signal
+) {
+    signal = 0.0;
+}"#;
+        let updated = set_script_uniform_default(script, "fast", 10.0);
+        assert!(updated.contains("input int fast = 10"), "{updated}");
+    }
+
+    #[test]
     fn set_script_uniform_default_updates_signature_binding() {
         let script = r#"
 void adaptive_trigger(
@@ -2416,7 +2864,7 @@ void adaptive_trigger(
             "fn main(source, lookback) { lookback = 3; return sma(source, 3); }",
         )
         .expect("compile");
-        let out = closure(&data);
+        let out = eval_series_primary(&closure, &data);
         assert_eq!(out[2], 2.0);
     }
 }

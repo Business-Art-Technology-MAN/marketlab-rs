@@ -52,6 +52,24 @@ pub const OTL_STDLIB_PRESETS: &[OtlStdlibPreset] = &[
         display_name: "OTL Formula",
         default_script: "input",
     },
+    OtlStdlibPreset {
+        id: "ga_orientation",
+        menu_label: "GA Orientation",
+        display_name: "GA Orientation",
+        default_script: "ga::orientation(input, 200)",
+    },
+    OtlStdlibPreset {
+        id: "ga_bivector_beta",
+        menu_label: "GA Bivector Beta",
+        display_name: "GA Bivector Beta",
+        default_script: r#"float asset, float market, output float bivector { bivector = ga::bivector_beta(asset, market, 60); }"#,
+    },
+    OtlStdlibPreset {
+        id: "ga_wedge_volume",
+        menu_label: "GA Wedge Volume",
+        display_name: "GA Wedge Volume",
+        default_script: "ga::wedge_volume(60)",
+    },
 ];
 
 impl OtlStdlibPreset {

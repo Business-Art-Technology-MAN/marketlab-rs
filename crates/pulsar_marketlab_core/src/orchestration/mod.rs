@@ -3,8 +3,10 @@
 mod binary;
 mod compiler;
 mod engine;
+mod ga_bridge;
 mod portfolio;
 mod script_resolve;
+mod series_eval;
 
 pub use binary::{
     deserialize_from_bytes, load_compiled_asset_from_path, manifest_json_from_signature,
@@ -13,9 +15,10 @@ pub use binary::{
 };
 pub use compiler::{
     compile, compile_script, compile_script_multi, compile_script_multi_with_context, cross,
-    display_name_for_script, ema, macd, normalize_script_for_compile, parse,
+    display_name_for_script, ema, eval_series_primary, macd, normalize_script_for_compile, parse,
     parse_script_entry_point_name, parse_script_scalar_uniforms, parse_script_signature,
-    parse_with_context, rsi, set_script_uniform_default, sma, spread_sign, tokenize, BinOp, CompileError,
+    otl_wirable_series_inputs, parse_with_context, rsi, set_script_uniform_default,
+    merge_script_scalar_uniforms, sma, spread_sign, tokenize, BinOp, CompileError,
     CompiledSeries, Expr, MultiSeriesClosure, OslParamType, OslParameter, ScriptCompileContext,
     ScriptSignature, SeriesClosure, Token,
 };
@@ -29,6 +32,7 @@ pub use engine::{
     PathBindingIndex, SignalTransformFn, StageGraphPrim, StageGraphSnapshot, StageSweepProfile,
     TimelineExecutionResult,
 };
+pub use series_eval::{SeriesEvalBuffer, SeriesEvalContext};
 pub use portfolio::{
     compute_allocation_weights, AssetQuote, ClosureLegKind,
     DirectionalDistribution, PortfolioIntegrationResult, PortfolioTrackingFrame, SymbolicOtlClosure,

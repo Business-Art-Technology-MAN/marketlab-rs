@@ -1,0 +1,6 @@
+shader sma_smoke(
+    input float source,
+    output float signal
+) {
+    signal = ta::sma(source, 3);
+}

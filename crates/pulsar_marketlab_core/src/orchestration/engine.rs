@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
+use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use thiserror::Error;
 
@@ -15,9 +16,11 @@ use super::portfolio::{
     PortfolioIntegratorConfig, PortfolioIntegrationResult, PortfolioOtlTransformFn,
     PortfolioTrackingFrame, SymbolicOtlClosure,
 };
+use super::compiler::parse_script_signature;
 use crate::compiler::{CompiledProgramTier, ObjectCodegenRegistry};
 use crate::engine::{PrecomputedMatrixCache, DEFAULT_COVARIANCE_LOOKBACK};
 use crate::compile_object_tier;
+use crate::ScriptCompileContext;
 use crate::engine::{
     compute_execution_levels, is_parallel_tier_signal, merge_parallel_signal_outcomes,
     run_parallel_signal_batch, evaluate_compiled_tier, MarketTimelineWindow, ParallelSignalJob,
@@ -25,8 +28,8 @@ use crate::engine::{
 };
 use crate::execution_matrix::{ExecutionContext, GraphSeriesMatrix, RuntimeEngineError};
 use crate::frontend::{
-    apply_alpha_conviction, compile_object_program as parse_otl_object_program,
-    conviction_scale_from_signal_series, resolve_runtime_script_source,
+    apply_alpha_conviction, canonicalize_otl_source, compile_object_program as parse_otl_object_program,
+    conviction_scale_from_signal_series, resolve_runtime_script_source, shader_uses_osl_parameter_syntax,
 };
 use crate::{OtlObjectKind, OtlProgram};
 
@@ -204,6 +207,8 @@ struct TimelineSweepScratch {
 pub struct MarketLabGraphEngine {
     graph: StableGraph<ExecutionNode, ()>,
     prim_to_index: HashMap<String, NodeIndex>,
+    /// Edge relationship labels (`inputs:underlying`, `inputs:constituents`, …).
+    wire_relationships: HashMap<(NodeIndex, NodeIndex), Arc<str>>,
     /// Dense `NodeIndex` → absolute prim path (built at compile time).
     node_prim_paths: Vec<Arc<str>>,
     execution_order: Vec<NodeIndex>,
@@ -219,6 +224,7 @@ impl MarketLabGraphEngine {
         Self {
             graph: StableGraph::new(),
             prim_to_index: HashMap::new(),
+            wire_relationships: HashMap::new(),
             node_prim_paths: Vec::new(),
             execution_order: Vec::new(),
             execution_levels: Vec::new(),
@@ -260,7 +266,11 @@ impl MarketLabGraphEngine {
         }
 
         for wire in spec.wires {
-            engine.connect(&wire.source_prim_path, &wire.target_prim_path)?;
+            engine.connect_with_relationship(
+                &wire.source_prim_path,
+                &wire.target_prim_path,
+                &wire.relationship,
+            )?;
         }
 
         engine.execution_order =
@@ -288,8 +298,25 @@ fn build_node_prim_paths(
 }
 
 fn resolve_prim_otl_expression(prim: &StageGraphPrim) -> String {
-    if let Some(path) = prim
-        .attributes
+    resolve_otl_script_from_attributes(&prim.attributes)
+}
+
+/// Resolve the OTL source string for stage-graph execution.
+///
+/// Live `inputs:script_src` always wins when present so graph compiles pick up
+/// editor/Details edits. The OTC cache at `inputs:script_compiled_path` is only
+/// used when `script_src` is empty (legacy USDA / headless loads).
+pub(crate) fn resolve_otl_script_from_attributes(
+    attributes: &std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(script) = attributes
+        .get("inputs:script_src")
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+    {
+        return script.to_string();
+    }
+    if let Some(path) = attributes
         .get("inputs:script_compiled_path")
         .map(|path| path.as_str().trim())
         .filter(|path| !path.is_empty())
@@ -300,10 +327,7 @@ fn resolve_prim_otl_expression(prim: &StageGraphPrim) -> String {
             }
         }
     }
-    prim.attributes
-        .get("inputs:script_src")
-        .cloned()
-        .unwrap_or_default()
+    String::new()
 }
 
 impl MarketLabGraphEngine {
@@ -395,7 +419,14 @@ impl MarketLabGraphEngine {
                         }
                     })?;
 
-                    let object_source = if is_three_tier_kind(resolved.kind) {
+                    let object_source = if shader_uses_osl_parameter_syntax(source) {
+                        canonicalize_otl_source(source).map_err(|err| {
+                            GraphEngineError::ScriptCompileError {
+                                path: prim_path.clone(),
+                                message: err.to_string(),
+                            }
+                        })?
+                    } else if is_three_tier_kind(resolved.kind) {
                         source.to_string()
                     } else {
                         super::script_resolve::wrap_series_script_as_signal_source(
@@ -462,6 +493,15 @@ impl MarketLabGraphEngine {
         source_prim_path: &str,
         target_prim_path: &str,
     ) -> Result<(), GraphEngineError> {
+        self.connect_with_relationship(source_prim_path, target_prim_path, "inputs:underlying")
+    }
+
+    pub fn connect_with_relationship(
+        &mut self,
+        source_prim_path: &str,
+        target_prim_path: &str,
+        relationship: &str,
+    ) -> Result<(), GraphEngineError> {
         let source = *self
             .prim_to_index
             .get(source_prim_path)
@@ -470,8 +510,17 @@ impl MarketLabGraphEngine {
             .prim_to_index
             .get(target_prim_path)
             .ok_or_else(|| GraphEngineError::UnknownPrimPath(target_prim_path.to_string()))?;
+        self.wire_relationships
+            .insert((source, target), Arc::from(relationship));
         self.graph.add_edge(source, target, ());
         Ok(())
+    }
+
+    fn wire_relationship(&self, source: NodeIndex, target: NodeIndex) -> &str {
+        self.wire_relationships
+            .get(&(source, target))
+            .map(|rel| rel.as_ref())
+            .unwrap_or("inputs:underlying")
     }
 
     pub fn set_signal_compiled_fn(
@@ -766,8 +815,64 @@ impl MarketLabGraphEngine {
         }
 
         if jobs.len() < 2 {
-            for job in jobs {
-                tier_workspace.release_reserved_column(job.column);
+            if jobs.len() == 1 {
+                let job = &jobs[0];
+                if !should_execute_on_level(self, job.node_index, indices, profile) {
+                    tier_workspace.release_reserved_column(job.column);
+                    return completed;
+                }
+                populate_signal_exec_inputs(
+                    self,
+                    job.node_index,
+                    &job.expression,
+                    timeline_len,
+                    &self.sweep_scratch.node_outputs,
+                    &mut tier_workspace.exec_ctx,
+                );
+                let scalar = self
+                    .tier_sweep_cache
+                    .get_mut(&job.node_index)
+                    .ok_or_else(|| GraphEngineError::ScriptCompileError {
+                        path: job.prim_path.clone(),
+                        message:
+                            "missing cached signal tier; call compile_otl_scripts()".to_string(),
+                    })
+                    .and_then(|tier| {
+                        tier_workspace.run_signal_node(&job.prim_path, job.node_index, tier)
+                    });
+                match scalar {
+                    Ok(scalar) => {
+                        tier_workspace.commit_signal_column(job.node_index, job.column);
+                        let attribute = signal_stream_attribute(&job.expression);
+                        push_scalar_stream(
+                            &mut self.sweep_scratch.streams,
+                            &job.prim_path,
+                            &attribute,
+                            &scalar,
+                        );
+                        let asset_symbol = infer_upstream_asset_symbol(
+                            &self.graph,
+                            job.node_index,
+                            &self.sweep_scratch.node_outputs,
+                        );
+                        self.sweep_scratch.node_outputs.insert(
+                            job.node_index,
+                            NodeRuntimeOutput {
+                                scalar: pad_or_trim(scalar, timeline_len),
+                                asset_symbol,
+                            },
+                        );
+                        completed.insert(job.node_index);
+                    }
+                    Err(_) => {
+                        tier_workspace.rollback_signal_attempt();
+                        tier_workspace.release_reserved_column(job.column);
+                    }
+                }
+            } else {
+                for job in jobs {
+                    tier_workspace.release_reserved_column(job.column);
+                }
             }
             return completed;
         }
@@ -991,13 +1096,14 @@ impl MarketLabGraphEngine {
                     tier_kind,
                     tier_program: _,
                 }) => {
-                    gather_upstream_into(
-                        &mut self.sweep_scratch.upstream_scratch,
-                        &self.graph,
+                    populate_signal_exec_inputs(
+                        self,
                         index,
+                        expression,
+                        timeline_len,
                         &self.sweep_scratch.node_outputs,
+                        &mut tier_workspace.exec_ctx,
                     );
-                    let upstream = self.sweep_scratch.upstream_scratch.as_slice();
 
                     let scalar = if matches!(tier_kind, Some(OtlObjectKind::Signal)) {
                         self.tier_sweep_cache
@@ -1009,16 +1115,11 @@ impl MarketLabGraphEngine {
                                         .to_string(),
                             })
                             .and_then(|tier| {
-                                tier_workspace.run_signal_node(
-                                    prim_path,
-                                    index,
-                                    tier,
-                                    pad_or_trim_slice(upstream, timeline_len),
-                                )
+                                tier_workspace.run_signal_node(prim_path, index, tier)
                             })
                             .unwrap_or_else(|_| {
                                 tier_workspace.rollback_signal_attempt();
-                                pad_or_trim_slice(upstream, timeline_len).to_vec()
+                                tier_workspace.exec_ctx.signal_upstream.clone()
                             })
                     } else {
                         vec![0.0; timeline_len]
@@ -1476,7 +1577,6 @@ impl TimelineTierWorkspace {
         prim_path: &str,
         node_index: NodeIndex,
         tier: &mut CompiledProgramTier,
-        upstream: Vec<f64>,
     ) -> Result<Vec<f64>, GraphEngineError> {
         let column = self.reserve_signal_column();
         if column >= self.matrix.signal_column_count() {
@@ -1485,7 +1585,6 @@ impl TimelineTierWorkspace {
                 RuntimeEngineError::MissingSignalColumn { column_index: column },
             ));
         }
-        self.exec_ctx.signal_upstream = upstream;
         self.exec_ctx.signal_output_column = column;
 
         if let Err(err) = evaluate_compiled_tier(&mut self.exec_ctx, tier, &mut self.matrix) {
@@ -1614,11 +1713,13 @@ fn build_tier_compile_registry(
     asset_quotes: &HashMap<String, AssetQuote>,
     portfolio_prim_path: &str,
     index_to_path: &HashMap<NodeIndex, String>,
+    script_source: &str,
 ) -> ObjectCodegenRegistry {
     let mut registry = ObjectCodegenRegistry {
         allocation_method: allocation_method.to_string(),
         initial_capital,
         asset_quotes: asset_quotes.clone(),
+        scalar_params: ScriptCompileContext::from_script_source(script_source).scalar_params,
         ..ObjectCodegenRegistry::default()
     };
     registry.portfolio_prim_path = Some(Arc::from(portfolio_prim_path));
@@ -1679,6 +1780,11 @@ impl MarketLabGraphEngine {
                 .get(&index)
                 .cloned()
                 .unwrap_or_else(|| format!("node_{index:?}"));
+            let script_source = match node {
+                ExecutionNode::SignalTransform { expression, .. } => expression.clone(),
+                ExecutionNode::PortfolioSink { otl_script, .. } => otl_script.clone(),
+                _ => String::new(),
+            };
 
             let registry = build_tier_compile_registry(
                 &self.graph,
@@ -1689,6 +1795,7 @@ impl MarketLabGraphEngine {
                 &HashMap::new(),
                 &prim_path,
                 &index_to_path,
+                &script_source,
             );
             let tier = compile_object_tier(&program, &registry).map_err(|err| {
                 GraphEngineError::ScriptCompileError {
@@ -1761,7 +1868,7 @@ fn pad_or_trim_slice(upstream: &[f64], timeline_len: usize) -> Vec<f64> {
 
 fn passthrough_signal(upstream: &[f64], timeline_len: usize, expression: &str) -> Vec<f64> {
     if let Ok(closure) = super::compiler::compile_script(expression.trim()) {
-        return pad_or_trim(closure(upstream), timeline_len);
+        return pad_or_trim(super::compiler::eval_series_primary(&closure, upstream), timeline_len);
     }
     if upstream.len() >= timeline_len {
         return upstream.iter().copied().take(timeline_len).collect();
@@ -1959,6 +2066,56 @@ fn trade_gate_series_from_ta_upstream(
     }
 
     indicator_series.to_vec()
+}
+
+fn populate_signal_exec_inputs(
+    engine: &MarketLabGraphEngine,
+    target: NodeIndex,
+    script_source: &str,
+    timeline_len: usize,
+    node_outputs: &HashMap<NodeIndex, NodeRuntimeOutput>,
+    exec_ctx: &mut ExecutionContext,
+) {
+    exec_ctx.signal_named_upstream.clear();
+    exec_ctx.signal_constituent_series.clear();
+    exec_ctx.signal_upstream.clear();
+
+    let signature = parse_script_signature(script_source);
+    let secondary_names: Vec<String> = signature.inputs.iter().skip(1).cloned().collect();
+
+    let mut primary: Option<Vec<f64>> = None;
+    let mut extra_underlying = Vec::new();
+    let mut sources = Vec::new();
+    let mut constituents = Vec::new();
+
+    for edge in engine.graph.edges_directed(target, Direction::Incoming) {
+        let source = edge.source();
+        let relationship = engine.wire_relationship(source, target);
+        let Some(output) = node_outputs.get(&source) else {
+            continue;
+        };
+        let series = pad_or_trim_slice(output.scalar.as_slice(), timeline_len).to_vec();
+        match relationship {
+            "inputs:constituents" => constituents.push(series),
+            "inputs:sources" => sources.push(series),
+            _ => {
+                if primary.is_none() {
+                    primary = Some(series);
+                } else {
+                    extra_underlying.push(series);
+                }
+            }
+        }
+    }
+
+    exec_ctx.signal_upstream = primary.unwrap_or_else(|| vec![0.0; timeline_len]);
+    exec_ctx.signal_constituent_series = constituents;
+
+    let mut named_sources = sources;
+    named_sources.extend(extra_underlying);
+    for (name, series) in secondary_names.into_iter().zip(named_sources) {
+        exec_ctx.signal_named_upstream.insert(name, series);
+    }
 }
 
 fn gather_upstream_into(
@@ -2343,6 +2500,26 @@ mod tests {
             .expect("signal stream");
         assert_eq!(signal.values.len(), 5);
         assert!(signal.values.iter().any(|value| value.is_finite() && *value > 0.0));
+    }
+
+    #[test]
+    fn resolve_otl_script_prefers_live_script_src_over_compiled_path() {
+        use super::resolve_otl_script_from_attributes;
+
+        let attrs = HashMap::from([
+            (
+                "inputs:script_src".to_string(),
+                "sma(data, 10)".to_string(),
+            ),
+            (
+                "inputs:script_compiled_path".to_string(),
+                "/tmp/stale.otc".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_otl_script_from_attributes(&attrs),
+            "sma(data, 10)"
+        );
     }
 
     #[test]

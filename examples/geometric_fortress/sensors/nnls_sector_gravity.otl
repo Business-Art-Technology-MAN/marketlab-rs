@@ -1,0 +1,8 @@
+// Optional — NNLS implied sector weights (article helper; not used in Pure Fortress tree).
+// Wire: market ← SPY; inputs:constituents ← 9 sector streams.
+
+float market,
+output float weight_0
+{
+    weight_0 = ga::nnls_weights(60);
+}

@@ -47,11 +47,13 @@ pub enum PortDirection {
     Output,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PropertyDeclaration {
     pub direction: PortDirection,
     pub ty: OtlType,
     pub name: String,
+    /// Scalar default for `input int` / `input float` ports (`fast = 10`).
+    pub default_value: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -12,6 +12,8 @@ arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 nalgebra = { workspace = true }
 csv = { workspace = true }
+vector-ga = { workspace = true }
+vector-ta = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

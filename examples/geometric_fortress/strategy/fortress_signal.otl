@@ -1,0 +1,11 @@
+// Simplified offense sensor: SPY when regime volume healthy AND SPY oriented up, else flat.
+// Wire: wedge, panic_thresh, defense_thresh, spy_orient ← upstream sensor nodes.
+
+float wedge,
+float panic_thresh,
+float defense_thresh,
+float spy_orient,
+output float conviction
+{
+    conviction = step(defense_thresh - wedge, 1.0) * step(wedge - panic_thresh, 1.0) * spy_orient;
+}

@@ -1150,6 +1150,60 @@ mod tests {
     }
 
     #[test]
+    fn otl_ma_crossover_produces_gate_signal_without_portfolio() {
+        const SCRIPT: &str = r#"shader ma_crossover(
+    float source,
+    int fast = 10,
+    int slow = 50,
+    output float signal
+) {
+    signal = ta::cross(ta::sma(source, fast), ta::sma(source, slow));
+}"#;
+        let mut graph = GraphDescription::new("test");
+        graph.add_node(NodeInstance::new(
+            "spy",
+            type_id::FINANCIAL_ASSET,
+            Position::new(0.0, 0.0),
+        ));
+        let mut otl = NodeInstance::new(
+            "otl",
+            type_id::OTL_OPERATOR,
+            Position::new(120.0, 0.0),
+        );
+        otl.properties.insert(
+            "script_src".into(),
+            graphy::JsonValue::String(SCRIPT.to_string()),
+        );
+        graph.add_node(otl);
+        graph.add_connection(Connection {
+            source_node: "spy".into(),
+            source_pin: "close".into(),
+            target_node: "otl".into(),
+            target_pin: "source".into(),
+            connection_type: ConnectionType::Data,
+        });
+
+        let snapshot = graph_description_to_stage_snapshot(&graph);
+        let result = run_finance_sweep(&snapshot);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let otl_path = snapshot
+            .prims
+            .iter()
+            .find(|prim| prim.type_name == "OtlOperator")
+            .map(|prim| prim.path.clone())
+            .expect("otl prim");
+        let signal = result
+            .analytics_signals
+            .get(&otl_path)
+            .unwrap_or_else(|| panic!("missing otl signal; streams={:?}", result.attribute_streams));
+        assert!(signal.len() >= 2, "expected timeline signal, got {signal:?}");
+        assert!(
+            signal.iter().any(|value| value.abs() > f64::EPSILON),
+            "expected non-flat gate values, got {signal:?}"
+        );
+    }
+
+    #[test]
     fn bare_ticker_csv_path_uses_bundled_sample_data() {
         let mut warnings = Vec::new();
         let (prices, loaded, synthetic) = load_asset_close_series(

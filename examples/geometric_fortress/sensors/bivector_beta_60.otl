@@ -1,0 +1,10 @@
+// Sensor 2 — Selection: bivector (rejection) beta vs SPY — geometric orthogonality / "maverick" score.
+// Wire: primary ← haven asset close; market ← SPY close (inputs:sources or second float input).
+// Python: calculate_geometric_beta(...)[1]  (bivector leg)
+
+float asset,
+float market,
+output float bivector
+{
+    bivector = ga::bivector_beta(asset, market, 60);
+}

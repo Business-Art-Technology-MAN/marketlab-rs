@@ -51,8 +51,7 @@ fn sweep_signal(
     output_matrix: &mut GraphSeriesMatrix,
     bar_count: usize,
 ) -> Result<(), RuntimeEngineError> {
-    let upstream = ctx.signal_upstream.as_slice();
-    engine.prepare(upstream, bar_count);
+    engine.prepare_from_exec_context(ctx, bar_count);
     let column = ctx.signal_output_column;
     let out = output_matrix.signal_column_slice_mut(column);
     let len = bar_count.min(out.len());

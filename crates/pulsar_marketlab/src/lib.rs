@@ -3,6 +3,7 @@ pub mod fix_engine;
 pub mod signal_dsl;
 pub mod signal_kernel;
 pub mod stage_bridge;
+pub mod geometric_analysis;
 pub mod technical_analysis;
 pub mod trading_stage;
 

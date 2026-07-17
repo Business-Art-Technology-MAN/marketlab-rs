@@ -1,0 +1,12 @@
+// SPY leg weight — Pure Geometric Fortress (month-end gated offense).
+// Wire sensor streams as named float inputs (see README).
+
+shader fortress_weight_spy(
+    input float wedge,
+    input float panic_thresh,
+    input float defense_thresh,
+    input float spy_orient,
+    output float spy_w
+) {
+    spy_w = ga::month_end() * step(wedge - defense_thresh, 1.0) * spy_orient;
+}

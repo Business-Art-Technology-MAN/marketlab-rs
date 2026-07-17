@@ -21,6 +21,10 @@ pub struct ExecutionContext {
     pub asset_vectors: HashMap<String, Arc<[f64]>>,
     /// Upstream price/signal window fed into the active signal-tier sweep.
     pub signal_upstream: Vec<f64>,
+    /// Named OSL float inputs beyond the primary series (e.g. `market` for `ga::scalar_beta`).
+    pub signal_named_upstream: HashMap<String, Vec<f64>>,
+    /// Constituent columns wired via `inputs:constituents` (e.g. `ga::wedge_volume`).
+    pub signal_constituent_series: Vec<Vec<f64>>,
     /// Matrix column index receiving the active signal-tier output.
     pub signal_output_column: usize,
     /// Deferred side-channel for OTL portfolio `outputs:weights` (set only during tier sweeps).
@@ -45,6 +49,8 @@ impl ExecutionContext {
             asset_quotes,
             asset_vectors,
             signal_upstream: Vec::new(),
+            signal_named_upstream: HashMap::new(),
+            signal_constituent_series: Vec::new(),
             signal_output_column: 0,
             weight_track: None,
             covariance_cache: None,

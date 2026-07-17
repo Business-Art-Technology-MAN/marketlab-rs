@@ -19,6 +19,8 @@ pub const CHART_GATE_LONG_RGB: u32 = 0x26a69a;
 pub const CHART_GATE_SHORT_RGB: u32 = 0xef5350;
 pub const CHART_GATE_FLAT_RGB: u32 = 0x52525b;
 pub const CHART_LONG_SHADE_RGB: u32 = 0x26a69a;
+pub const CHART_MA_FAST_RGB: u32 = 0xf5c542;
+pub const CHART_MA_SLOW_RGB: u32 = 0xc084fc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChartPaneKind {
@@ -355,7 +357,7 @@ pub fn build_isolated_series_chart(
 
 pub fn build_sparkline_model(values: &[f64], kind: FinanceSeriesKind) -> FinanceChartModel {
     let len = values.len();
-    let range = FinanceChartModel::tail_visible_range(len, len.min(DEFAULT_VISIBLE_BARS));
+    let range = 0..len;
     let summary = NodeValueSummary {
         min: values.iter().copied().fold(f64::INFINITY, f64::min),
         max: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
@@ -365,6 +367,80 @@ pub fn build_sparkline_model(values: &[f64], kind: FinanceSeriesKind) -> Finance
         short_pct: None,
     };
     build_isolated_series_chart("sparkline", values, kind, range, len.saturating_sub(1), &summary)
+}
+
+/// EventGraph OTL thumbnail: OHLC base, gate/signal overlay, and optional MA lines.
+pub fn build_otl_analytics_sparkline_model(
+    preview: &FinanceAssetPreview,
+    bundle: &FinanceNodeSeriesBundle,
+    label: &str,
+    ma_fast: Option<usize>,
+    ma_slow: Option<usize>,
+) -> FinanceChartModel {
+    use pulsar_marketlab_core::sma;
+
+    let len = preview.bars.len();
+    let range = FinanceChartModel::tail_visible_range(len, len);
+    let crosshair = len.saturating_sub(1);
+    let summary = NodeValueSummary {
+        min: preview.bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min),
+        max: preview.bars.iter().map(|bar| bar.high).fold(f64::NEG_INFINITY, f64::max),
+        last: preview.bars.last().map(|bar| bar.close).unwrap_or(0.0),
+        long_pct: bundle.summary.long_pct,
+        flat_pct: bundle.summary.flat_pct,
+        short_pct: bundle.summary.short_pct,
+    };
+    let indicator = (bundle.primary_kind == FinanceSeriesKind::Indicator)
+        .then_some(bundle.primary_series.as_slice());
+    let gate = (bundle.primary_kind == FinanceSeriesKind::Gate)
+        .then_some(bundle.primary_series.as_slice());
+    let mut model = build_asset_ohlc_chart(
+        preview,
+        label,
+        range,
+        crosshair,
+        indicator.map(|series| ("Signal", series)),
+        gate,
+        &summary,
+    );
+    if let (Some(fast), Some(slow)) = (ma_fast, ma_slow) {
+        if fast > 0 && slow > 0 {
+            let closes = preview.close_series();
+            model.layers.push(ChartLayer {
+                id: "ma_fast".to_string(),
+                label: format!("MA {fast}"),
+                kind: FinanceSeriesKind::Indicator,
+                values: sma(&closes, fast),
+                color_rgb: CHART_MA_FAST_RGB,
+                overlay: true,
+            });
+            model.layers.push(ChartLayer {
+                id: "ma_slow".to_string(),
+                label: format!("MA {slow}"),
+                kind: FinanceSeriesKind::Indicator,
+                values: sma(&closes, slow),
+                color_rgb: CHART_MA_SLOW_RGB,
+                overlay: true,
+            });
+        }
+    }
+    model
+}
+
+/// Read `fast` / `slow` defaults from an OSL `shader ma_crossover(...)` script header.
+pub fn ma_crossover_periods_from_script(script: &str) -> Option<(usize, usize)> {
+    let signature = pulsar_marketlab_core::parse_script_signature(script);
+    let fast = signature
+        .parameters
+        .iter()
+        .find(|param| param.name == "fast")
+        .and_then(|param| param.default_value.map(|value| value.max(1.0) as usize))?;
+    let slow = signature
+        .parameters
+        .iter()
+        .find(|param| param.name == "slow")
+        .and_then(|param| param.default_value.map(|value| value.max(1.0) as usize))?;
+    Some((fast, slow))
 }
 
 fn asset_trading_panes(has_indicator: bool, has_gate: bool) -> Vec<ChartPaneSpec> {
@@ -440,5 +516,12 @@ mod tests {
         assert_eq!(panes.len(), 4);
         assert!(panes.iter().any(|p| p.kind == ChartPaneKind::Volume));
         assert!(panes.iter().any(|p| p.kind == ChartPaneKind::Gate));
+    }
+
+    #[test]
+    fn sparkline_model_uses_full_timeline() {
+        let values: Vec<f64> = (0..200).map(|index| index as f64).collect();
+        let model = build_sparkline_model(&values, FinanceSeriesKind::Gate);
+        assert_eq!(model.visible_range, 0..200);
     }
 }

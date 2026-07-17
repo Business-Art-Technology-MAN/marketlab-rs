@@ -26,6 +26,10 @@ fn main() {
                         height: px(960.0),
                     },
                 })),
+                window_min_size: Some(Size {
+                    width: px(1024.0),
+                    height: px(640.0),
+                }),
                 titlebar: Some(TitlebarOptions {
                     title: Some("MarketLab Finance".into()),
                     ..Default::default()

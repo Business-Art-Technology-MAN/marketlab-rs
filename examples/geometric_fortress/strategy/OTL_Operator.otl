@@ -1,0 +1,6 @@
+signal auto_series(
+    input closure raw,
+    output closure gated
+) {
+    gated = ta::spread_sign(ta::ema(input, 10), ta::sma(input, 100));
+}

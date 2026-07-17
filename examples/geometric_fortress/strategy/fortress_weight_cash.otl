@@ -1,0 +1,17 @@
+// SHV / cash leg weight — panic, failed defense, or bear offense.
+
+float wedge,
+float panic_thresh,
+float defense_thresh,
+float spy_orient,
+float tlt_orient,
+float gld_orient,
+output float cash_w
+{
+    cash_w = ga::month_end()
+        * (
+            step(panic_thresh - wedge, 1.0)
+            + step(defense_thresh - wedge, 1.0) * step(wedge - panic_thresh, 1.0) * step(0.0 - tlt_orient, 1.0) * step(0.0 - gld_orient, 1.0)
+            + step(wedge - defense_thresh, 1.0) * step(0.0 - spy_orient, 1.0)
+        );
+}

@@ -1,0 +1,18 @@
+// Three-tier shell — paste into PortfolioIntegrator or compile as portfolio object.
+// Wire inputs:sources to SPY, TLT, GLD, SHV legs; upstream allocator emits per-leg weights.
+
+allocator geometric_fortress_blend(
+    input closure[] legs,
+    output closure blended
+) {
+    // legs[0]=SPY, legs[1]=TLT, legs[2]=GLD, legs[3]=SHV conviction streams
+    // Replace with fortress_weights outputs when wired as signal columns.
+    blended = mix(legs[0], legs[3], 0.0);
+}
+
+portfolio geometric_fortress_fund(
+    input closure[] sources,
+    output closure nav
+) {
+    nav = portfolio_info("execution_map");
+}
